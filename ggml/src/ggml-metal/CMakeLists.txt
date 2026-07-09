@@ -51,6 +51,7 @@ set(METALLIB_KERNEL_SOURCES
     kernels/argsort.metal
     kernels/pool.metal
     kernels/misc.metal
+    kernels/retro.metal # retro delta: fork-owned training kernels
 )
 
 if (GGML_METAL_EMBED_LIBRARY)

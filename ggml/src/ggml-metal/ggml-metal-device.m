@@ -1937,6 +1937,26 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
             return has_simdgroup_reduction;
+        // retro delta: RMS-norm backward. F32, contiguous rows (nb0 == elt size),
+        // same shape; needs simdgroup reductions. Else falls back to CPU.
+        case GGML_OP_RMS_NORM_BACK:
+            return has_simdgroup_reduction &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->type         == GGML_TYPE_F32 &&
+                   op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
+                   op->src[1]->nb[0] == ggml_type_size(op->src[1]->type) &&
+                   ggml_are_same_shape(op->src[0], op->src[1]) &&
+                   ggml_are_same_shape(op->src[0], op);
+        // retro delta: out-prod (weight-gradient GEMM). F32; src0 dim0 and dst
+        // dim0 must be unit-stride (matches the CPU op's asserts); src1 may carry
+        // arbitrary strides. Anything else falls back to CPU.
+        case GGML_OP_OUT_PROD:
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->type         == GGML_TYPE_F32 &&
+                   op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
+                   op->nb[0]         == ggml_type_size(op->type);
         default:
             return false;
     }

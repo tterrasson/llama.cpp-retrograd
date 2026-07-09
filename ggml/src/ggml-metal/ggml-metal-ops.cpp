@@ -499,6 +499,14 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_opt_step_sgd(ctx, idx);
             } break;
+        case GGML_OP_RMS_NORM_BACK: // retro delta
+            {
+                n_fuse = ggml_metal_op_rms_norm_back(ctx, idx);
+            } break;
+        case GGML_OP_OUT_PROD: // retro delta
+            {
+                n_fuse = ggml_metal_op_out_prod(ctx, idx);
+            } break;
         case GGML_OP_COUNT_EQUAL:
             {
                 n_fuse = ggml_metal_op_count_equal(ctx, idx);
@@ -5534,6 +5542,93 @@ int ggml_metal_op_opt_step_sgd(ggml_metal_op_t ctx, int idx) {
 
     const int nth = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), ne0);
     const int64_t n = (np + nth - 1) / nth;
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, n, 1, 1, nth, 1, 1);
+
+    return 1;
+}
+
+// retro delta: RMS-norm backward. One threadgroup per row; mirrors the forward
+// kernel_rms_norm dispatch (threads-per-row doubles from a SIMD width up to ne00).
+int ggml_metal_op_rms_norm_back(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
+    GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
+    GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
+
+    float eps;
+    memcpy(&eps, op->op_params, sizeof(float));
+
+    auto pipeline = ggml_metal_library_get_pipeline_rms_norm_back(lib, op);
+
+    ggml_metal_kargs_rms_norm_back args = {
+        /*.ne00 =*/ ne00,
+        /*.eps  =*/ eps,
+        /*.nb01 =*/ nb01, /*.nb02 =*/ nb02, /*.nb03 =*/ nb03,
+        /*.nb11 =*/ nb11, /*.nb12 =*/ nb12, /*.nb13 =*/ nb13,
+        /*.nb1  =*/ nb1,  /*.nb2  =*/ nb2,  /*.nb3  =*/ nb3,
+    };
+
+    int nth = 32;
+    while (nth < ne00 && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
+        nth *= 2;
+    }
+    nth = std::min(nth, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+    nth = std::min(nth, (int) ne00);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
+
+    return 1;
+}
+
+// retro delta: out-prod (weight-gradient GEMM). Correctness-first flat dispatch:
+// one thread per dst element, sequential reduction over the contraction dim.
+int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    GGML_TENSOR_LOCALS( int64_t, ne0, op->src[0], ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
+    GGML_TENSOR_LOCALS( int64_t, ne1, op->src[1], ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
+    GGML_TENSOR_LOCALS( int64_t, ne,  op,         ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
+
+    const int64_t es = (int64_t) sizeof(float); // strides are all F32 multiples
+
+    auto pipeline = ggml_metal_library_get_pipeline_out_prod(lib, op);
+
+    ggml_metal_kargs_out_prod args = {
+        /*.ne0  =*/ ne0,  /*.ne1  =*/ ne1, /*.ne2 =*/ ne2, /*.ne3 =*/ ne3,
+        /*.ne01 =*/ ne01,
+        /*.dps2 =*/ ne2 / ne02, /*.dps3 =*/ ne3 / ne03,
+        /*.s01  =*/ (int64_t) nb01 / es, /*.s02 =*/ (int64_t) nb02 / es, /*.s03 =*/ (int64_t) nb03 / es,
+        /*.s10  =*/ (int64_t) nb10 / es, /*.s11 =*/ (int64_t) nb11 / es, /*.s12 =*/ (int64_t) nb12 / es, /*.s13 =*/ (int64_t) nb13 / es,
+        /*.s1   =*/ (int64_t) nb1  / es, /*.s2  =*/ (int64_t) nb2  / es, /*.s3  =*/ (int64_t) nb3  / es,
+    };
+
+    const int64_t total = ne0 * ne1 * ne2 * ne3;
+    const int nth = std::min<int64_t>(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), total);
+    const int64_t n = (total + nth - 1) / nth;
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, n, 1, 1, nth, 1, 1);
 
