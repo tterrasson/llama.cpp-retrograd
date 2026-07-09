@@ -313,12 +313,15 @@ kernel void kernel_cross_entropy_loss_back_f32(
     const float sm_scale = 1.0f / sum;
     float label_sum = 0.0f;
     for (int i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) label_sum += s1[i00];
-    const bool active = retro_tg_sum(label_sum, sh, sgitg, tiisg, ntg.x) != 0.0f;
+    // The row's label mass scales the softmax term so the gradient stays exact
+    // for weighted labels, mirroring the CPU op. One-hot rows are unchanged.
+    const float label_mass = retro_tg_sum(label_sum, sh, sgitg, tiisg, ntg.x);
+    const bool active = label_mass != 0.0f;
     const float d_by_nr  = active ? grad[0] / (float) args.nactive : 0.0f;
 
     for (int i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) {
         const float sm = exp(s0[i00] - max_val) * sm_scale;
-        d[i00] = active ? (sm - s1[i00]) * d_by_nr : 0.0f;
+        d[i00] = active ? (label_mass * sm - s1[i00]) * d_by_nr : 0.0f;
     }
 }
 

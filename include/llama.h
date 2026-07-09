@@ -1631,6 +1631,22 @@ extern "C" {
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
 
+    // retro delta: like llama_opt_epoch, but each label position carries a float
+    // weight that scales its cross-entropy contribution. Detached per-token
+    // coefficients turn this weighted loss into a differentiable policy-gradient
+    // objective (PPO). label_weights uses the dataset layout (ndata rows of the
+    // datapoint width); NULL behaves like all-ones. A zero weight masks the
+    // position exactly like a negative sparse label.
+    LLAMA_API void llama_opt_epoch_weighted(
+            struct llama_context    * lctx,
+            ggml_opt_dataset_t        dataset,
+            ggml_opt_result_t         result_train,
+            ggml_opt_result_t         result_eval,
+            int64_t                   idata_split,
+            ggml_opt_epoch_callback   callback_train,
+            ggml_opt_epoch_callback   callback_eval,
+            const float             * label_weights);
+
 #ifdef __cplusplus
 }
 #endif

@@ -197,19 +197,23 @@ struct llama_context {
     void opt_init(struct llama_model * model, struct llama_opt_params lopt_params);
 
     // TODO: more flexible combinations of logical/physical batch size and context size
+    // retro delta: label_weights optionally scales each label position's loss
+    // contribution (dataset layout, nullable = all ones).
     void opt_epoch(
             ggml_opt_dataset_t      dataset,
             ggml_opt_result_t       result_train,
             ggml_opt_result_t       result_eval,
             int64_t                 idata_split,
             ggml_opt_epoch_callback callback_train,
-            ggml_opt_epoch_callback callback_eval);
+            ggml_opt_epoch_callback callback_eval,
+            const float           * label_weights = nullptr);
 
     void opt_epoch_iter(
             ggml_opt_dataset_t               dataset,
             ggml_opt_result_t                result,
             const std::vector<llama_token> & tokens,
             const std::vector<llama_token> & labels_sparse,
+            const float                    * label_weights, // per label position, nullable
             llama_batch                    & batch,
             ggml_opt_epoch_callback          callback,
             bool                             train,

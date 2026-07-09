@@ -3494,6 +3494,7 @@ void llama_context::opt_epoch_iter(
         ggml_opt_result_t                result,
         const std::vector<llama_token> & tokens,
         const std::vector<llama_token> & labels_sparse,
+        const float                    * label_weights,
         llama_batch                    & batch,
         ggml_opt_epoch_callback          callback,
         bool                             train,
@@ -3582,15 +3583,18 @@ void llama_context::opt_epoch_iter(
                 struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
                 GGML_ASSERT(labels->ne[1] == n_ubatch);
                 ggml_set_zero(labels);
-                const float onef = 1.0f;
                 int32_t n_active_labels = 0;
                 for (uint32_t pos_ubatch = 0; pos_ubatch < n_ubatch; ++pos_ubatch) {
                     const uint32_t ilabel = pos_ctx + pos_batch + pos_ubatch;
                     // Negative labels are ignored by Retroback's masked SFT
                     // loss. The all-zero one-hot row is skipped downstream.
-                    if (labels_sparse[ilabel] >= 0) {
+                    // retro delta: a weighted position scales its one-hot value,
+                    // which the generalized cross-entropy backward turns into an
+                    // exactly scaled per-token gradient; weight zero masks it.
+                    const float weight = label_weights ? label_weights[ilabel] : 1.0f;
+                    if (labels_sparse[ilabel] >= 0 && weight != 0.0f) {
                         GGML_ASSERT(labels_sparse[ilabel] < labels->ne[0]);
-                        ggml_backend_tensor_set(labels, &onef, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
+                        ggml_backend_tensor_set(labels, &weight, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
                         ++n_active_labels;
                     }
                 }
@@ -3605,6 +3609,12 @@ void llama_context::opt_epoch_iter(
             pos_batch += ubatch.n_tokens;
         } while (mctx->next());
     }
+
+    // retro delta: the graphs built here borrow allocations from the optimizer
+    // context freed above. Reset the cached graph result so a following
+    // llama_decode (e.g. policy-gradient rollout scoring between optimizer
+    // steps) can never satisfy can_reuse() against a dangling training graph.
+    gf_res_prev->reset();
 }
 
 void llama_context::opt_epoch(
@@ -3613,7 +3623,8 @@ void llama_context::opt_epoch(
         ggml_opt_result_t         result_eval,
         int64_t                   idata_split,
         ggml_opt_epoch_callback   callback_train,
-        ggml_opt_epoch_callback   callback_eval) {
+        ggml_opt_epoch_callback   callback_eval,
+        const float             * label_weights) {
     const uint32_t n_ctx    = this->n_ctx();
     const uint32_t n_batch  = std::min(cparams.n_batch,  n_ctx);
     const uint32_t n_ubatch = std::min(cparams.n_ubatch, n_batch);
@@ -3637,7 +3648,8 @@ void llama_context::opt_epoch(
         const int64_t idata_in_loop = idata*ubatch_per_ctx;
 
         ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), idata);
-        opt_epoch_iter(dataset, result_train, tokens, labels_sparse, batch,
+        opt_epoch_iter(dataset, result_train, tokens, labels_sparse,
+            label_weights ? label_weights + idata*n_ctx : nullptr, batch,
             callback_train, train, idata_in_loop, ndata_in_loop, t_loop_start);
     }
 
@@ -3648,7 +3660,8 @@ void llama_context::opt_epoch(
         const int64_t idata_in_loop = (idata - idata_split)*ubatch_per_ctx;
 
         ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), idata);
-        opt_epoch_iter(dataset, result_eval, tokens, labels_sparse, batch,
+        opt_epoch_iter(dataset, result_eval, tokens, labels_sparse,
+            label_weights ? label_weights + idata*n_ctx : nullptr, batch,
             callback_eval, train, idata_in_loop, ndata_in_loop, t_loop_start);
     }
 
@@ -4364,6 +4377,26 @@ void llama_opt_epoch(
         idata_split,
         callback_train,
         callback_eval);
+}
+
+// retro delta: weighted-label training epoch (see llama.h).
+void llama_opt_epoch_weighted(
+        struct llama_context    * ctx,
+        ggml_opt_dataset_t        dataset,
+        ggml_opt_result_t         result_train,
+        ggml_opt_result_t         result_eval,
+        int64_t                   idata_split,
+        ggml_opt_epoch_callback   callback_train,
+        ggml_opt_epoch_callback   callback_eval,
+        const float             * label_weights) {
+    ctx->opt_epoch(
+        dataset,
+        result_train,
+        result_eval,
+        idata_split,
+        callback_train,
+        callback_eval,
+        label_weights);
 }
 
 //
