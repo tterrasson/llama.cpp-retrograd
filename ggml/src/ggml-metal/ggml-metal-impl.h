@@ -1380,4 +1380,39 @@ typedef struct {
     int64_t s1;  int64_t s2;  int64_t s3;                // dst
 } ggml_metal_kargs_out_prod;
 
+// retro delta: soft-max backward (LoRA training on Metal)
+typedef struct {
+     int32_t ne00;
+     float   scale;
+    uint64_t nb01; uint64_t nb02; uint64_t nb03; // src0 = dy (grad of softmax output)
+    uint64_t nb11; uint64_t nb12; uint64_t nb13; // src1 = y  (softmax output)
+    uint64_t nb1;  uint64_t nb2;  uint64_t nb3;  // dst
+} ggml_metal_kargs_soft_max_back;
+
+// retro delta: flat F32 fill, zero-initialises dst before accumulate/scatter ops
+typedef struct {
+    int64_t np;
+    float   val;
+} ggml_metal_kargs_retro_fill;
+
+// retro delta: cross-entropy loss forward (contiguous rows; dst is a scalar)
+typedef struct {
+    int32_t ne00;  // n_classes (row width)
+    int32_t nrows; // total rows across ne1..ne3
+} ggml_metal_kargs_cross_entropy_loss;
+
+// retro delta: cross-entropy loss backward (contiguous rows)
+typedef struct {
+    int32_t ne00;  // n_classes (row width)
+    int32_t nrows; // total rows across ne1..ne3
+} ggml_metal_kargs_cross_entropy_loss_back;
+
+// retro delta: get-rows backward (scatter-add of grad rows into the vocab-sized dst)
+typedef struct {
+     int64_t ne00; // row width (n_embd)
+     int64_t nr;   // number of scattered rows (= nelements of the I32 index vector)
+    uint64_t nb01; // src0 row stride (bytes)
+    uint64_t nb1;  // dst row stride (bytes)
+} ggml_metal_kargs_get_rows_back;
+
 #endif // GGML_METAL_IMPL

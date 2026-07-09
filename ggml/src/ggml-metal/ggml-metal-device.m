@@ -1957,6 +1957,59 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                    op->type         == GGML_TYPE_F32 &&
                    op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
                    op->nb[0]         == ggml_type_size(op->type);
+        // retro delta: soft-max backward. F32, contiguous, same shapes; the
+        // kernel implements the max_bias == 0 case only (matching the CPU op's
+        // assert and our training graph). Needs simdgroup reductions.
+        case GGML_OP_SOFT_MAX_BACK:
+        {
+            float max_bias;
+            memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
+            return has_simdgroup_reduction &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->type         == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) &&
+                   ggml_is_contiguous(op->src[1]) &&
+                   ggml_are_same_shape(op->src[0], op->src[1]) &&
+                   ggml_are_same_shape(op->src[0], op) &&
+                   max_bias == 0.0f;
+        }
+        // retro delta: cross-entropy loss forward. F32 contiguous logits/labels
+        // of the same shape, scalar dst; per-row log-sum-exp reduction plus an
+        // atomic-float accumulation (Apple-silicon Metal supports atomic_float).
+        case GGML_OP_CROSS_ENTROPY_LOSS:
+            return has_simdgroup_reduction &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->type         == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) &&
+                   ggml_is_contiguous(op->src[1]) &&
+                   ggml_are_same_shape(op->src[0], op->src[1]) &&
+                   ggml_is_scalar(op);
+        // retro delta: cross-entropy loss backward. src0 = scalar grad,
+        // src1 = logits, src2 = labels; all F32 contiguous.
+        case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+            return has_simdgroup_reduction &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 &&
+                   op->type         == GGML_TYPE_F32 &&
+                   ggml_is_scalar(op->src[0]) &&
+                   ggml_is_contiguous(op->src[1]) &&
+                   ggml_is_contiguous(op->src[2]) &&
+                   ggml_is_contiguous(op) &&
+                   ggml_are_same_shape(op->src[1], op->src[2]) &&
+                   ggml_are_same_shape(op->src[1], op);
+        // retro delta: get-rows backward (scatter-add of grad rows). F32 grads
+        // and dst, I32 indices; uses atomic-float for duplicate indices.
+        case GGML_OP_GET_ROWS_BACK:
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_I32 &&
+                   op->type         == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) &&
+                   ggml_is_contiguous(op->src[1]) &&
+                   ggml_is_contiguous(op) &&
+                   op->src[0]->ne[0] == op->ne[0];
         default:
             return false;
     }

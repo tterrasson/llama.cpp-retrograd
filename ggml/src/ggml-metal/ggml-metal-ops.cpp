@@ -507,6 +507,22 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_out_prod(ctx, idx);
             } break;
+        case GGML_OP_SOFT_MAX_BACK: // retro delta
+            {
+                n_fuse = ggml_metal_op_soft_max_back(ctx, idx);
+            } break;
+        case GGML_OP_CROSS_ENTROPY_LOSS: // retro delta
+            {
+                n_fuse = ggml_metal_op_cross_entropy_loss(ctx, idx);
+            } break;
+        case GGML_OP_CROSS_ENTROPY_LOSS_BACK: // retro delta
+            {
+                n_fuse = ggml_metal_op_cross_entropy_loss_back(ctx, idx);
+            } break;
+        case GGML_OP_GET_ROWS_BACK: // retro delta
+            {
+                n_fuse = ggml_metal_op_get_rows_back(ctx, idx);
+            } break;
         case GGML_OP_COUNT_EQUAL:
             {
                 n_fuse = ggml_metal_op_count_equal(ctx, idx);
@@ -5574,12 +5590,16 @@ int ggml_metal_op_rms_norm_back(ggml_metal_op_t ctx, int idx) {
         /*.nb1  =*/ nb1,  /*.nb2  =*/ nb2,  /*.nb3  =*/ nb3,
     };
 
+    // nth stays a power of two (>= one simdgroup): the kernel's final
+    // cross-simdgroup reduction reads one partial per simdgroup from lanes of
+    // simdgroup 0, which requires every simdgroup to be fully populated.
+    // (Clamping nth to ne00 here previously created a partial trailing
+    // simdgroup and produced wrong sums for row widths like 33.)
     int nth = 32;
     while (nth < ne00 && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
         nth *= 2;
     }
     nth = std::min(nth, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
-    nth = std::min(nth, (int) ne00);
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -5631,6 +5651,184 @@ int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, n, 1, 1, nth, 1, 1);
+
+    return 1;
+}
+
+// retro delta: shared threads-per-row choice for the per-row reduction kernels.
+// Always a power of two >= one simdgroup so every simdgroup is fully populated
+// (the kernels' cross-simdgroup reductions rely on it).
+static int ggml_metal_op_retro_row_nth(ggml_metal_pipeline_with_params pipeline, int64_t ne00) {
+    int nth = 32;
+    while (nth < ne00 && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
+        nth *= 2;
+    }
+    return std::min(nth, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+}
+
+// retro delta: zero-fill an F32 tensor; prologue for the atomic-add stages of
+// cross-entropy loss and get-rows backward. Inserts a concurrency barrier so
+// the accumulating dispatch observes the cleared buffer.
+static void ggml_metal_op_retro_fill_zero(ggml_metal_op_t ctx, ggml_tensor * t) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    auto pipeline = ggml_metal_library_get_pipeline_retro_fill(lib);
+
+    const int64_t np = ggml_nelements(t);
+    ggml_metal_kargs_retro_fill args = {
+        /*.np  =*/ np,
+        /*.val =*/ 0.0f,
+    };
+
+    const int nth = std::min<int64_t>(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), np);
+    const int64_t n = (np + nth - 1) / nth;
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(t), 1);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, n, 1, 1, nth, 1, 1);
+
+    ggml_metal_op_concurrency_reset(ctx);
+}
+
+// retro delta: soft-max backward. One threadgroup per row; a single dot-product
+// reduction, then dx = (dy - dot(y, dy)) * y * scale. Mirrors rms_norm_back.
+int ggml_metal_op_soft_max_back(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
+    GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
+    GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
+
+    float scale;
+    memcpy(&scale, (const float *) op->op_params + 0, sizeof(float));
+
+    auto pipeline = ggml_metal_library_get_pipeline_soft_max_back(lib, op);
+
+    ggml_metal_kargs_soft_max_back args = {
+        /*.ne00  =*/ ne00,
+        /*.scale =*/ scale,
+        /*.nb01 =*/ nb01, /*.nb02 =*/ nb02, /*.nb03 =*/ nb03,
+        /*.nb11 =*/ nb11, /*.nb12 =*/ nb12, /*.nb13 =*/ nb13,
+        /*.nb1  =*/ nb1,  /*.nb2  =*/ nb2,  /*.nb3  =*/ nb3,
+    };
+
+    const int nth = ggml_metal_op_retro_row_nth(pipeline, ne00);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
+
+    return 1;
+}
+
+// retro delta: cross-entropy loss forward. Zero the scalar dst, then one
+// threadgroup per row computes the row's loss contribution and atomically
+// accumulates it into dst[0].
+int ggml_metal_op_cross_entropy_loss(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const int64_t ne00  = op->src[0]->ne[0];
+    const int64_t nrows = ggml_nrows(op->src[0]);
+
+    ggml_metal_op_retro_fill_zero(ctx, op);
+
+    auto pipeline = ggml_metal_library_get_pipeline_cross_entropy_loss(lib, op);
+
+    ggml_metal_kargs_cross_entropy_loss args = {
+        /*.ne00  =*/ (int32_t) ne00,
+        /*.nrows =*/ (int32_t) nrows,
+    };
+
+    const int nth = ggml_metal_op_retro_row_nth(pipeline, ne00);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, nth, 1, 1);
+
+    return 1;
+}
+
+// retro delta: cross-entropy loss backward. One threadgroup per row:
+// dst = (softmax(logits) - labels) * grad/nrows.
+int ggml_metal_op_cross_entropy_loss_back(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const int64_t ne00  = op->src[1]->ne[0];
+    const int64_t nrows = ggml_nrows(op->src[1]);
+
+    auto pipeline = ggml_metal_library_get_pipeline_cross_entropy_loss_back(lib, op);
+
+    ggml_metal_kargs_cross_entropy_loss_back args = {
+        /*.ne00  =*/ (int32_t) ne00,
+        /*.nrows =*/ (int32_t) nrows,
+    };
+
+    const int nth = ggml_metal_op_retro_row_nth(pipeline, ne00);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2]), 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         4);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, nth, 1, 1);
+
+    return 1;
+}
+
+// retro delta: get-rows backward. Zero the dst, then scatter-add each grad row
+// into dst row idx[i] (atomic-float: duplicate indices accumulate).
+int ggml_metal_op_get_rows_back(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const int64_t ne00 = op->src[0]->ne[0];
+    const int64_t nr   = ggml_nelements(op->src[1]);
+
+    ggml_metal_op_retro_fill_zero(ctx, op);
+
+    auto pipeline = ggml_metal_library_get_pipeline_get_rows_back(lib, op);
+
+    ggml_metal_kargs_get_rows_back args = {
+        /*.ne00 =*/ ne00,
+        /*.nr   =*/ nr,
+        /*.nb01 =*/ op->src[0]->nb[1],
+        /*.nb1  =*/ op->nb[1],
+    };
+
+    const int nth = std::min<int64_t>(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), ne00);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, nr, 1, 1, nth, 1, 1);
 
     return 1;
 }
