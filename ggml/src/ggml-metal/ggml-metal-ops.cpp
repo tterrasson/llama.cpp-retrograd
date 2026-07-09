@@ -5627,7 +5627,11 @@ int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS( int64_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
 
-    const int64_t es = (int64_t) sizeof(float); // strides are all F32 multiples
+    const int64_t es = (int64_t) sizeof(float); // src1/dst strides are F32 multiples
+
+    // F32 src0 indexes in elements; quantized src0 (Q8_0) can't (block layout),
+    // so its kernel takes s01/s02/s03 in bytes instead.
+    const int64_t es0 = op->src[0]->type == GGML_TYPE_F32 ? es : 1;
 
     auto pipeline = ggml_metal_library_get_pipeline_out_prod(lib, op);
 
@@ -5635,7 +5639,7 @@ int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
         /*.ne0  =*/ ne0,  /*.ne1  =*/ ne1, /*.ne2 =*/ ne2, /*.ne3 =*/ ne3,
         /*.ne01 =*/ ne01,
         /*.dps2 =*/ ne2 / ne02, /*.dps3 =*/ ne3 / ne03,
-        /*.s01  =*/ (int64_t) nb01 / es, /*.s02 =*/ (int64_t) nb02 / es, /*.s03 =*/ (int64_t) nb03 / es,
+        /*.s01  =*/ (int64_t) nb01 / es0, /*.s02 =*/ (int64_t) nb02 / es0, /*.s03 =*/ (int64_t) nb03 / es0,
         /*.s10  =*/ (int64_t) nb10 / es, /*.s11 =*/ (int64_t) nb11 / es, /*.s12 =*/ (int64_t) nb12 / es, /*.s13 =*/ (int64_t) nb13 / es,
         /*.s1   =*/ (int64_t) nb1  / es, /*.s2  =*/ (int64_t) nb2  / es, /*.s3  =*/ (int64_t) nb3  / es,
     };

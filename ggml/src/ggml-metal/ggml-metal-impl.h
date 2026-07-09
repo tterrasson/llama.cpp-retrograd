@@ -1370,7 +1370,9 @@ typedef struct {
 } ggml_metal_kargs_rms_norm_back;
 
 // retro delta: out-prod / weight-gradient GEMM (LoRA training on Metal)
-// strides are in ELEMENTS (host divides byte strides by sizeof(float)); s00=s0=1.
+// src1/dst strides are in ELEMENTS (host divides byte strides by sizeof(float));
+// s00=s0=1. src0 strides s01/s02/s03 are in elements for the F32 kernel but in
+// BYTES for the quantized (q8_0) kernel, which indexes blocks itself.
 typedef struct {
     int64_t ne0; int64_t ne1; int64_t ne2; int64_t ne3; // dst dims
     int64_t ne01;                                        // contraction dim
