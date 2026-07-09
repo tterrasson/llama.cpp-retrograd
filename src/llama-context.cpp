@@ -3583,11 +3583,18 @@ void llama_context::opt_epoch_iter(
                 GGML_ASSERT(labels->ne[1] == n_ubatch);
                 ggml_set_zero(labels);
                 const float onef = 1.0f;
+                int32_t n_active_labels = 0;
                 for (uint32_t pos_ubatch = 0; pos_ubatch < n_ubatch; ++pos_ubatch) {
                     const uint32_t ilabel = pos_ctx + pos_batch + pos_ubatch;
-                    GGML_ASSERT(labels_sparse[ilabel] < labels->ne[0]);
-                    ggml_backend_tensor_set(labels, &onef, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
+                    // Negative labels are ignored by Retroback's masked SFT
+                    // loss. The all-zero one-hot row is skipped downstream.
+                    if (labels_sparse[ilabel] >= 0) {
+                        GGML_ASSERT(labels_sparse[ilabel] < labels->ne[0]);
+                        ggml_backend_tensor_set(labels, &onef, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
+                        ++n_active_labels;
+                    }
                 }
+                ggml_opt_set_loss_active_rows(opt_ctx, n_active_labels);
             }
             ggml_opt_eval(opt_ctx, result);
             if (callback) {

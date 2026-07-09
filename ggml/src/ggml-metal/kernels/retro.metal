@@ -246,6 +246,13 @@ kernel void kernel_cross_entropy_loss_f32(
         ushort3 ntg[[threads_per_threadgroup]]) {
     threadgroup float sh[32];
     const int64_t i1 = tgpig.x;
+
+    // A batch containing only ignored labels has a zero loss. Avoid dividing
+    // by zero while leaving the zero-filled destination unchanged.
+    if (args.nactive == 0) {
+        return;
+    }
+
     device const float * s0 = logits + i1*args.ne00;
     device const float * s1 = labels + i1*args.ne00;
 
@@ -268,7 +275,7 @@ kernel void kernel_cross_entropy_loss_f32(
     const float loss = retro_tg_sum(lloss, sh, sgitg, tiisg, ntg.x);
 
     if (tpitg.x == 0) {
-        atomic_fetch_add_explicit(dst, -loss / (float) args.nrows, memory_order_relaxed);
+        atomic_fetch_add_explicit(dst, -loss / (float) args.nactive, memory_order_relaxed);
     }
 }
 
@@ -304,11 +311,14 @@ kernel void kernel_cross_entropy_loss_back_f32(
     }
     const float sum = retro_tg_sum(lsum, sh, sgitg, tiisg, ntg.x);
     const float sm_scale = 1.0f / sum;
-    const float d_by_nr  = grad[0] / (float) args.nrows;
+    float label_sum = 0.0f;
+    for (int i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) label_sum += s1[i00];
+    const bool active = retro_tg_sum(label_sum, sh, sgitg, tiisg, ntg.x) != 0.0f;
+    const float d_by_nr  = active ? grad[0] / (float) args.nactive : 0.0f;
 
     for (int i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) {
         const float sm = exp(s0[i00] - max_val) * sm_scale;
-        d[i00] = (sm - s1[i00]) * d_by_nr;
+        d[i00] = active ? (sm - s1[i00]) * d_by_nr : 0.0f;
     }
 }
 

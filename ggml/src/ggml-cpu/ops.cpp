@@ -11718,6 +11718,7 @@ static void ggml_compute_forward_cross_entropy_loss_f32(
     float * sums =  (float *) params->wdata;
     float * st   = ((float *) params->wdata) + nth + ith*nc;
     float sum_thread = 0.0f;
+    int64_t active_thread = 0;
 
     GGML_ASSERT(params->wsize >= sizeof(float) * (nth + nth * nc));
 
@@ -11750,7 +11751,12 @@ static void ggml_compute_forward_cross_entropy_loss_f32(
 
         float sum_st = 0.0f;
         ggml_vec_sum_f32(nc, &sum_st, st);
-        sum_thread += sum_st;
+        bool active = false;
+        for (int64_t i = 0; i < nc; ++i) active = active || s1[i] != 0.0f;
+        if (active) {
+            sum_thread += sum_st;
+            ++active_thread;
+        }
 
 #ifndef NDEBUG
         for (int64_t i = 0; i < nc; ++i) {
@@ -11760,12 +11766,17 @@ static void ggml_compute_forward_cross_entropy_loss_f32(
 #endif // NDEBUG
     }
     sums[ith] = sum_thread;
+    st[0] = (float) active_thread;
     ggml_barrier(params->threadpool);
 
     if (ith == 0) {
         float * dp = (float *) dst->data;
         ggml_vec_sum_f32(nth, dp, sums);
-        dp[0] *= -1.0f / (float) nr;
+        float active = 0.0f;
+        for (int64_t thread = 0; thread < nth; ++thread) {
+            active += ((float *) params->wdata)[nth + thread*nc];
+        }
+        dp[0] *= active > 0.0f ? -1.0f / active : 0.0f;
     }
 }
 
@@ -11817,7 +11828,28 @@ static void ggml_compute_forward_cross_entropy_loss_back_f32(
     const int64_t ir0 = dr*ith;
     const int64_t ir1 = MIN(ir0 + dr, nr);
 
-    const float d_by_nr = ((const float *) grad->data)[0] / (float) nr;
+    float * active_counts = (float *) params->wdata;
+    float active_thread = 0.0f;
+    for (int64_t i1 = ir0; i1 < ir1; ++i1) {
+        const float * labels = (const float *)((const char *) src1f->data + i1*src1f->nb[1]);
+        for (int64_t i = 0; i < nc; ++i) {
+            if (labels[i] != 0.0f) {
+                active_thread += 1.0f;
+                break;
+            }
+        }
+    }
+    active_counts[ith] = active_thread;
+    ggml_barrier(params->threadpool);
+    if (ith == 0) {
+        float active = 0.0f;
+        for (int64_t thread = 0; thread < nth; ++thread) active += active_counts[thread];
+        active_counts[0] = active;
+    }
+    ggml_barrier(params->threadpool);
+    const float d_by_nr = active_counts[0] > 0.0f
+            ? ((const float *) grad->data)[0] / active_counts[0]
+            : 0.0f;
 
     for (int64_t i1 = ir0; i1 < ir1; i1++) {
         float       * ds0 = (float       *)((char       *) dst->data   + i1*dst->nb[1]);
@@ -11831,6 +11863,13 @@ static void ggml_compute_forward_cross_entropy_loss_back_f32(
             assert(!isnan(s1[i]));
         }
 #endif // NDEBUG
+
+        bool active = false;
+        for (int64_t i = 0; i < nc; ++i) active = active || s1[i] != 0.0f;
+        if (!active) {
+            ggml_vec_set_f32(nc, ds0, 0.0f);
+            continue;
+        }
 
         // soft_max
         float max = -INFINITY;
