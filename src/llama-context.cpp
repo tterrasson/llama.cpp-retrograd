@@ -2377,12 +2377,15 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     // retro delta: the training path (llama_opt_epoch -> ggml_opt_build) duplicates this
     // forward graph and expands a backward + optimizer-step graph into a copy of the SAME
     // capacity, because ggml_graph_dup() sizes the copy from cgraph->size. Forward + backward
-    // + AdamW steps needs on the order of 3x the forward node budget, so reserve that headroom
+    // + AdamW steps needs a multiple of the forward node budget, so reserve that headroom
     // here. Without it, ggml_build_backward_expand() overflows the graph and aborts on
     // GGML_ASSERT(cgraph->n_nodes < cgraph->size) as soon as more than a couple of layers are
-    // trained. This only grows cheap graph metadata (node pointers + hash set); activation
-    // buffers are still sized from the nodes actually used, so inference cost is unchanged.
-    res *= 3u;
+    // trained. Hybrid SSM blocks (Mamba/Falcon-H1) are especially node-heavy in the backward
+    // pass: each ssm_scan/ssm_conv expands into a dedicated *_back op plus view/reshape/cont
+    // and gradient-accumulation nodes, so 4x is used to cover them. This only grows cheap graph
+    // metadata (node pointers + hash set); activation buffers are still sized from the nodes
+    // actually used, so inference cost is unchanged.
+    res *= 4u;
     return res;
 }
 
