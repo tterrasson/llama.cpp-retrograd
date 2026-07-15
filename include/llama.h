@@ -1647,6 +1647,31 @@ extern "C" {
             ggml_opt_epoch_callback   callback_eval,
             const float             * label_weights);
 
+    // retro delta: training-graph preflight. Requires llama_opt_init.
+    enum llama_opt_preflight_check {
+        LLAMA_OPT_PREFLIGHT_MISSING_GRAD    = 0, // op has no gradient rule in ggml (dev is NULL)
+        LLAMA_OPT_PREFLIGHT_DEVICE_FORWARD  = 1, // device cannot run this forward op
+        LLAMA_OPT_PREFLIGHT_DEVICE_BACKWARD = 2, // device cannot run this backward/optimizer op
+    };
+
+    typedef void (*llama_opt_preflight_cb)(
+            int32_t                    check, // one of llama_opt_preflight_check
+            ggml_backend_dev_t         dev,   // NULL for LLAMA_OPT_PREFLIGHT_MISSING_GRAD
+            const struct ggml_tensor * node,
+            void                     * userdata);
+
+    // retro delta: builds the same concrete graph an optimizer step would use,
+    // for one representative ubatch, without evaluating it. Reports every op
+    // that has no gradient rule, and every graph op each registered CPU/GPU
+    // device cannot execute (the scheduler would fall back to another backend
+    // for those). When at least one gradient rule is missing the backward
+    // graph cannot be built, so only forward ops get device checks. Returns
+    // the number of ops with a missing gradient rule, or -1 on failure.
+    LLAMA_API int32_t llama_opt_preflight(
+            struct llama_context   * lctx,
+            llama_opt_preflight_cb   callback,
+            void                   * userdata);
+
 #ifdef __cplusplus
 }
 #endif
