@@ -500,6 +500,9 @@ llama_context::~llama_context() {
             }
         }
     }
+    if (opt_batch_capacity != 0) {
+        llama_batch_free(opt_batch);
+    }
     ggml_opt_free(opt_ctx);
 }
 
@@ -3720,9 +3723,12 @@ void llama_context::opt_epoch_iter(
             {
                 const size_t size_gf = ggml_graph_size(gf);
                 const size_t size_meta = 4*size_gf*ggml_tensor_overhead() + 2*ggml_graph_overhead_custom(size_gf, /*grads = */ true);
+                if (opt_compute_meta.size() < size_meta) {
+                    opt_compute_meta.resize(size_meta);
+                }
                 struct ggml_init_params params = {
-                    /*.mem_size   =*/ size_meta,
-                    /*.mem_buffer =*/ nullptr,
+                    /*.mem_size   =*/ opt_compute_meta.size(),
+                    /*.mem_buffer =*/ opt_compute_meta.data(),
                     /*.no_alloc   =*/ true,
                 };
                 ctx_compute_opt = ggml_init(params);
@@ -3734,7 +3740,16 @@ void llama_context::opt_epoch_iter(
             {
                 struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
                 GGML_ASSERT(labels->ne[1] == n_ubatch);
-                ggml_set_zero(labels);
+                if (opt_label_storage == nullptr || labels->data != opt_label_storage) {
+                    ggml_set_zero(labels);
+                    opt_label_storage = labels->data;
+                } else {
+                    constexpr float zero = 0.0f;
+                    for (const size_t offset : opt_active_label_offsets) {
+                        ggml_backend_tensor_set(labels, &zero, offset, sizeof(zero));
+                    }
+                }
+                opt_active_label_offsets.clear();
                 int32_t n_active_labels = 0;
                 for (uint32_t pos_ubatch = 0; pos_ubatch < n_ubatch; ++pos_ubatch) {
                     const uint32_t ilabel = pos_ctx + pos_batch + pos_ubatch;
@@ -3746,7 +3761,9 @@ void llama_context::opt_epoch_iter(
                     const float weight = label_weights ? label_weights[ilabel] : 1.0f;
                     if (labels_sparse[ilabel] >= 0 && weight != 0.0f) {
                         GGML_ASSERT(labels_sparse[ilabel] < labels->ne[0]);
-                        ggml_backend_tensor_set(labels, &weight, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
+                        const size_t offset = (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float);
+                        ggml_backend_tensor_set(labels, &weight, offset, sizeof(float));
+                        opt_active_label_offsets.push_back(offset);
                         ++n_active_labels;
                     }
                 }
@@ -3787,9 +3804,20 @@ void llama_context::opt_epoch(
 
     const uint32_t ubatch_per_ctx = n_ctx / n_ubatch;
 
-    struct llama_batch batch = llama_batch_init(n_batch, 0, 1);
-    std::vector<llama_token>        tokens(n_ctx);
-    std::vector<llama_token> labels_sparse(n_ctx);
+    if (opt_batch_capacity != n_batch) {
+        if (opt_batch_capacity != 0) {
+            llama_batch_free(opt_batch);
+        }
+        opt_batch = llama_batch_init(n_batch, 0, 1);
+        opt_batch_capacity = n_batch;
+    }
+    opt_tokens.resize(n_ctx);
+    opt_labels_sparse.resize(n_ctx);
+
+    // Inference can reuse the scheduler buffers between calls. The first
+    // ubatch therefore always starts from a fully cleared label tensor.
+    opt_label_storage = nullptr;
+    opt_active_label_offsets.clear();
 
     int64_t idata = 0;
 
@@ -3799,9 +3827,9 @@ void llama_context::opt_epoch(
         constexpr bool train = true;
         const int64_t idata_in_loop = idata*ubatch_per_ctx;
 
-        ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), idata);
-        opt_epoch_iter(dataset, result_train, tokens, labels_sparse,
-            label_weights ? label_weights + idata*n_ctx : nullptr, batch,
+        ggml_opt_dataset_get_batch_host(dataset, opt_tokens.data(), n_ctx*sizeof(llama_token), opt_labels_sparse.data(), idata);
+        opt_epoch_iter(dataset, result_train, opt_tokens, opt_labels_sparse,
+            label_weights ? label_weights + idata*n_ctx : nullptr, opt_batch,
             callback_train, train, idata_in_loop, ndata_in_loop, t_loop_start);
     }
 
@@ -3811,13 +3839,11 @@ void llama_context::opt_epoch(
         constexpr bool train = false;
         const int64_t idata_in_loop = (idata - idata_split)*ubatch_per_ctx;
 
-        ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), idata);
-        opt_epoch_iter(dataset, result_eval, tokens, labels_sparse,
-            label_weights ? label_weights + idata*n_ctx : nullptr, batch,
+        ggml_opt_dataset_get_batch_host(dataset, opt_tokens.data(), n_ctx*sizeof(llama_token), opt_labels_sparse.data(), idata);
+        opt_epoch_iter(dataset, result_eval, opt_tokens, opt_labels_sparse,
+            label_weights ? label_weights + idata*n_ctx : nullptr, opt_batch,
             callback_eval, train, idata_in_loop, ndata_in_loop, t_loop_start);
     }
-
-    llama_batch_free(batch);
 }
 
 //
