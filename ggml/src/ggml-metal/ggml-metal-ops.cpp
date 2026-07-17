@@ -5629,7 +5629,7 @@ int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
 
     const int64_t es = (int64_t) sizeof(float); // src1/dst strides are F32 multiples
 
-    // F32 src0 indexes in elements; quantized src0 (Q8_0) can't (block layout),
+    // F32 src0 indexes in elements; quantized src0 can't (block layout),
     // so its kernel takes s01/s02/s03 in bytes instead.
     const int64_t es0 = op->src[0]->type == GGML_TYPE_F32 ? es : 1;
 
@@ -5644,7 +5644,11 @@ int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
         /*.s1   =*/ (int64_t) nb1  / es, /*.s2  =*/ (int64_t) nb2  / es, /*.s3  =*/ (int64_t) nb3  / es,
     };
 
-    const int64_t total = ne0 * ne1 * ne2 * ne3;
+    const bool is_k_quant = op->src[0]->type >= GGML_TYPE_Q2_K &&
+                            op->src[0]->type <= GGML_TYPE_Q6_K;
+    const int64_t outputs_per_thread = is_k_quant ? 16 : 1;
+    GGML_ASSERT(ne0 % outputs_per_thread == 0);
+    const int64_t total = ne0 * ne1 * ne2 * ne3 / outputs_per_thread;
     const int nth = std::min<int64_t>(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), total);
     const int64_t n = (total + nth - 1) / nth;
 

@@ -138,6 +138,54 @@ kernel void kernel_out_prod_q8_0(
     dst[i0 + i1*args.s1 + i2*args.s2 + i3*args.s3] = acc;
 }
 
+// retro delta: K-quant out-prod specialization.
+template<typename block_q, void (*dequantize_func)(device const block_q *, short, thread float4x4 &)>
+kernel void kernel_out_prod_k(
+        constant ggml_metal_kargs_out_prod & args,
+        device const char  * src0,
+        device const float * src1,
+        device       float * dst,
+        uint gid[[thread_position_in_grid]]) {
+    const int64_t ne0_chunks = args.ne0 / 16;
+    const int64_t total = ne0_chunks * args.ne1 * args.ne2 * args.ne3;
+    if ((int64_t) gid >= total) {
+        return;
+    }
+
+    const int64_t ic = (int64_t) gid % ne0_chunks;
+    int64_t r        = (int64_t) gid / ne0_chunks;
+    const int64_t i1 = r % args.ne1;
+    r /= args.ne1;
+    const int64_t i2 = r % args.ne2;
+    const int64_t i3 = r / args.ne2;
+
+    const int64_t i02 = i2 / args.dps2;
+    const int64_t i03 = i3 / args.dps3;
+    const int64_t i0  = ic * 16;
+    const int64_t ib  = i0 / QK_K;
+    const short   il  = (i0 % QK_K) / 16;
+
+    device const char * base0 = src0 + i02*args.s02 + i03*args.s03;
+    const int64_t off1 = i1*args.s10 + i2*args.s12 + i3*args.s13;
+
+    float4x4 acc(0.0f);
+    for (int64_t k = 0; k < args.ne01; ++k) {
+        float4x4 values;
+        dequantize_func((device const block_q *)(base0 + k*args.s01) + ib, il, values);
+        acc += values * src1[off1 + k*args.s11];
+    }
+
+    *((device float4x4 *)(dst + i0 + i1*args.s1 + i2*args.s2 + i3*args.s3)) = acc;
+}
+
+typedef decltype(kernel_out_prod_k<block_q2_K, dequantize_q2_K>) out_prod_k_t;
+
+template [[host_name("kernel_out_prod_q2_K")]] kernel out_prod_k_t kernel_out_prod_k<block_q2_K, dequantize_q2_K>;
+template [[host_name("kernel_out_prod_q3_K")]] kernel out_prod_k_t kernel_out_prod_k<block_q3_K, dequantize_q3_K>;
+template [[host_name("kernel_out_prod_q4_K")]] kernel out_prod_k_t kernel_out_prod_k<block_q4_K, dequantize_q4_K>;
+template [[host_name("kernel_out_prod_q5_K")]] kernel out_prod_k_t kernel_out_prod_k<block_q5_K, dequantize_q5_K>;
+template [[host_name("kernel_out_prod_q6_K")]] kernel out_prod_k_t kernel_out_prod_k<block_q6_K, dequantize_q6_K>;
+
 // retro delta: threadgroup-wide sum/max over per-simdgroup partials. Safe for any
 // threadgroup size (including a partial trailing simdgroup): only simdgroup 0
 // combines the partials, then the total is re-broadcast through shared memory.
