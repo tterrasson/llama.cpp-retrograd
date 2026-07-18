@@ -2038,7 +2038,8 @@ struct test_unary : public test_case {
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const bool grad_supported = op == GGML_UNARY_OP_ABS || op == GGML_UNARY_OP_SGN || op == GGML_UNARY_OP_NEG ||
-            op == GGML_UNARY_OP_STEP || op == GGML_UNARY_OP_RELU || op == GGML_UNARY_OP_SILU ||
+            op == GGML_UNARY_OP_STEP || op == GGML_UNARY_OP_TANH || op == GGML_UNARY_OP_RELU ||
+            op == GGML_UNARY_OP_GELU || op == GGML_UNARY_OP_SILU ||
             op == GGML_UNARY_OP_EXPM1 || op == GGML_UNARY_OP_SOFTPLUS;
 
         ggml_tensor * a;
@@ -2074,6 +2075,11 @@ struct test_unary : public test_case {
         float min = -150.f;
         float max =  150.f;
 
+        if (op == GGML_UNARY_OP_TANH || op == GGML_UNARY_OP_GELU) {
+            min = -3.f;
+            max =  3.f;
+        }
+
         // Keep FP16 exp/expm1 inputs in-range so all backends stay finite instead of
         // disagreeing on whether overflow saturates to max-F16 or produces +inf.
         if (type == GGML_TYPE_F16 && (op == GGML_UNARY_OP_EXP || op == GGML_UNARY_OP_EXPM1)) {
@@ -2088,7 +2094,30 @@ struct test_unary : public test_case {
     }
 
     float grad_eps() override {
+        if (op == GGML_UNARY_OP_TANH || op == GGML_UNARY_OP_GELU) {
+            return 0.1f;
+        }
         return 15.0f;
+    }
+
+    bool grad_precise() override {
+        return op == GGML_UNARY_OP_TANH || op == GGML_UNARY_OP_GELU;
+    }
+
+    int64_t grad_nmax() override {
+        return op == GGML_UNARY_OP_TANH || op == GGML_UNARY_OP_GELU ? 2048 : 10000;
+    }
+
+    double max_maa_err() override {
+        if (op == GGML_UNARY_OP_TANH) {
+            return 5e-4;
+        }
+        // The CPU GELU forward path uses an FP16 lookup table even for F32
+        // tensors, so finite differences include its quantization error.
+        if (op == GGML_UNARY_OP_GELU) {
+            return 1e-2;
+        }
+        return 1e-4;
     }
 
     std::vector<float> grad_expect() override {

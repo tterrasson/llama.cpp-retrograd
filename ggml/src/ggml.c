@@ -7262,9 +7262,43 @@ static void ggml_compute_backward(
                 case GGML_UNARY_OP_STEP: {
                     // noop
                 } break;
+                case GGML_UNARY_OP_TANH: {
+                    if (src0_needs_grads) {
+                        // d/dx tanh(x) = 1 - tanh(x)^2. Reuse the forward
+                        // result to avoid evaluating tanh a second time.
+                        struct ggml_tensor * tanh_sq = ggml_sqr(ctx, tensor);
+                        ggml_add_or_set(ctx, cgraph, isrc0,
+                                ggml_sub(ctx, grad, ggml_mul(ctx, grad, tanh_sq)));
+                    }
+                } break;
                 case GGML_UNARY_OP_RELU: {
                     if (src0_needs_grads) {
                         ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, ggml_step(ctx, src0), grad));
+                    }
+                } break;
+                case GGML_UNARY_OP_GELU: {
+                    if (src0_needs_grads) {
+                        // GELU uses the tanh approximation in the forward pass:
+                        //   u  = sqrt(2/pi) * (x + 0.044715*x^3)
+                        //   t  = tanh(u)
+                        //   g' = 0.5*(1 + t)
+                        //        + 0.5*x*(1 - t^2)*sqrt(2/pi)*(1 + 3*0.044715*x^2)
+                        const float coef_a = 0.044715f;
+                        const float sqrt_2_over_pi = 0.79788456080286535587989211986876f;
+                        struct ggml_tensor * x     = src0;
+                        struct ggml_tensor * x2    = ggml_sqr(ctx, x);
+                        struct ggml_tensor * u     = ggml_mul(ctx, x,
+                                ggml_scale_bias(ctx, x2, sqrt_2_over_pi*coef_a, sqrt_2_over_pi));
+                        struct ggml_tensor * t     = ggml_tanh(ctx, u);
+                        struct ggml_tensor * dudx  = ggml_scale_bias(ctx, x2,
+                                3.0f*sqrt_2_over_pi*coef_a, sqrt_2_over_pi);
+                        struct ggml_tensor * sech2 = ggml_scale_bias(ctx, ggml_sqr(ctx, t), -1.0f, 1.0f);
+                        struct ggml_tensor * dgelu = ggml_scale(ctx,
+                                ggml_add(ctx,
+                                    ggml_scale_bias(ctx, t, 1.0f, 1.0f),
+                                    ggml_mul(ctx, ggml_mul(ctx, x, sech2), dudx)),
+                                0.5f);
+                        ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad, dgelu));
                     }
                 } break;
                 case GGML_UNARY_OP_SILU: {
@@ -7725,7 +7759,9 @@ static bool ggml_backward_op_implemented(const struct ggml_tensor * node) {
                 case GGML_UNARY_OP_SGN:
                 case GGML_UNARY_OP_NEG:
                 case GGML_UNARY_OP_STEP:
+                case GGML_UNARY_OP_TANH:
                 case GGML_UNARY_OP_RELU:
+                case GGML_UNARY_OP_GELU:
                 case GGML_UNARY_OP_SILU:
                 case GGML_UNARY_OP_EXP:
                 case GGML_UNARY_OP_EXPM1:
