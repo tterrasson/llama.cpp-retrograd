@@ -350,6 +350,14 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_ssm_scan(ctx, idx);
             } break;
+        case GGML_OP_SSM_CONV_BACK: // retro delta
+            {
+                n_fuse = ggml_metal_op_ssm_conv_back(ctx, idx);
+            } break;
+        case GGML_OP_SSM_SCAN_BACK: // retro delta
+            {
+                n_fuse = ggml_metal_op_ssm_scan_back(ctx, idx);
+            } break;
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_RWKV_WKV7:
             {
@@ -5699,6 +5707,111 @@ static void ggml_metal_op_retro_fill_zero(ggml_metal_op_t ctx, ggml_tensor * t) 
     ggml_metal_encoder_dispatch_threadgroups(enc, n, 1, 1, nth, 1, 1);
 
     ggml_metal_op_concurrency_reset(ctx);
+}
+
+// retro delta: SSM convolution backward. One flat thread per element of the
+// packed [grad_sx | grad_c] output.
+int ggml_metal_op_ssm_conv_back(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * sx = op->src[0];
+    const ggml_tensor * c  = op->src[1];
+    const ggml_tensor * dy = op->src[2];
+
+    ggml_metal_kargs_ssm_conv_back args = {
+        /*.d_conv  =*/ c->ne[0],
+        /*.ncs     =*/ sx->ne[0],
+        /*.d_inner =*/ sx->ne[1],
+        /*.n_t     =*/ dy->ne[1],
+        /*.n_s     =*/ sx->ne[2],
+        /*.nb00 =*/ sx->nb[0], /*.nb01 =*/ sx->nb[1], /*.nb02 =*/ sx->nb[2],
+        /*.nb10 =*/ c ->nb[0], /*.nb11 =*/ c ->nb[1],
+        /*.nb20 =*/ dy->nb[0], /*.nb21 =*/ dy->nb[1], /*.nb22 =*/ dy->nb[2],
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_ssm_conv_back(lib, op);
+    const int64_t total = ggml_nelements(op);
+    const int nth = std::min<int64_t>(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), total);
+    const int64_t n = (total + nth - 1) / nth;
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(sx), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(c),  2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dy), 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op), 4);
+    ggml_metal_encoder_dispatch_threadgroups(enc, n, 1, 1, nth, 1, 1);
+
+    return 1;
+}
+
+// retro delta: SSM scan backward. The kernel accumulates several shared
+// gradients atomically, so clear the packed destination before dispatch.
+int ggml_metal_op_ssm_scan_back(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * s   = op->src[0];
+    const ggml_tensor * x   = op->src[1];
+    const ggml_tensor * dt  = op->src[2];
+    const ggml_tensor * A   = op->src[3];
+    const ggml_tensor * B   = op->src[4];
+    const ggml_tensor * C   = op->src[5];
+    const ggml_tensor * ids = op->src[6];
+    const ggml_tensor * ds  = op->src[7];
+
+    const int64_t n_x  = ggml_nelements(x);
+    const int64_t n_dt = ggml_nelements(dt);
+    const int64_t n_A  = ggml_nelements(A);
+    const int64_t n_B  = ggml_nelements(B);
+    const int64_t n_C  = ggml_nelements(C);
+
+    ggml_metal_kargs_ssm_scan_back args = {
+        /*.d_state      =*/ s->ne[0],
+        /*.head_dim     =*/ x->ne[0],
+        /*.n_head       =*/ x->ne[1],
+        /*.n_group      =*/ B->ne[1],
+        /*.n_seq_tokens =*/ x->ne[2],
+        /*.n_seqs       =*/ x->ne[3],
+        /*.n_A0         =*/ A->ne[0],
+        /*.off_dt       =*/ n_x,
+        /*.off_A        =*/ n_x + n_dt,
+        /*.off_B        =*/ n_x + n_dt + n_A,
+        /*.off_C        =*/ n_x + n_dt + n_A + n_B,
+        /*.off_s        =*/ n_x + n_dt + n_A + n_B + n_C,
+        /*.nb00 =*/ s->nb[0], /*.nb01 =*/ s->nb[1], /*.nb02 =*/ s->nb[2], /*.nb03 =*/ s->nb[3],
+        /*.nb10 =*/ x->nb[0], /*.nb11 =*/ x->nb[1], /*.nb12 =*/ x->nb[2], /*.nb13 =*/ x->nb[3],
+        /*.nb20 =*/ dt->nb[0], /*.nb21 =*/ dt->nb[1], /*.nb22 =*/ dt->nb[2],
+        /*.nb30 =*/ A->nb[0], /*.nb31 =*/ A->nb[1],
+        /*.nb40 =*/ B->nb[0], /*.nb41 =*/ B->nb[1], /*.nb42 =*/ B->nb[2], /*.nb43 =*/ B->nb[3],
+        /*.nb50 =*/ C->nb[0], /*.nb51 =*/ C->nb[1], /*.nb52 =*/ C->nb[2], /*.nb53 =*/ C->nb[3],
+        /*.nb60 =*/ ids->nb[0],
+    };
+
+    ggml_metal_op_retro_fill_zero(ctx, op);
+
+    auto pipeline = ggml_metal_library_get_pipeline_ssm_scan_back(lib, op);
+    const int64_t total = s->ne[0]*x->ne[0]*x->ne[1]*x->ne[2]*x->ne[3];
+    const int nth = std::min<int64_t>(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), total);
+    const int64_t n = (total + nth - 1) / nth;
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(s),   1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),   2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dt),  3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(A),   4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(B),   5);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(C),   6);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ids), 7);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ds),  8);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),  9);
+    ggml_metal_encoder_dispatch_threadgroups(enc, n, 1, 1, nth, 1, 1);
+
+    return 1;
 }
 
 // retro delta: soft-max backward. One threadgroup per row; a single dot-product

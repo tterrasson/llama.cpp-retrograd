@@ -1826,6 +1826,39 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return has_simdgroup_reduction;
         case GGML_OP_SSM_CONV:
             return has_simdgroup_reduction;
+        // retro delta: dedicated F32 backward kernels. SSM_CONV_BACK writes
+        // disjoint packed-output elements; SSM_SCAN_BACK zero-fills its packed
+        // output and uses atomic-float accumulation for shared B/C/A/state
+        // gradients. Keep the contract deliberately narrow so unsupported
+        // layouts continue to fall back through the scheduler.
+        case GGML_OP_SSM_CONV_BACK:
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 &&
+                   op->type         == GGML_TYPE_F32 &&
+                   op->src[0]->nb[0] == sizeof(float) &&
+                   op->src[1]->nb[0] == sizeof(float) &&
+                   op->src[2]->nb[0] == sizeof(float) &&
+                   ggml_is_contiguous(op);
+        case GGML_OP_SSM_SCAN_BACK:
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 &&
+                   op->src[3]->type == GGML_TYPE_F32 &&
+                   op->src[4]->type == GGML_TYPE_F32 &&
+                   op->src[5]->type == GGML_TYPE_F32 &&
+                   op->src[6]->type == GGML_TYPE_I32 &&
+                   op->src[7]->type == GGML_TYPE_F32 &&
+                   op->type         == GGML_TYPE_F32 &&
+                   op->src[0]->nb[0] == sizeof(float) &&
+                   op->src[1]->nb[0] == sizeof(float) &&
+                   op->src[2]->nb[0] == sizeof(float) &&
+                   op->src[3]->nb[0] == sizeof(float) &&
+                   op->src[4]->nb[0] == sizeof(float) &&
+                   op->src[5]->nb[0] == sizeof(float) &&
+                   op->src[6]->nb[0] == sizeof(int32_t) &&
+                   ggml_is_contiguous(op->src[7]) &&
+                   ggml_is_contiguous(op);
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_RWKV_WKV7:
             return true;
@@ -1956,6 +1989,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         // Anything else falls back to CPU.
         case GGML_OP_OUT_PROD:
             return (op->src[0]->type == GGML_TYPE_F32 ||
+                    op->src[0]->type == GGML_TYPE_Q5_0 ||
                     op->src[0]->type == GGML_TYPE_Q8_0 ||
                     op->src[0]->type == GGML_TYPE_Q2_K ||
                     op->src[0]->type == GGML_TYPE_Q3_K ||

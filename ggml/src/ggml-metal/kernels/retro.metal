@@ -64,6 +64,143 @@ kernel void kernel_rms_norm_back_f32(
     }
 }
 
+// retro delta: SSM convolution backward. The packed output contains grad_sx
+// followed by grad_c. Every thread owns exactly one output element.
+kernel void kernel_ssm_conv_back_f32(
+        constant ggml_metal_kargs_ssm_conv_back & args,
+        device const char  * src0,
+        device const char  * src1,
+        device const char  * src2,
+        device       float * dst,
+        uint gid[[thread_position_in_grid]]) {
+    const int64_t n_sx = args.ncs * args.d_inner * args.n_s;
+    const int64_t n_c  = args.d_conv * args.d_inner;
+    if ((int64_t) gid >= n_sx + n_c) {
+        return;
+    }
+
+    if ((int64_t) gid < n_sx) {
+        int64_t r = gid;
+        const int64_t j  = r % args.ncs;
+        r /= args.ncs;
+        const int64_t ch = r % args.d_inner;
+        const int64_t s  = r / args.d_inner;
+        const int64_t kmin = j >= args.n_t ? j - (args.n_t - 1) : 0;
+        const int64_t kmax = min(j, args.d_conv - 1);
+        float acc = 0.0f;
+        for (int64_t k = kmin; k <= kmax; ++k) {
+            const int64_t t = j - k;
+            const float dy = *(device const float *) (src2 + ch*args.nb20 + t*args.nb21 + s*args.nb22);
+            const float c = *(device const float *) (src1 + k*args.nb10 + ch*args.nb11);
+            acc += dy*c;
+        }
+        dst[gid] = acc;
+        return;
+    }
+
+    int64_t r = (int64_t) gid - n_sx;
+    const int64_t k  = r % args.d_conv;
+    const int64_t ch = r / args.d_conv;
+    float acc = 0.0f;
+    for (int64_t s = 0; s < args.n_s; ++s) {
+        for (int64_t t = 0; t < args.n_t; ++t) {
+            const float sx = *(device const float *) (src0 + (k + t)*args.nb00 + ch*args.nb01 + s*args.nb02);
+            const float dy = *(device const float *) (src2 + ch*args.nb20 + t*args.nb21 + s*args.nb22);
+            acc += dy*sx;
+        }
+    }
+    dst[gid] = acc;
+}
+
+// retro delta: SSM scan backward. One thread handles one (sequence, token,
+// head, channel, state) tuple. It recomputes the scalar forward trajectory and
+// reverse adjoint, then atomically contributes to the packed gradients.
+kernel void kernel_ssm_scan_back_f32(
+        constant ggml_metal_kargs_ssm_scan_back & args,
+        device const char  * src0,
+        device const char  * src1,
+        device const char  * src2,
+        device const char  * src3,
+        device const char  * src4,
+        device const char  * src5,
+        device const char  * src6,
+        device const float * src7,
+        device       float * dst,
+        uint gid[[thread_position_in_grid]]) {
+    const int64_t total = args.d_state * args.head_dim * args.n_head * args.n_seq_tokens * args.n_seqs;
+    if ((int64_t) gid >= total) {
+        return;
+    }
+
+    int64_t r = gid;
+    const int64_t n = r % args.d_state;
+    r /= args.d_state;
+    const int64_t p = r % args.head_dim;
+    r /= args.head_dim;
+    const int64_t h = r % args.n_head;
+    r /= args.n_head;
+    const int64_t t = r % args.n_seq_tokens;
+    const int64_t s = r / args.n_seq_tokens;
+
+    const int64_t g = h / (args.n_head / args.n_group);
+    const int32_t slot = *(device const int32_t *) (src6 + s*args.nb60);
+    const float A = *(device const float *) (src3 + (args.n_A0 == 1 ? 0 : n*args.nb30) + h*args.nb31);
+
+    float state = *(device const float *) (src0 + n*args.nb00 + p*args.nb01 + h*args.nb02 + (int64_t) slot*args.nb03);
+    float prev = state;
+    for (int64_t u = 0; u <= t; ++u) {
+        const float dtv = *(device const float *) (src2 + h*args.nb20 + u*args.nb21 + s*args.nb22);
+        const float dsp = dtv <= 20.0f ? log(1.0f + exp(dtv)) : dtv;
+        const float aval = exp(dsp*A);
+        const float x = *(device const float *) (src1 + p*args.nb10 + h*args.nb11 + u*args.nb12 + s*args.nb13);
+        const float B = *(device const float *) (src4 + n*args.nb40 + g*args.nb41 + u*args.nb42 + s*args.nb43);
+        prev = state;
+        state = prev*aval + B*x*dsp;
+    }
+
+    const int64_t n_x = args.off_dt;
+    const int64_t final_off = n_x + s*(args.d_state*args.head_dim*args.n_head) + h*(args.d_state*args.head_dim) + p*args.d_state + n;
+    float lambda = 0.0f;
+    for (int64_t u = args.n_seq_tokens - 1; u >= t; --u) {
+        const float dy = src7[p + h*args.head_dim + u*args.head_dim*args.n_head + s*args.n_seq_tokens*args.head_dim*args.n_head];
+        const float C = *(device const float *) (src5 + n*args.nb50 + g*args.nb51 + u*args.nb52 + s*args.nb53);
+        float future;
+        if (u == args.n_seq_tokens - 1) {
+            future = src7[final_off];
+        } else {
+            const float dt_next = *(device const float *) (src2 + h*args.nb20 + (u + 1)*args.nb21 + s*args.nb22);
+            const float dsp_next = dt_next <= 20.0f ? log(1.0f + exp(dt_next)) : dt_next;
+            future = exp(dsp_next*A)*lambda;
+        }
+        lambda = dy*C + future;
+    }
+
+    const float dtv = *(device const float *) (src2 + h*args.nb20 + t*args.nb21 + s*args.nb22);
+    const float dsp = dtv <= 20.0f ? log(1.0f + exp(dtv)) : dtv;
+    const float sig = dtv > 20.0f ? 1.0f : 1.0f/(1.0f + exp(-dtv));
+    const float aval = exp(dsp*A);
+    const float x = *(device const float *) (src1 + p*args.nb10 + h*args.nb11 + t*args.nb12 + s*args.nb13);
+    const float B = *(device const float *) (src4 + n*args.nb40 + g*args.nb41 + t*args.nb42 + s*args.nb43);
+    const float dy = src7[p + h*args.head_dim + t*args.head_dim*args.n_head + s*args.n_seq_tokens*args.head_dim*args.n_head];
+
+    const int64_t ix  = p + h*args.head_dim + t*args.head_dim*args.n_head + s*args.n_seq_tokens*args.head_dim*args.n_head;
+    const int64_t idt = args.off_dt + h + t*args.n_head + s*args.n_head*args.n_seq_tokens;
+    const int64_t iA  = args.off_A + (args.n_A0 == 1 ? h : n + h*args.d_state);
+    const int64_t iB  = args.off_B + n + g*args.d_state + t*args.d_state*args.n_group + s*args.d_state*args.n_group*args.n_seq_tokens;
+    const int64_t iC  = args.off_C + n + g*args.d_state + t*args.d_state*args.n_group + s*args.d_state*args.n_group*args.n_seq_tokens;
+
+    atomic_fetch_add_explicit((device atomic_float *) dst + ix, dsp*lambda*B, memory_order_relaxed);
+    atomic_fetch_add_explicit((device atomic_float *) dst + idt, (lambda*prev*A*aval + x*lambda*B)*sig, memory_order_relaxed);
+    atomic_fetch_add_explicit((device atomic_float *) dst + iA, lambda*prev*dsp*aval, memory_order_relaxed);
+    atomic_fetch_add_explicit((device atomic_float *) dst + iB, lambda*x*dsp, memory_order_relaxed);
+    atomic_fetch_add_explicit((device atomic_float *) dst + iC, dy*state, memory_order_relaxed);
+
+    if (t == 0) {
+        const int64_t is0 = args.off_s + n + p*args.d_state + h*args.d_state*args.head_dim + (int64_t) slot*args.d_state*args.head_dim*args.n_head;
+        atomic_fetch_add_explicit((device atomic_float *) dst + is0, aval*lambda, memory_order_relaxed);
+    }
+}
+
 // retro delta: out-prod (weight-gradient GEMM) for LoRA training.
 // dst[i0,i1,i2,i3] = sum_k src0[i0,k,i02,i03] * src1[i1,k,i2,i3]
 // with GQA broadcast i02 = i2/dps2, i03 = i3/dps3. Correctness-first: one thread
@@ -135,6 +272,43 @@ kernel void kernel_out_prod_q8_0(
         acc += ((float) blk->d * blk->qs[iq]) * src1[off1 + k*args.s11];
     }
 
+    dst[i0 + i1*args.s1 + i2*args.s2 + i3*args.s3] = acc;
+}
+
+// retro delta: activation-gradient path for legacy Q5_0 model weights.
+kernel void kernel_out_prod_q5_0(
+        constant ggml_metal_kargs_out_prod & args,
+        device const char  * src0,
+        device const float * src1,
+        device       float * dst,
+        uint gid[[thread_position_in_grid]]) {
+    const int64_t total = args.ne0 * args.ne1 * args.ne2 * args.ne3;
+    if ((int64_t) gid >= total) {
+        return;
+    }
+
+    const int64_t i0 = (int64_t) gid % args.ne0;
+    int64_t r        = (int64_t) gid / args.ne0;
+    const int64_t i1 = r % args.ne1;
+    r /= args.ne1;
+    const int64_t i2 = r % args.ne2;
+    const int64_t i3 = r / args.ne2;
+    const int64_t i02 = i2 / args.dps2;
+    const int64_t i03 = i3 / args.dps3;
+    const int64_t ib  = i0 / QK5_0;
+    const short   iq  = i0 % QK5_0;
+    const short   il  = iq & 15;
+
+    device const char * base0 = src0 + i02*args.s02 + i03*args.s03;
+    const int64_t off1 = i1*args.s10 + i2*args.s12 + i3*args.s13;
+    float acc = 0.0f;
+    for (int64_t k = 0; k < args.ne01; ++k) {
+        device const block_q5_0 * blk = (device const block_q5_0 *) (base0 + k*args.s01) + ib;
+        const uint qh = *((device const uint *) blk->qh);
+        const int low = iq < 16 ? (blk->qs[il] & 0x0f) : (blk->qs[il] >> 4);
+        const int q = low | (int) (((qh >> iq) & 1u) << 4);
+        acc += ((float) blk->d * (float) (q - 16)) * src1[off1 + k*args.s11];
+    }
     dst[i0 + i1*args.s1 + i2*args.s2 + i3*args.s3] = acc;
 }
 

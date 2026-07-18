@@ -959,6 +959,44 @@ typedef struct {
     uint64_t nb0;
 } ggml_metal_kargs_ssm_scan;
 
+// retro delta: SSM convolution backward. The destination is a packed F32
+// vector [grad_sx | grad_c]; all source strides are expressed in bytes.
+typedef struct {
+    int64_t  d_conv;
+    int64_t  ncs;
+    int64_t  d_inner;
+    int64_t  n_t;
+    int64_t  n_s;
+    uint64_t nb00; uint64_t nb01; uint64_t nb02;
+    uint64_t nb10; uint64_t nb11;
+    uint64_t nb20; uint64_t nb21; uint64_t nb22;
+} ggml_metal_kargs_ssm_conv_back;
+
+// retro delta: SSM scan backward. The destination is the packed F32 vector
+// [grad_x | grad_dt | grad_A | grad_B | grad_C | grad_s]. Source strides are
+// bytes; packed-output offsets are element offsets.
+typedef struct {
+    int64_t  d_state;
+    int64_t  head_dim;
+    int64_t  n_head;
+    int64_t  n_group;
+    int64_t  n_seq_tokens;
+    int64_t  n_seqs;
+    int64_t  n_A0;
+    int64_t  off_dt;
+    int64_t  off_A;
+    int64_t  off_B;
+    int64_t  off_C;
+    int64_t  off_s;
+    uint64_t nb00; uint64_t nb01; uint64_t nb02; uint64_t nb03;
+    uint64_t nb10; uint64_t nb11; uint64_t nb12; uint64_t nb13;
+    uint64_t nb20; uint64_t nb21; uint64_t nb22;
+    uint64_t nb30; uint64_t nb31;
+    uint64_t nb40; uint64_t nb41; uint64_t nb42; uint64_t nb43;
+    uint64_t nb50; uint64_t nb51; uint64_t nb52; uint64_t nb53;
+    uint64_t nb60;
+} ggml_metal_kargs_ssm_scan_back;
+
 typedef struct {
     int32_t  ne00;
     int32_t  ne01;
