@@ -1,49 +1,28 @@
 #version 450
 
+#extension GL_EXT_control_flow_attributes : enable
+
 #include "generic_head.glsl"
 #include "types.glsl"
 
-#extension GL_EXT_control_flow_attributes : enable
+// retro delta: backward of the (Retroback-weighted) cross-entropy loss. Per row i1:
+//   p          = softmax(logits[i1])
+//   label_mass = Sum_c labels[i1,c]
+//   dst[i1,c]  = (label_mass * p[c] - labels[i1,c]) * grad[0] / nactive
+// Rows with zero label mass produce a zero gradient. nactive is precomputed on
+// the host (op_params override, else the row count) and passed in param1, so no
+// cross-row reduction is needed and every workgroup owns one row.
 
-layout(constant_id = 0) const uint BLOCK_SIZE = 32;
+layout(constant_id = 0) const uint BLOCK_SIZE = 128;
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
-layout (binding = 0) readonly buffer G {A_TYPE data_g[];};
-layout (binding = 1) readonly buffer X {B_TYPE data_x[];};
-layout (binding = 2) readonly buffer Y {B_TYPE data_y[];};
-layout (binding = 3) writeonly buffer D {D_TYPE data_d[];};
+layout (binding = 0) readonly  buffer G {float  data_grad[];};
+layout (binding = 1) readonly  buffer L {A_TYPE data_logits[];};
+layout (binding = 2) readonly  buffer Y {B_TYPE data_labels[];};
+layout (binding = 3) writeonly buffer D {D_TYPE data_dst[];};
 
-shared FLOAT_TYPE tmp[BLOCK_SIZE];
-
-FLOAT_TYPE wg_reduce_max(FLOAT_TYPE v) {
-    const uint tid = gl_LocalInvocationID.x;
-    tmp[tid] = v;
-    barrier();
-    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            tmp[tid] = max(tmp[tid], tmp[tid + s]);
-        }
-        barrier();
-    }
-    v = tmp[0];
-    barrier();
-    return v;
-}
-
-FLOAT_TYPE wg_reduce_sum(FLOAT_TYPE v) {
-    const uint tid = gl_LocalInvocationID.x;
-    tmp[tid] = v;
-    barrier();
-    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            tmp[tid] += tmp[tid + s];
-        }
-        barrier();
-    }
-    v = tmp[0];
-    barrier();
-    return v;
-}
+shared FLOAT_TYPE sh_a[BLOCK_SIZE];
+shared FLOAT_TYPE sh_b[BLOCK_SIZE];
 
 void main() {
     const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
@@ -53,23 +32,53 @@ void main() {
         return;
     }
 
-    const uint off = row * p.KX;
-    const FLOAT_TYPE d_by_nrows = FLOAT_TYPE(data_g[0]) / FLOAT_TYPE(p.KY);
+    const uint nc   = p.KX;
+    const uint base = row * nc;
 
-    FLOAT_TYPE max_logit = FLOAT_TYPE(uintBitsToFloat(0xFF800000));
-    for (uint i = tid; i < p.KX; i += BLOCK_SIZE) {
-        max_logit = max(max_logit, FLOAT_TYPE(data_x[off + i]));
+    // row max
+    FLOAT_TYPE m = FLOAT_TYPE(-3.402823466e+38);
+    [[unroll]] for (uint col = tid; col < nc; col += BLOCK_SIZE) {
+        m = max(m, FLOAT_TYPE(data_logits[base + col]));
     }
-    max_logit = wg_reduce_max(max_logit);
-
-    FLOAT_TYPE sum_exp = FLOAT_TYPE(0.0f);
-    for (uint i = tid; i < p.KX; i += BLOCK_SIZE) {
-        sum_exp += exp(FLOAT_TYPE(data_x[off + i]) - max_logit);
+    sh_a[tid] = m;
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sh_a[tid] = max(sh_a[tid], sh_a[tid + s]);
+        }
+        barrier();
     }
-    const FLOAT_TYPE inv_sum = FLOAT_TYPE(1.0f) / wg_reduce_sum(sum_exp);
+    const FLOAT_TYPE row_max = sh_a[0];
+    barrier();
 
-    for (uint i = tid; i < p.KX; i += BLOCK_SIZE) {
-        const FLOAT_TYPE sm = exp(FLOAT_TYPE(data_x[off + i]) - max_logit) * inv_sum;
-        data_d[off + i] = D_TYPE((sm - FLOAT_TYPE(data_y[off + i])) * d_by_nrows);
+    // sum(exp(logits - max)) and label mass
+    FLOAT_TYPE se = FLOAT_TYPE(0);
+    FLOAT_TYPE sl = FLOAT_TYPE(0);
+    [[unroll]] for (uint col = tid; col < nc; col += BLOCK_SIZE) {
+        se += exp(FLOAT_TYPE(data_logits[base + col]) - row_max);
+        sl += FLOAT_TYPE(data_labels[base + col]);
+    }
+    sh_a[tid] = se;
+    sh_b[tid] = sl;
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sh_a[tid] += sh_a[tid + s];
+            sh_b[tid] += sh_b[tid + s];
+        }
+        barrier();
+    }
+    const FLOAT_TYPE sum_exp    = sh_a[0];
+    const FLOAT_TYPE label_mass = sh_b[0];
+
+    const bool row_active = label_mass != FLOAT_TYPE(0);
+    const FLOAT_TYPE sm_scale = FLOAT_TYPE(1) / sum_exp;
+    const FLOAT_TYPE d_by_nr  = row_active ? FLOAT_TYPE(data_grad[0] / p.param1) : FLOAT_TYPE(0);
+
+    [[unroll]] for (uint col = tid; col < nc; col += BLOCK_SIZE) {
+        const FLOAT_TYPE sm = exp(FLOAT_TYPE(data_logits[base + col]) - row_max) * sm_scale;
+        data_dst[base + col] = row_active
+            ? D_TYPE((label_mass * sm - FLOAT_TYPE(data_labels[base + col])) * d_by_nr)
+            : D_TYPE(0);
     }
 }

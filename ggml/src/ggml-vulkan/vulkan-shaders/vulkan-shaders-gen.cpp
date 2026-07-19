@@ -835,6 +835,12 @@ void process_shaders() {
             string_to_spv("get_rows_" + tname, shader, merge_maps(base_dict, {{"TEMP_TYPE", "FLOAT_TYPE"}, {data_a_key, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float16_t"}}));
         }
         string_to_spv("get_rows_" + tname + "_f32", shader, merge_maps(base_dict, {{"TEMP_TYPE", "FLOAT_TYPE"}, {data_a_key, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float"}}));
+
+        // out_prod with a quantized src0 (weight-gradient path); reuses the
+        // dequant_funcs.glsl per-element machinery, one variant per quant type.
+        if (tname != "f32" && tname != "f16" && tname != "bf16") {
+            string_to_spv("out_prod_" + tname + "_f32", "out_prod_quant.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
+        }
     }
 
     string_to_spv("get_rows_i32", "get_rows.comp", {{"TEMP_TYPE", "uint"}, {"A_TYPE", "uint"}, {"B_TYPE", "int"}, {"D_TYPE", "uint"}});
@@ -1220,6 +1226,8 @@ void process_shaders() {
     string_to_spv("ssm_scan_subgroup_f32", "ssm_scan.comp", {{"A_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}});
 
     string_to_spv("ssm_conv_f32", "ssm_conv.comp", {{"A_TYPE", "float"}});
+    string_to_spv("ssm_conv_back_f32", "ssm_conv_back.comp", {{"A_TYPE", "float"}});
+    string_to_spv("ssm_scan_back_f32", "ssm_scan_back.comp", {{"A_TYPE", "float"}});
 
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
 

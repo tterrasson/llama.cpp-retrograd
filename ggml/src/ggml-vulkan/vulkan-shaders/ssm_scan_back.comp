@@ -1,0 +1,119 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_atomic_float : require
+
+// Backward of the Mamba-2 selective scan. One thread per (n, p, h, t, s) element
+// of the state grid; each thread recomputes state_t (forward) and lambda_t
+// (reverse) in O(n_seq_tokens) and scatters its contribution to every gradient
+// block with atomic adds. dst must be zero-filled before dispatch. Mirrors the
+// CPU/Metal reference exactly. Packed dst layout:
+//   [ grad_x | grad_dt | grad_A | grad_B | grad_C | grad_s ]
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint d_state, head_dim, n_head, n_group, n_seq_tokens, n_seqs, n_A0;
+    uint off_dt, off_A, off_B, off_C, off_s;
+    uint nb00, nb01, nb02, nb03;   // s  (element units)
+    uint nb10, nb11, nb12, nb13;   // x
+    uint nb20, nb21, nb22;         // dt
+    uint nb30, nb31;               // A
+    uint nb40, nb41, nb42, nb43;   // B
+    uint nb50, nb51, nb52, nb53;   // C
+    uint nb60;                     // ids
+} p;
+
+layout(binding = 0) readonly buffer S   { float data_s[]; };
+layout(binding = 1) readonly buffer X   { float data_x[]; };
+layout(binding = 2) readonly buffer Dt  { float data_dt[]; };
+layout(binding = 3) readonly buffer Av  { float data_A[]; };
+layout(binding = 4) readonly buffer Bv  { float data_B[]; };
+layout(binding = 5) readonly buffer Cv  { float data_C[]; };
+layout(binding = 6) readonly buffer Ids { int   data_ids[]; };
+layout(binding = 7) readonly buffer Ds  { float data_ds[]; };
+layout(binding = 8)          buffer D   { float data_d[]; };
+
+float softplus(float v) { return v <= 20.0f ? log(1.0f + exp(v)) : v; }
+
+void main() {
+    const uint gid = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+    const uint total = p.d_state * p.head_dim * p.n_head * p.n_seq_tokens * p.n_seqs;
+    if (gid >= total) {
+        return;
+    }
+
+    uint r = gid;
+    const uint n = r % p.d_state;    r /= p.d_state;
+    const uint pp = r % p.head_dim;  r /= p.head_dim;
+    const uint h = r % p.n_head;     r /= p.n_head;
+    const uint t = r % p.n_seq_tokens;
+    const uint s = r / p.n_seq_tokens;
+
+    const uint g = h / (p.n_head / p.n_group);
+    const int  slot = data_ids[s * p.nb60];
+    const float A = data_A[(p.n_A0 == 1u ? 0u : n * p.nb30) + h * p.nb31];
+
+    // recompute state_t, retaining prev = state_{t-1} for the A gradient
+    float state = data_s[n * p.nb00 + pp * p.nb01 + h * p.nb02 + uint(slot) * p.nb03];
+    float prev = state;
+    for (uint u = 0u; u <= t; ++u) {
+        const float dtv = data_dt[h * p.nb20 + u * p.nb21 + s * p.nb22];
+        const float dsp = softplus(dtv);
+        const float aval = exp(dsp * A);
+        const float xv = data_x[pp * p.nb10 + h * p.nb11 + u * p.nb12 + s * p.nb13];
+        const float Bval = data_B[n * p.nb40 + g * p.nb41 + u * p.nb42 + s * p.nb43];
+        prev = state;
+        state = prev * aval + Bval * xv * dsp;
+    }
+
+    // recompute lambda_t from the final-state gradient and later output grads
+    const uint n_x = p.off_dt;
+    const uint final_off = n_x + s * (p.d_state * p.head_dim * p.n_head) +
+                           h * (p.d_state * p.head_dim) + pp * p.d_state + n;
+    float lambda = 0.0f;
+    for (int u = int(p.n_seq_tokens) - 1; u >= int(t); --u) {
+        const uint uu = uint(u);
+        const float dy = data_ds[pp + h * p.head_dim + uu * p.head_dim * p.n_head +
+                                 s * p.n_seq_tokens * p.head_dim * p.n_head];
+        const float C = data_C[n * p.nb50 + g * p.nb51 + uu * p.nb52 + s * p.nb53];
+        float future;
+        if (uu == p.n_seq_tokens - 1u) {
+            future = data_ds[final_off];
+        } else {
+            const float dt_next = data_dt[h * p.nb20 + (uu + 1u) * p.nb21 + s * p.nb22];
+            future = exp(softplus(dt_next) * A) * lambda;
+        }
+        lambda = dy * C + future;
+    }
+
+    const float dtv = data_dt[h * p.nb20 + t * p.nb21 + s * p.nb22];
+    const float dsp = softplus(dtv);
+    const float sig = dtv > 20.0f ? 1.0f : 1.0f / (1.0f + exp(-dtv));
+    const float aval = exp(dsp * A);
+    const float xv = data_x[pp * p.nb10 + h * p.nb11 + t * p.nb12 + s * p.nb13];
+    const float Bval = data_B[n * p.nb40 + g * p.nb41 + t * p.nb42 + s * p.nb43];
+    const float dy = data_ds[pp + h * p.head_dim + t * p.head_dim * p.n_head +
+                             s * p.n_seq_tokens * p.head_dim * p.n_head];
+
+    const uint ix  = pp + h * p.head_dim + t * p.head_dim * p.n_head +
+                     s * p.n_seq_tokens * p.head_dim * p.n_head;
+    const uint idt = p.off_dt + h + t * p.n_head + s * p.n_head * p.n_seq_tokens;
+    const uint iA  = p.off_A + (p.n_A0 == 1u ? h : n + h * p.d_state);
+    const uint iB  = p.off_B + n + g * p.d_state + t * p.d_state * p.n_group +
+                     s * p.d_state * p.n_group * p.n_seq_tokens;
+    const uint iC  = p.off_C + n + g * p.d_state + t * p.d_state * p.n_group +
+                     s * p.d_state * p.n_group * p.n_seq_tokens;
+
+    atomicAdd(data_d[ix],  dsp * lambda * Bval);
+    atomicAdd(data_d[idt], (lambda * prev * A * aval + xv * lambda * Bval) * sig);
+    atomicAdd(data_d[iA],  lambda * prev * dsp * aval);
+    atomicAdd(data_d[iB],  lambda * xv * dsp);
+    atomicAdd(data_d[iC],  dy * state);
+
+    if (t == 0u) {
+        const uint is0 = p.off_s + n + pp * p.d_state + h * p.d_state * p.head_dim +
+                         uint(slot) * p.d_state * p.head_dim * p.n_head;
+        atomicAdd(data_d[is0], aval * lambda);
+    }
+}
