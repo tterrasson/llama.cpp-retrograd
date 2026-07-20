@@ -974,7 +974,9 @@ typedef struct {
 
 // retro delta: SSM scan backward. The destination is the packed F32 vector
 // [grad_x | grad_dt | grad_A | grad_B | grad_C | grad_s]. Source strides are
-// bytes; packed-output offsets are element offsets.
+// bytes; packed-output offsets are element offsets. The time axis is processed
+// in chunks of tc tokens; chunk_lo/chunk_hi delimit the token range of one
+// grad dispatch.
 typedef struct {
     int64_t  d_state;
     int64_t  head_dim;
@@ -995,6 +997,9 @@ typedef struct {
     uint64_t nb40; uint64_t nb41; uint64_t nb42; uint64_t nb43;
     uint64_t nb50; uint64_t nb51; uint64_t nb52; uint64_t nb53;
     uint64_t nb60;
+    int64_t  tc;
+    int64_t  chunk_lo;
+    int64_t  chunk_hi;
 } ggml_metal_kargs_ssm_scan_back;
 
 typedef struct {

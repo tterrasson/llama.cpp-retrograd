@@ -6233,9 +6233,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_col2im_1d_f16,  "col2im_1d_f16",  col2im_1d_f16_len,  col2im_1d_f16_data,  "main", 2, sizeof(vk_op_col2im_1d_push_constants), {256, 1, 1}, {}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_col2im_1d_bf16, "col2im_1d_bf16", col2im_1d_bf16_len, col2im_1d_bf16_data, "main", 2, sizeof(vk_op_col2im_1d_push_constants), {256, 1, 1}, {}, 1, true);
 
-    ggml_vk_create_pipeline(device, device->pipeline_out_prod_f32, "out_prod_f32", out_prod_f32_len, out_prod_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_out_prod_f32, "out_prod_f32", out_prod_f32_len, out_prod_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {16, 16, 1}, {}, 1);
 #define CREATE_OUT_PROD_QUANT(TYPE, NAMELC) \
-    ggml_vk_create_pipeline(device, device->pipeline_out_prod_quant_f32[TYPE], "out_prod_" #NAMELC "_f32", out_prod_ ## NAMELC ## _f32_len, out_prod_ ## NAMELC ## _f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_out_prod_quant_f32[TYPE], "out_prod_" #NAMELC "_f32", out_prod_ ## NAMELC ## _f32_len, out_prod_ ## NAMELC ## _f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {16, 16, 1}, {}, 1);
     CREATE_OUT_PROD_QUANT(GGML_TYPE_Q4_0, q4_0)
     CREATE_OUT_PROD_QUANT(GGML_TYPE_Q4_1, q4_1)
     CREATE_OUT_PROD_QUANT(GGML_TYPE_Q5_0, q5_0)
@@ -12678,6 +12678,15 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
                 elements = { nr, 1, 1 };
             }
         } break;
+    case GGML_OP_OUT_PROD:
+        // One 16x16 output tile per workgroup; shader local_size_x remains 256
+        // and maps its linear local id to (tile column, tile row).
+        elements = {
+            (uint32_t)dst->ne[0],
+            (uint32_t)dst->ne[1],
+            (uint32_t)(dst->ne[2] * dst->ne[3]),
+        };
+        break;
     case GGML_OP_SOLVE_TRI:
         {
             uint32_t nr = (uint32_t)(ne02 * ne03);
@@ -12844,7 +12853,6 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     case GGML_OP_DIV:
     case GGML_OP_MUL:
     case GGML_OP_ADD1:
-    case GGML_OP_OUT_PROD:
     case GGML_OP_ARANGE:
     case GGML_OP_FILL:
     case GGML_OP_SCALE:

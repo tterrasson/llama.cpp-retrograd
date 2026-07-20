@@ -10097,11 +10097,8 @@ void ggml_compute_forward_ssm_conv_back(
 static void ggml_compute_forward_ssm_scan_back_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
-    // single-threaded: B and C gradients accumulate across heads within a group,
-    // and A gradients accumulate across sequences, so avoid cross-thread races here.
-    if (params->ith != 0) {
-        return;
-    }
+    const int ith = params->ith;
+    const int nth = params->nth;
 
     const ggml_tensor * src0 = dst->src[0]; // s   {d_state, head_dim, n_head, n_kv}
     const ggml_tensor * src1 = dst->src[1]; // x   {head_dim, n_head, n_seq_tokens, n_seqs}
@@ -10132,8 +10129,14 @@ static void ggml_compute_forward_ssm_scan_back_f32(
     float * g_C  = g_B  + nc*ng*nt*ns;
     float * g_s  = g_C  + nc*ng*nt*ns;
 
-    // zero everything (g_A, g_B, g_C, g_s accumulate; g_x, g_dt are fully written)
-    memset(dst->data, 0, ggml_nbytes(dst));
+    // Each state-space group owns disjoint B/C cells and a disjoint range of
+    // heads (therefore disjoint x/dt/A/s cells). Partitioning by group keeps
+    // every reduction in its original sequence/head/token order without
+    // atomics or floating-point reassociation.
+    if (ith == 0) {
+        memset(dst->data, 0, ggml_nbytes(dst));
+    }
+    ggml_barrier(params->threadpool);
 
     // scratch reused across heads/sequences
     std::vector<float> traj((size_t) nt*nr*nc); // forward states: traj[t*nr*nc + p*nc + n]
@@ -10143,12 +10146,15 @@ static void ggml_compute_forward_ssm_scan_back_f32(
     std::vector<float> lam((size_t) nr*nc);      // state adjoint λ_t[p*nc + n]
     std::vector<float> gda(nc);                  // dL/d(dA) accumulated over head_dim
 
-    for (int64_t i3 = 0; i3 < ns; ++i3) {
-        const int64_t slot = ids[i3];
-        const float * s0 = (const float *) ((const char *) src0->data + slot*src0->nb[3]);
+    const int64_t heads_per_group = nh / ng;
+    for (int64_t g = ith; g < ng; g += nth) {
+        for (int64_t i3 = 0; i3 < ns; ++i3) {
+            const int64_t slot = ids[i3];
+            const float * s0 = (const float *) ((const char *) src0->data + slot*src0->nb[3]);
 
-        for (int64_t h = 0; h < nh; ++h) {
-            const int64_t g = h / (nh / ng);
+            const int64_t h0 = g*heads_per_group;
+            const int64_t h1 = h0 + heads_per_group;
+            for (int64_t h = h0; h < h1; ++h) {
 
             // ---- forward recompute: fill traj, dtsp, sig, aA ----
             for (int64_t t = 0; t < nt; ++t) {
@@ -10261,6 +10267,7 @@ static void ggml_compute_forward_ssm_scan_back_f32(
                     const float a0 = (nA0 == 1) ? aA[0] : aA[n];
                     g_s[n + p*nc + h*nc*nr + slot*nc*nr*nh] += a0 * lam[p*nc + n];
                 }
+            }
             }
         }
     }
@@ -12025,7 +12032,12 @@ static void ggml_compute_forward_cross_entropy_loss_f32(
         float sum_st = 0.0f;
         ggml_vec_sum_f32(nc, &sum_st, st);
         bool active = false;
-        for (int64_t i = 0; i < nc; ++i) active = active || s1[i] != 0.0f;
+        for (int64_t i = 0; i < nc; ++i) {
+            if (s1[i] != 0.0f) {
+                active = true;
+                break;
+            }
+        }
         if (active) {
             sum_thread += sum_st;
             ++active_thread;
@@ -12138,7 +12150,12 @@ static void ggml_compute_forward_cross_entropy_loss_back_f32(
 #endif // NDEBUG
 
         bool active = false;
-        for (int64_t i = 0; i < nc; ++i) active = active || s1[i] != 0.0f;
+        for (int64_t i = 0; i < nc; ++i) {
+            if (s1[i] != 0.0f) {
+                active = true;
+                break;
+            }
+        }
         if (!active) {
             ggml_vec_set_f32(nc, ds0, 0.0f);
             continue;

@@ -632,11 +632,23 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_back(
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan_back(
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan_back_ckpt(
         ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_ASSERT(op->op == GGML_OP_SSM_SCAN_BACK);
 
-    const char * name = "kernel_ssm_scan_back_f32";
+    const char * name = "kernel_ssm_scan_back_ckpt_f32";
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan_back_grad(
+        ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_SSM_SCAN_BACK);
+
+    const char * name = "kernel_ssm_scan_back_grad_f32";
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);

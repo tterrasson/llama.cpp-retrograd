@@ -132,7 +132,8 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan          (ggml_metal_library_t lib, const struct ggml_tensor * op, bool tail);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan_ssd_mma  (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_back     (ggml_metal_library_t lib, const struct ggml_tensor * op); // retro delta
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan_back     (ggml_metal_library_t lib, const struct ggml_tensor * op); // retro delta
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan_back_ckpt(ggml_metal_library_t lib, const struct ggml_tensor * op); // retro delta
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan_back_grad(ggml_metal_library_t lib, const struct ggml_tensor * op); // retro delta
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rwkv              (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net   (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri         (ggml_metal_library_t lib, const struct ggml_tensor * op);

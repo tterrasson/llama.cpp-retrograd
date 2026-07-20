@@ -5620,8 +5620,7 @@ int ggml_metal_op_rms_norm_back(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-// retro delta: out-prod (weight-gradient GEMM). Correctness-first flat dispatch:
-// one thread per dst element, sequential reduction over the contraction dim.
+// retro delta: out-prod (weight-gradient GEMM), tiled across both output axes.
 int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -5656,17 +5655,24 @@ int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
                             op->src[0]->type <= GGML_TYPE_Q6_K;
     const int64_t outputs_per_thread = is_k_quant ? 16 : 1;
     GGML_ASSERT(ne0 % outputs_per_thread == 0);
-    const int64_t total = ne0 * ne1 * ne2 * ne3 / outputs_per_thread;
-    const int nth = std::min<int64_t>(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), total);
-    const int64_t n = (total + nth - 1) / nth;
-
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, n, 1, 1, nth, 1, 1);
+    if (is_k_quant) {
+        constexpr int tile = 8;
+        const int64_t ne0_chunks = ne0 / outputs_per_thread;
+        ggml_metal_encoder_dispatch_threadgroups(
+                enc, (ne0_chunks + tile - 1)/tile, (ne1 + tile - 1)/tile, ne2*ne3,
+                tile, tile, 1);
+    } else {
+        constexpr int tile = 8;
+        ggml_metal_encoder_dispatch_threadgroups(
+                enc, (ne0 + tile - 1)/tile, (ne1 + tile - 1)/tile, ne2*ne3,
+                tile, tile, 1);
+    }
 
     return 1;
 }
@@ -5747,8 +5753,43 @@ int ggml_metal_op_ssm_conv_back(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-// retro delta: SSM scan backward. The kernel accumulates several shared
-// gradients atomically, so clear the packed destination before dispatch.
+// retro delta: tokens per chunk for the SSM scan backward. Chunking bounds
+// the state/lambda scratch to (2*tc + n_chunks + 1) chain states instead of
+// materializing the full T-length trajectories.
+static int64_t ggml_metal_op_ssm_scan_back_tc(int64_t nt) {
+    return std::min<int64_t>(nt, 32);
+}
+
+// retro delta: scratch after the packed destination, laid out as
+// [traj (tc) | lam (tc) | checkpoints (n_chunks) | lambda carry (1)] in units
+// of n_head*n_seqs*d_state*head_dim floats. Tracked by the concurrency ranges
+// through the alloc size, like the flash-attention temp buffers.
+size_t ggml_metal_op_ssm_scan_back_extra_tmp(const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_SSM_SCAN_BACK);
+
+    const int64_t nc = op->src[0]->ne[0];
+    const int64_t nr = op->src[1]->ne[0];
+    const int64_t nh = op->src[1]->ne[1];
+    const int64_t nt = op->src[1]->ne[2];
+    const int64_t ns = op->src[1]->ne[3];
+
+    const int64_t tc  = ggml_metal_op_ssm_scan_back_tc(nt);
+    const int64_t nch = (nt + tc - 1)/tc;
+
+    return sizeof(float)*(2*tc + nch + 1)*(nh*ns)*(nc*nr);
+}
+
+// retro delta: SSM scan backward. Two O(T) passes replace the former
+// per-element O(T^2) recomputation:
+//   pass 0 (ckpt) snapshots the forward state at each chunk boundary and
+//     seeds the lambda carry with the final-state gradient;
+//   pass 1 (grad) is dispatched per chunk, last to first, recomputing the
+//     chunk states from the checkpoint, running the reverse adjoint within
+//     the chunk, and emitting the packed gradients.
+// Shared gradients (A/B/C/initial-state) still combine through device
+// atomics, but once per threadgroup and chunk instead of once per element;
+// exclusive cells (grad_x, grad_dt) are written directly. The packed
+// destination is zero-filled first because of the remaining atomics.
 int ggml_metal_op_ssm_scan_back(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
     ggml_metal_library_t lib = ctx->lib;
@@ -5768,6 +5809,17 @@ int ggml_metal_op_ssm_scan_back(ggml_metal_op_t ctx, int idx) {
     const int64_t n_A  = ggml_nelements(A);
     const int64_t n_B  = ggml_nelements(B);
     const int64_t n_C  = ggml_nelements(C);
+
+    const int64_t nc = s->ne[0];
+    const int64_t nr = x->ne[0];
+    const int64_t nh = x->ne[1];
+    const int64_t nt = x->ne[2];
+    const int64_t ns = x->ne[3];
+
+    const int64_t tc     = ggml_metal_op_ssm_scan_back_tc(nt);
+    const int64_t nch    = (nt + tc - 1)/tc;
+    const int64_t chains = nh*ns;
+    const int64_t cs     = nc*nr;
 
     ggml_metal_kargs_ssm_scan_back args = {
         /*.d_state      =*/ s->ne[0],
@@ -5789,27 +5841,70 @@ int ggml_metal_op_ssm_scan_back(ggml_metal_op_t ctx, int idx) {
         /*.nb40 =*/ B->nb[0], /*.nb41 =*/ B->nb[1], /*.nb42 =*/ B->nb[2], /*.nb43 =*/ B->nb[3],
         /*.nb50 =*/ C->nb[0], /*.nb51 =*/ C->nb[1], /*.nb52 =*/ C->nb[2], /*.nb53 =*/ C->nb[3],
         /*.nb60 =*/ ids->nb[0],
+        /*.tc       =*/ tc,
+        /*.chunk_lo =*/ 0,
+        /*.chunk_hi =*/ nt,
     };
+
+    // per-simdgroup partials of the grad_dt reduction (<= 256 threads)
+    const int64_t red_len = 8;
 
     ggml_metal_op_retro_fill_zero(ctx, op);
 
-    auto pipeline = ggml_metal_library_get_pipeline_ssm_scan_back(lib, op);
-    const int64_t total = s->ne[0]*x->ne[0]*x->ne[1]*x->ne[2]*x->ne[3];
-    const int nth = std::min<int64_t>(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), total);
-    const int64_t n = (total + nth - 1) / nth;
+    ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(op);
+    ggml_metal_buffer_id bid_traj = bid_dst;
+    bid_traj.offs += ggml_nbytes(op);
+    ggml_metal_buffer_id bid_lam  = bid_traj;
+    bid_lam.offs += sizeof(float)*tc*chains*cs;
+    ggml_metal_buffer_id bid_ckpt = bid_lam;
+    bid_ckpt.offs += sizeof(float)*tc*chains*cs;
+    ggml_metal_buffer_id bid_carry = bid_ckpt;
+    bid_carry.offs += sizeof(float)*nch*chains*cs;
 
-    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    auto pipeline_ckpt = ggml_metal_library_get_pipeline_ssm_scan_back_ckpt(lib, op);
+    auto pipeline_grad = ggml_metal_library_get_pipeline_ssm_scan_back_grad(lib, op);
+
+    const int nth_ckpt = std::min(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_ckpt));
+    const int nth_grad = std::min(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_grad));
+
+    // pass 0: checkpoints + lambda-carry seed
+    ggml_metal_encoder_set_pipeline(enc, pipeline_ckpt);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(s),   1);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),   2);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dt),  3);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(A),   4);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(B),   5);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(C),   6);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ids), 7);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ds),  8);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),  9);
-    ggml_metal_encoder_dispatch_threadgroups(enc, n, 1, 1, nth, 1, 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ids), 6);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ds),  7);
+    ggml_metal_encoder_set_buffer  (enc, bid_ckpt,  8);
+    ggml_metal_encoder_set_buffer  (enc, bid_carry, 9);
+    ggml_metal_encoder_dispatch_threadgroups(enc, nh, ns, 1, nth_ckpt, 1, 1);
+
+    // pass 1: per-chunk gradients, last chunk first (lambda-carry chain)
+    for (int64_t c = nch - 1; c >= 0; --c) {
+        ggml_metal_encoder_memory_barrier(enc);
+
+        args.chunk_lo = c*tc;
+        args.chunk_hi = std::min(nt, args.chunk_lo + tc);
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline_grad);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),   1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dt),  2);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(A),   3);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(B),   4);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(C),   5);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ids), 6);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ds),  7);
+        ggml_metal_encoder_set_buffer  (enc, bid_dst,   8);
+        ggml_metal_encoder_set_buffer  (enc, bid_traj,  9);
+        ggml_metal_encoder_set_buffer  (enc, bid_lam,  10);
+        ggml_metal_encoder_set_buffer  (enc, bid_ckpt, 11);
+        ggml_metal_encoder_set_buffer  (enc, bid_carry, 12);
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, red_len*sizeof(float), 0);
+        ggml_metal_encoder_dispatch_threadgroups(enc, nh, ns, 1, nth_grad, 1, 1);
+    }
 
     return 1;
 }

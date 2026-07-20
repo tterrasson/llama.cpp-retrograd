@@ -26,17 +26,17 @@ uint get_doffset() { return p.misalign_offsets & 0xFF; }
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
-void main() {
-    uint idx = get_idx();
-    if (idx >= p.ne) {
-        return;
-    }
+shared float tile_a[16];
+shared float tile_b[16];
 
-    uint tmp = idx;
-    uint i0 = tmp % p.ne20; tmp /= p.ne20;
-    uint i1 = tmp % p.ne21; tmp /= p.ne21;
-    uint i2 = tmp % p.ne22; tmp /= p.ne22;
-    uint i3 = tmp;
+void main() {
+    const uint lx = gl_LocalInvocationIndex & 15u;
+    const uint ly = gl_LocalInvocationIndex >> 4u;
+    const uint i0 = gl_WorkGroupID.x * 16u + lx;
+    const uint i1 = gl_WorkGroupID.y * 16u + ly;
+    const uint i2 = gl_WorkGroupID.z % p.ne22;
+    const uint i3 = gl_WorkGroupID.z / p.ne22;
+    const bool valid = i0 < p.ne20 && i1 < p.ne21 && i3 < p.ne23;
 
     uint a_i0 = i0 % p.ne00;
     uint a_i2 = i2 / (p.ne22 / p.ne02);
@@ -49,11 +49,23 @@ void main() {
     float sum = 0.0f;
     uint K = p.ne01;
     for (uint k = 0; k < K; k++) {
-        uint aoff = get_aoffset() + a_i3*p.nb03 + a_i2*p.nb02 + k*p.nb01 + a_i0*p.nb00;
-        uint boff = get_boffset() + b_i3*p.nb13 + b_i2*p.nb12 + k*p.nb11 + b_i0*p.nb10;
-        sum += data_a[aoff] * data_b[boff];
+        if (ly == 0u) {
+            uint aoff = get_aoffset() + a_i3*p.nb03 + a_i2*p.nb02 + k*p.nb01 + a_i0*p.nb00;
+            tile_a[lx] = i0 < p.ne20 ? data_a[aoff] : 0.0f;
+        }
+        if (lx == 0u) {
+            uint boff = get_boffset() + b_i3*p.nb13 + b_i2*p.nb12 + k*p.nb11 + b_i0*p.nb10;
+            tile_b[ly] = i1 < p.ne21 ? data_b[boff] : 0.0f;
+        }
+        barrier();
+        if (valid) {
+            sum += tile_a[lx] * tile_b[ly];
+        }
+        barrier();
     }
 
-    uint doff = get_doffset() + i3*p.nb23 + i2*p.nb22 + i1*p.nb21 + i0*p.nb20;
-    data_d[doff] = sum;
+    if (valid) {
+        uint doff = get_doffset() + i3*p.nb23 + i2*p.nb22 + i1*p.nb21 + i0*p.nb20;
+        data_d[doff] = sum;
+    }
 }

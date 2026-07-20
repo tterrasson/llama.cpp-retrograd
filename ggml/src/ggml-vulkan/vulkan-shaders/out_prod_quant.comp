@@ -15,21 +15,21 @@
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
+shared float tile_a[16];
+shared float tile_b[16];
+
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
     init_iq_shmem(gl_WorkGroupSize);
 #endif
 
-    const uint idx = get_idx();
-    if (idx >= p.ne) {
-        return;
-    }
-
-    uint tmp = idx;
-    const uint i0 = tmp % p.ne20; tmp /= p.ne20;
-    const uint i1 = tmp % p.ne21; tmp /= p.ne21;
-    const uint i2 = tmp % p.ne22; tmp /= p.ne22;
-    const uint i3 = tmp;
+    const uint lx = gl_LocalInvocationIndex & 15u;
+    const uint ly = gl_LocalInvocationIndex >> 4u;
+    const uint i0 = gl_WorkGroupID.x * 16u + lx;
+    const uint i1 = gl_WorkGroupID.y * 16u + ly;
+    const uint i2 = gl_WorkGroupID.z % p.ne22;
+    const uint i3 = gl_WorkGroupID.z / p.ne22;
+    const bool valid = i0 < p.ne20 && i1 < p.ne21 && i3 < p.ne23;
 
     // src0 rows broadcast over the batch dims (dps2/dps3 style)
     const uint a_i2 = i2 / (p.ne22 / p.ne02);
@@ -58,14 +58,30 @@ void main() {
     float sum = 0.0f;
     const uint K = p.ne01;
     for (uint k = 0; k < K; ++k) {
-        const uint ib = a_row_base + k * p.nb01;
-        vec2 v = dequantize(ib, iqs, 0);
-        const vec2 dm = get_dm(ib, 0);
-        v = v * dm.x + dm.y;
-        const float a_val = sel == 0u ? v.x : v.y;
-        sum += a_val * float(data_b[boff_base + k * p.nb11]);
+        if (ly == 0u) {
+            if (i0 < p.ne20) {
+                const uint ib = a_row_base + k * p.nb01;
+                vec2 v = dequantize(ib, iqs, 0);
+                const vec2 dm = get_dm(ib, 0);
+                v = v * dm.x + dm.y;
+                tile_a[lx] = sel == 0u ? v.x : v.y;
+            } else {
+                tile_a[lx] = 0.0f;
+            }
+        }
+        if (lx == 0u) {
+            tile_b[ly] = i1 < p.ne21
+                    ? float(data_b[boff_base + k * p.nb11]) : 0.0f;
+        }
+        barrier();
+        if (valid) {
+            sum += tile_a[lx] * tile_b[ly];
+        }
+        barrier();
     }
 
-    const uint doff = get_doffset() + i3 * p.nb23 + i2 * p.nb22 + i1 * p.nb21 + i0 * p.nb20;
-    data_d[doff] = D_TYPE(sum);
+    if (valid) {
+        const uint doff = get_doffset() + i3 * p.nb23 + i2 * p.nb22 + i1 * p.nb21 + i0 * p.nb20;
+        data_d[doff] = D_TYPE(sum);
+    }
 }
