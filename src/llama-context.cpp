@@ -3650,6 +3650,7 @@ void llama_context::opt_epoch_iter(
         const std::vector<llama_token> & tokens,
         const std::vector<llama_token> & labels_sparse,
         const float                    * label_weights,
+        uint32_t                         n_evals,
         llama_batch                    & batch,
         ggml_opt_epoch_callback          callback,
         bool                             train,
@@ -3661,11 +3662,19 @@ void llama_context::opt_epoch_iter(
     const uint32_t n_batch  = std::min(this->n_batch(),  n_ctx);
     const uint32_t n_ubatch = std::min(this->n_ubatch(), n_batch);
 
+    // retro delta: the caller can bound this row's trained span to n_evals
+    // physical ubatches (0 = full row). Every position past the last active
+    // label carries zero loss, so skipping those ubatches changes no gradient;
+    // opt_epoch keeps the total across rows on an accumulation-period boundary
+    // so every optimizer step still closes within the call.
+    const uint32_t pos_end = n_evals == 0 ? n_ctx : std::min(n_ctx, n_evals * n_ubatch);
+
     memory->clear(true);
 
-    for (uint32_t pos_ctx = 0; pos_ctx < n_ctx; pos_ctx += n_batch) {
-        batch.n_tokens = n_batch;
-        for (uint32_t pos_batch = 0; pos_batch < n_batch; ++pos_batch) {
+    for (uint32_t pos_ctx = 0; pos_ctx < pos_end; pos_ctx += n_batch) {
+        const uint32_t n_tokens_window = std::min(n_batch, pos_end - pos_ctx);
+        batch.n_tokens = n_tokens_window;
+        for (uint32_t pos_batch = 0; pos_batch < n_tokens_window; ++pos_batch) {
             batch.token   [pos_batch]    = tokens[pos_ctx + pos_batch];
             batch.pos     [pos_batch]    = pos_ctx + pos_batch;
             batch.n_seq_id[pos_batch]    = 1;
@@ -3819,6 +3828,49 @@ void llama_context::opt_epoch(
     opt_label_storage = nullptr;
     opt_active_label_offsets.clear();
 
+    // retro delta: weighted rows train only up to their last active label,
+    // rounded up to a physical ubatch. The freed ubatches carry zero loss by
+    // construction, so gradients are identical; the saved compute is the
+    // padding of short rows. The total is then padded back to an accumulation-
+    // period boundary — rightmost rows first, into padding that exists anyway —
+    // so every optimizer step closes inside this call and no partial gradient
+    // accumulation leaks into a later call taken under a different policy.
+    std::vector<uint32_t> row_evals;
+    if (label_weights && idata_split > 0) {
+        const uint32_t n_ctx_train = llama_model_n_ctx_train(&model);
+        const uint32_t n_batch_train  = std::min(n_batch,  n_ctx_train);
+        const uint32_t n_ubatch_train = std::min(n_ubatch, n_batch_train);
+        const uint32_t evals_cap  = n_ctx_train / n_ubatch_train;
+        const uint32_t opt_period = n_batch_train / n_ubatch_train;
+        const int32_t * all_labels = static_cast<const int32_t *>(
+                ggml_opt_dataset_labels(dataset)->data);
+        row_evals.resize(idata_split);
+        uint64_t total = 0;
+        for (int64_t i = 0; i < idata_split; ++i) {
+            const int32_t * row_labels  = all_labels    + i*n_ctx;
+            const float   * row_weights = label_weights + i*n_ctx;
+            int64_t last = -1;
+            for (uint32_t j = 0; j < n_ctx_train; ++j) {
+                if (row_labels[j] >= 0 && row_weights[j] != 0.0f) {
+                    last = j;
+                }
+            }
+            const uint32_t evals = last < 0
+                    ? 1
+                    : static_cast<uint32_t>(last)/n_ubatch_train + 1;
+            row_evals[i] = std::min(evals, evals_cap);
+            total += row_evals[i];
+        }
+        uint64_t deficit = (opt_period - total % opt_period) % opt_period;
+        for (int64_t i = idata_split - 1; i >= 0 && deficit > 0; --i) {
+            const uint32_t extension = static_cast<uint32_t>(
+                    std::min<uint64_t>(evals_cap - row_evals[i], deficit));
+            row_evals[i] += extension;
+            deficit      -= extension;
+        }
+        GGML_ASSERT(deficit == 0 && "weighted rows cannot close the accumulation period");
+    }
+
     int64_t idata = 0;
 
     int64_t t_loop_start = ggml_time_us();
@@ -3829,7 +3881,8 @@ void llama_context::opt_epoch(
 
         ggml_opt_dataset_get_batch_host(dataset, opt_tokens.data(), n_ctx*sizeof(llama_token), opt_labels_sparse.data(), idata);
         opt_epoch_iter(dataset, result_train, opt_tokens, opt_labels_sparse,
-            label_weights ? label_weights + idata*n_ctx : nullptr, opt_batch,
+            label_weights ? label_weights + idata*n_ctx : nullptr,
+            row_evals.empty() ? 0 : row_evals[idata], opt_batch,
             callback_train, train, idata_in_loop, ndata_in_loop, t_loop_start);
     }
 
@@ -3841,7 +3894,7 @@ void llama_context::opt_epoch(
 
         ggml_opt_dataset_get_batch_host(dataset, opt_tokens.data(), n_ctx*sizeof(llama_token), opt_labels_sparse.data(), idata);
         opt_epoch_iter(dataset, result_eval, opt_tokens, opt_labels_sparse,
-            label_weights ? label_weights + idata*n_ctx : nullptr, opt_batch,
+            label_weights ? label_weights + idata*n_ctx : nullptr, /*n_evals=*/0, opt_batch,
             callback_eval, train, idata_in_loop, ndata_in_loop, t_loop_start);
     }
 }

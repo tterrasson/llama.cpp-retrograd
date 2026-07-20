@@ -217,6 +217,7 @@ struct llama_context {
             const std::vector<llama_token> & tokens,
             const std::vector<llama_token> & labels_sparse,
             const float                    * label_weights, // per label position, nullable
+            uint32_t                         n_evals,       // retro delta: physical ubatches to run, 0 = full row
             llama_batch                    & batch,
             ggml_opt_epoch_callback          callback,
             bool                             train,

@@ -225,6 +225,9 @@ struct ggml_opt_optimizer_params ggml_opt_get_default_optimizer_params(void * us
 
     ggml_opt_optimizer_params result;
 
+    // Generic ggml callers keep the historical unclipped behavior unless they
+    // opt in. Retroback overrides this with its validated default of 1.0.
+    result.max_grad_norm = INFINITY;
     result.adamw.alpha = 0.001f;
     result.adamw.beta1 = 0.9f;
     result.adamw.beta2 = 0.999f;
@@ -494,19 +497,55 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             /*.no_alloc   =*/ true,
         };
         opt_ctx->ctx_cpu = ggml_init(params);
-        opt_ctx->opt_step_params = ggml_new_tensor_1d(opt_ctx->ctx_cpu, GGML_TYPE_F32, need_momenta ? 7 : 2);
+        const int64_t optimizer_param_count = need_momenta ? 7 : 2;
+        opt_ctx->opt_step_params = ggml_new_tensor_1d(
+                opt_ctx->ctx_cpu, GGML_TYPE_F32, optimizer_param_count + 1);
         ggml_set_input(opt_ctx->opt_step_params);
         const char * optimizer_name = ggml_opt_optimizer_name(opt_ctx->optimizer);
         ggml_format_name(opt_ctx->opt_step_params, "%s_params", optimizer_name);
         opt_ctx->buf_cpu = ggml_backend_alloc_ctx_tensors_from_buft(opt_ctx->ctx_cpu, ggml_backend_cpu_buffer_type());
     }
-    ggml_tensor * adamw_params = opt_ctx->opt_step_params;
+    const int64_t optimizer_param_count = need_momenta ? 7 : 2;
+    ggml_tensor * optimizer_params = ggml_view_1d(
+            opt_ctx->ctx_compute, opt_ctx->opt_step_params, optimizer_param_count, 0);
+    ggml_tensor * max_grad_norm = ggml_view_1d(
+            opt_ctx->ctx_compute,
+            opt_ctx->opt_step_params,
+            1,
+            optimizer_param_count * sizeof(float));
+
+    // Compute one norm over every trainable parameter gradient, then use the
+    // same scale for all tensors so clipping preserves the gradient direction.
+    ggml_tensor * global_grad_norm_sq = nullptr;
+    for (int i = opt_ctx->gf->n_nodes - 1; i >= 0; --i) {
+        struct ggml_tensor * node = opt_ctx->gb_opt->nodes[i];
+        struct ggml_tensor * grad = ggml_graph_get_grad(opt_ctx->gb_opt, node);
+        if (grad && (node->flags & GGML_TENSOR_FLAG_PARAM)) {
+            ggml_tensor * tensor_norm_sq = ggml_sum(opt_ctx->ctx_compute,
+                    ggml_sqr(opt_ctx->ctx_compute, grad));
+            global_grad_norm_sq = global_grad_norm_sq
+                    ? ggml_add(opt_ctx->ctx_compute, global_grad_norm_sq, tensor_norm_sq)
+                    : tensor_norm_sq;
+        }
+    }
+    GGML_ASSERT(global_grad_norm_sq != nullptr);
+    ggml_tensor * global_grad_norm = ggml_clamp(
+            opt_ctx->ctx_compute,
+            ggml_sqrt(opt_ctx->ctx_compute, global_grad_norm_sq),
+            1e-12f,
+            INFINITY);
+    ggml_tensor * grad_scale = ggml_clamp(
+            opt_ctx->ctx_compute,
+            ggml_div(opt_ctx->ctx_compute, max_grad_norm, global_grad_norm),
+            0.0f,
+            1.0f);
     const char * optimizer_name = ggml_opt_optimizer_name(opt_ctx->optimizer);
     for (int i = opt_ctx->gf->n_nodes-1; i >= 0; --i) {
         struct ggml_tensor * node = opt_ctx->gb_opt->nodes[i];
         struct ggml_tensor * grad = ggml_graph_get_grad(opt_ctx->gb_opt, node);
 
         if (grad && (node->flags & GGML_TENSOR_FLAG_PARAM)) {
+            struct ggml_tensor * clipped_grad = ggml_mul(opt_ctx->ctx_compute, grad, grad_scale);
             struct ggml_tensor * m = nullptr;
             struct ggml_tensor * v = nullptr;
             if (need_momenta) {
@@ -518,10 +557,12 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             struct ggml_tensor * opt_step;
             switch (optimizer) {
                 case GGML_OPT_OPTIMIZER_TYPE_ADAMW:
-                    opt_step = ggml_opt_step_adamw(opt_ctx->ctx_compute, node, grad, m, v, adamw_params);
+                    opt_step = ggml_opt_step_adamw(
+                            opt_ctx->ctx_compute, node, clipped_grad, m, v, optimizer_params);
                     break;
                 case GGML_OPT_OPTIMIZER_TYPE_SGD:
-                    opt_step = ggml_opt_step_sgd(opt_ctx->ctx_compute, node, grad, adamw_params);
+                    opt_step = ggml_opt_step_sgd(
+                            opt_ctx->ctx_compute, node, clipped_grad, optimizer_params);
                     break;
                 default:
                     GGML_ABORT("fatal error");
@@ -825,6 +866,7 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     GGML_ASSERT(opt_ctx->eval_ready);
     if (opt_ctx->allocated_graph == opt_ctx->gb_opt) {
         const ggml_opt_optimizer_params & opt_pars = opt_ctx->get_opt_pars(opt_ctx->get_opt_pars_ud);
+        GGML_ASSERT(opt_pars.max_grad_norm > 0.0f);
 
         switch (opt_ctx->optimizer) {
             case GGML_OPT_OPTIMIZER_TYPE_ADAMW: {
@@ -849,6 +891,7 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
                 adamw_par_data[4] = opt_pars.adamw.wd;
                 adamw_par_data[5] = beta1h;
                 adamw_par_data[6] = beta2h;
+                adamw_par_data[7] = opt_pars.max_grad_norm;
             } break;
             case GGML_OPT_OPTIMIZER_TYPE_SGD: {
                 GGML_ASSERT(opt_pars.sgd.alpha > 0.0f);
@@ -857,6 +900,7 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
                 float * sgd = ggml_get_data_f32(opt_ctx->opt_step_params);
                 sgd[0] = opt_pars.sgd.alpha;
                 sgd[1] = opt_pars.sgd.wd;
+                sgd[2] = opt_pars.max_grad_norm;
             } break;
             default:
                 GGML_ABORT("fatal error");
