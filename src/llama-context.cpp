@@ -3926,7 +3926,12 @@ bool llama_context::opt_step_packed_sequences(
         auto * res = opt_graph_cache.get();
         const auto gparams = graph_params(
                 res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
-        const bool reuse_graph = opt_cached_compute_ctx && res->can_reuse(gparams);
+        // ggml_backend_sched_split_graph() rewrites node sources in place to
+        // scheduler-owned copy tensors. Reusing that dynamic graph after a
+        // preflight/generation allocation leaves stale Vulkan buffers and can
+        // bind an op to an input of the wrong type. Rebuild until dynamic graph
+        // scheduling gains an immutable clone with input/output remapping.
+        const bool reuse_graph = false;
         if (!reuse_graph) {
             if (opt_cached_compute_ctx) {
                 ggml_opt_set_graph_cache(opt_ctx, false);

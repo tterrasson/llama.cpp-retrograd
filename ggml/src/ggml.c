@@ -5589,51 +5589,41 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
-// ggml_flash_attn_back
+// ggml_flash_attn_ext_back
 
-struct ggml_tensor * ggml_flash_attn_back(
+struct ggml_tensor * ggml_flash_attn_ext_back(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * k,
         struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * out,
         struct ggml_tensor  * d,
-        bool                  masked) {
-    GGML_ABORT("TODO: adapt to ggml_flash_attn_ext() changes");
+        struct ggml_tensor  * sinks,
+        float                 scale,
+        float                 max_bias,
+        float                 logit_softcap) {
+    GGML_ASSERT(q && k && v && out && d);
+    GGML_ASSERT(q->ne[0] == k->ne[0]);
+    GGML_ASSERT(k->ne[1] == v->ne[1]);
+    GGML_ASSERT(q->ne[2] % k->ne[2] == 0);
+    GGML_ASSERT(q->ne[2] % v->ne[2] == 0);
+    GGML_ASSERT(q->ne[3] == k->ne[3] && q->ne[3] == v->ne[3]);
+    GGML_ASSERT(out->ne[0] == v->ne[0]);
+    GGML_ASSERT(out->ne[1] == q->ne[2]);
+    GGML_ASSERT(out->ne[2] == q->ne[1]);
+    GGML_ASSERT(out->ne[3] == q->ne[3]);
+    GGML_ASSERT(ggml_are_same_shape(out, d));
+    GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(!sinks || sinks->type == GGML_TYPE_F32);
 
-    GGML_ASSERT(ggml_can_mul_mat(k, q));
-    // TODO: check if vT can be multiplied by (k*qT)
-
-    // d shape [D,N,ne2,ne3]
-    // q shape [D,N,ne2,ne3]
-    // k shape [D,M,kvne2,ne3]
-    // v shape [M,D,kvne2,ne3]
-
-    const int64_t     D = q->ne[0];
-    const int64_t     N = q->ne[1];
-    const int64_t     M = k->ne[1];
-    const int64_t   ne2 = q->ne[2];
-    const int64_t   ne3 = q->ne[3];
-    const int64_t kvne2 = k->ne[2];
-
-    GGML_ASSERT(k->ne[0] == D);
-    GGML_ASSERT(v->ne[0] == M);
-    GGML_ASSERT(v->ne[1] == D);
-    GGML_ASSERT(d->ne[0] == D);
-    GGML_ASSERT(d->ne[1] == N);
-    GGML_ASSERT(k->ne[2] == kvne2);
-    GGML_ASSERT(k->ne[3] == ne3);
-    GGML_ASSERT(v->ne[2] == kvne2);
-    GGML_ASSERT(v->ne[3] == ne3);
-    GGML_ASSERT(d->ne[2] == ne2);
-    GGML_ASSERT(d->ne[3] == ne3);
-
-    GGML_ASSERT(ne2 % kvne2 == 0);
-
-    // store gradients of q, k and v as continuous tensors concatenated in result.
-    // note: v and gradv are actually transposed, i.e. v->ne[0] != D.
+    // Store continuous F32 dQ, dK and dV, followed by two scalars per query
+    // row (logsumexp and dot(dO, O)). The latter let the Vulkan backward stream
+    // over K/V without ever materializing the O(N^2) probability matrix.
     const int64_t elem_q = ggml_nelements(q);
     const int64_t elem_k = ggml_nelements(k);
     const int64_t elem_v = ggml_nelements(v);
+    const int64_t n_rows = q->ne[1] * q->ne[2] * q->ne[3];
 
     enum ggml_type result_type = GGML_TYPE_F32;
     GGML_ASSERT(ggml_blck_size(result_type) == 1);
@@ -5642,20 +5632,24 @@ struct ggml_tensor * ggml_flash_attn_back(
     const size_t offs_q = 0;
     const size_t offs_k = offs_q + GGML_PAD(elem_q * tsize, GGML_MEM_ALIGN);
     const size_t offs_v = offs_k + GGML_PAD(elem_k * tsize, GGML_MEM_ALIGN);
-    const size_t end    = offs_v + GGML_PAD(elem_v * tsize, GGML_MEM_ALIGN);
+    const size_t offs_s = offs_v + GGML_PAD(elem_v * tsize, GGML_MEM_ALIGN);
+    const size_t end    = offs_s + 2 * n_rows * tsize;
 
     const size_t nelements = (end + tsize - 1)/tsize;
 
     struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nelements);
 
-    int32_t masked_i = masked ? 1 : 0;
-    ggml_set_op_params(result, &masked_i, sizeof(masked_i));
+    const float params[] = { scale, max_bias, logit_softcap };
+    ggml_set_op_params(result, params, sizeof(params));
 
     result->op     = GGML_OP_FLASH_ATTN_BACK;
     result->src[0] = q;
     result->src[1] = k;
     result->src[2] = v;
-    result->src[3] = d;
+    result->src[3] = mask;
+    result->src[4] = out;
+    result->src[5] = d;
+    result->src[6] = sinks;
 
     return result;
 }
@@ -7197,6 +7191,36 @@ static void ggml_compute_backward(
             }
             GGML_ASSERT((!src1 || !src1_needs_grads) && "backward pass for softmax mask not implemented");
         } break;
+        case GGML_OP_FLASH_ATTN_EXT: {
+            if (src0_needs_grads || src1_needs_grads || src2_needs_grads) {
+                float scale;
+                float max_bias;
+                float logit_softcap;
+                memcpy(&scale,         (const float *) tensor->op_params + 0, sizeof(float));
+                memcpy(&max_bias,      (const float *) tensor->op_params + 1, sizeof(float));
+                memcpy(&logit_softcap, (const float *) tensor->op_params + 2, sizeof(float));
+
+                struct ggml_tensor * db = ggml_flash_attn_ext_back(
+                        ctx, src0, src1, src2, tensor->src[3], tensor, grad,
+                        tensor->src[4], scale, max_bias, logit_softcap);
+
+                const size_t size_q = GGML_PAD(ggml_nelements(src0) * sizeof(float), GGML_MEM_ALIGN);
+                const size_t size_k = GGML_PAD(ggml_nelements(src1) * sizeof(float), GGML_MEM_ALIGN);
+
+                if (src0_needs_grads) {
+                    struct ggml_tensor * gq = ggml_view_1d(ctx, db, ggml_nelements(src0), 0);
+                    ggml_add_or_set(ctx, cgraph, isrc0, ggml_reshape(ctx, gq, src0));
+                }
+                if (src1_needs_grads) {
+                    struct ggml_tensor * gk = ggml_view_1d(ctx, db, ggml_nelements(src1), size_q);
+                    ggml_add_or_set(ctx, cgraph, isrc1, ggml_reshape(ctx, gk, src1));
+                }
+                if (src2_needs_grads) {
+                    struct ggml_tensor * gv = ggml_view_1d(ctx, db, ggml_nelements(src2), size_q + size_k);
+                    ggml_add_or_set(ctx, cgraph, isrc2, ggml_reshape(ctx, gv, src2));
+                }
+            }
+        } break;
         case GGML_OP_ROPE: {
             if (src0_needs_grads) {
                 //const int n_past = ((int32_t *) tensor->op_params)[0];
@@ -7647,6 +7671,10 @@ void ggml_build_backward_expand(
         if (node->op == GGML_OP_SET_ROWS) {
             ignore_src[2] = true; // destination cache is overwritten
         }
+        if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+            ignore_src[3] = true; // attention mask is constant
+            ignore_src[4] = true; // attention sinks are not trained here
+        }
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
             if (!node->src[j] || ignore_src[j] || !grads_needed[ggml_hash_find(&cgraph->visited_hash_set, node->src[j])]) {
                 continue;
@@ -7711,6 +7739,10 @@ static void ggml_backward_ignored_srcs(const struct ggml_tensor * node, bool ign
             ignore_src[1] = true;
             ignore_src[2] = true;
             break;
+        case GGML_OP_FLASH_ATTN_EXT:
+            ignore_src[3] = true;
+            ignore_src[4] = true;
+            break;
         default:
             break;
     }
@@ -7753,6 +7785,7 @@ static bool ggml_backward_op_implemented(const struct ggml_tensor * node) {
         case GGML_OP_DIAG_MASK_INF:
         case GGML_OP_DIAG_MASK_ZERO:
         case GGML_OP_SOFT_MAX:
+        case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_ROPE:
         case GGML_OP_IM2COL:
         case GGML_OP_POOL_2D:

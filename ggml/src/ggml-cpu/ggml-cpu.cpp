@@ -440,6 +440,12 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     }
 
     switch (op->op) {
+        case GGML_OP_FLASH_ATTN_BACK:
+            // FLASH_ATTN_BACK now implements the extended streaming contract
+            // (Q F32, K/V F16, mask/out/dO sources). Its differentiable kernel
+            // is Vulkan-only; CPU contexts keep Flash Attention disabled and
+            // therefore never construct this op.
+            return false;
         case GGML_OP_CPY:
         case GGML_OP_SET_ROWS:
             return
