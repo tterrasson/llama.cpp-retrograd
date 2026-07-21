@@ -13,6 +13,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -20,6 +21,27 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+
+static bool llama_backend_set_sparse_f32(
+        ggml_backend_sched_t backend_sched,
+        ggml_tensor * tensor,
+        const std::vector<size_t> & offsets,
+        const std::vector<float> & values) {
+    GGML_ASSERT(offsets.size() == values.size());
+    if (offsets.empty()) {
+        return true;
+    }
+
+    ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(backend_sched, tensor);
+    if (!backend) {
+        return false;
+    }
+    ggml_backend_dev_t device = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = device ? ggml_backend_dev_backend_reg(device) : nullptr;
+    auto set_sparse = reg ? (ggml_backend_set_sparse_f32_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_sparse_f32") : nullptr;
+    return set_sparse && set_sparse(backend, tensor, offsets.data(), values.data(), offsets.size());
+}
 
 //
 // llama_context
@@ -3749,14 +3771,17 @@ void llama_context::opt_epoch_iter(
             {
                 struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
                 GGML_ASSERT(labels->ne[1] == n_ubatch);
-                if (opt_label_storage == nullptr || labels->data != opt_label_storage) {
+                const bool new_label_storage = opt_label_storage == nullptr || labels->data != opt_label_storage;
+                if (new_label_storage) {
                     ggml_set_zero(labels);
                     opt_label_storage = labels->data;
-                } else {
-                    constexpr float zero = 0.0f;
-                    for (const size_t offset : opt_active_label_offsets) {
-                        ggml_backend_tensor_set(labels, &zero, offset, sizeof(zero));
-                    }
+                }
+
+                std::vector<size_t> sparse_offsets;
+                std::vector<float> sparse_values;
+                if (!new_label_storage) {
+                    sparse_offsets = opt_active_label_offsets;
+                    sparse_values.resize(sparse_offsets.size(), 0.0f);
                 }
                 opt_active_label_offsets.clear();
                 int32_t n_active_labels = 0;
@@ -3771,9 +3796,20 @@ void llama_context::opt_epoch_iter(
                     if (labels_sparse[ilabel] >= 0 && weight != 0.0f) {
                         GGML_ASSERT(labels_sparse[ilabel] < labels->ne[0]);
                         const size_t offset = (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float);
-                        ggml_backend_tensor_set(labels, &weight, offset, sizeof(float));
+                        auto previous = std::find(sparse_offsets.begin(), sparse_offsets.end(), offset);
+                        if (previous == sparse_offsets.end()) {
+                            sparse_offsets.push_back(offset);
+                            sparse_values.push_back(weight);
+                        } else {
+                            sparse_values[previous - sparse_offsets.begin()] = weight;
+                        }
                         opt_active_label_offsets.push_back(offset);
                         ++n_active_labels;
+                    }
+                }
+                if (!llama_backend_set_sparse_f32(sched.get(), labels, sparse_offsets, sparse_values)) {
+                    for (size_t i = 0; i < sparse_offsets.size(); ++i) {
+                        ggml_backend_tensor_set(labels, &sparse_values[i], sparse_offsets[i], sizeof(float));
                     }
                 }
                 ggml_opt_set_loss_active_rows(opt_ctx, n_active_labels);

@@ -224,6 +224,16 @@ extern "C" {
     };
     typedef struct ggml_backend_feature * (*ggml_backend_get_features_t)(ggml_backend_reg_t reg);
 
+    // Optional backend extension for batching sparse F32 tensor updates. The
+    // offsets are byte offsets relative to tensor->data. Backends that do not
+    // expose "ggml_backend_set_sparse_f32" keep using tensor_set calls.
+    typedef bool (*ggml_backend_set_sparse_f32_t)(
+            ggml_backend_t       backend,
+            struct ggml_tensor * tensor,
+            const size_t       * offsets,
+            const float        * values,
+            size_t               count);
+
     //
     // Backend registry
     //

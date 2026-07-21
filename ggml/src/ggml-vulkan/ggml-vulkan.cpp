@@ -1158,7 +1158,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_ssm_conv_back_f32;
-    vk_pipeline pipeline_ssm_scan_back_f32;
+    vk_pipeline pipeline_ssm_scan_back_ckpt_f32;
+    vk_pipeline pipeline_ssm_scan_back_grad_f32;
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
@@ -2069,6 +2070,7 @@ struct vk_op_ssm_scan_back_push_constants {
     uint32_t nb40, nb41, nb42, nb43;
     uint32_t nb50, nb51, nb52, nb53;
     uint32_t nb60;
+    uint32_t tc, chunk_lo, chunk_hi;
 };
 
 struct vk_op_conv2d_push_constants {
@@ -6352,8 +6354,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_back_f32, "ssm_conv_back_f32", ssm_conv_back_f32_len, ssm_conv_back_f32_data, "main", 4, sizeof(vk_op_ssm_conv_back_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_back_ckpt_f32, "ssm_scan_back_ckpt_f32", ssm_scan_back_ckpt_f32_len, ssm_scan_back_ckpt_f32_data, "main", 9, sizeof(vk_op_ssm_scan_back_push_constants), {256, 1, 1}, {}, 1);
     if (device->buffer_float32_atomic_add) {
-        ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_back_f32, "ssm_scan_back_f32", ssm_scan_back_f32_len, ssm_scan_back_f32_data, "main", 9, sizeof(vk_op_ssm_scan_back_push_constants), {256, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_back_grad_f32, "ssm_scan_back_grad_f32", ssm_scan_back_grad_f32_len, ssm_scan_back_grad_f32_data, "main", 12, sizeof(vk_op_ssm_scan_back_push_constants), {256, 1, 1}, {}, 1);
     }
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
@@ -12301,7 +12304,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         return nullptr;
     case GGML_OP_SSM_SCAN_BACK:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
-            return ctx->device->pipeline_ssm_scan_back_f32;
+            return ctx->device->pipeline_ssm_scan_back_grad_f32;
         }
         return nullptr;
     case GGML_OP_SSM_CONV:
@@ -13542,7 +13545,6 @@ static void ggml_vk_ssm_scan_back(ggml_backend_vk_context * ctx, vk_context& sub
     const ggml_tensor * B   = dst->src[4];
     const ggml_tensor * C   = dst->src[5];
     const ggml_tensor * ids = dst->src[6];
-    const ggml_tensor * ds  = dst->src[7];
 
     GGML_ASSERT(dst->buffer != nullptr);
 
@@ -13552,6 +13554,18 @@ static void ggml_vk_ssm_scan_back(ggml_backend_vk_context * ctx, vk_context& sub
     const uint32_t n_A  = (uint32_t)ggml_nelements(A);
     const uint32_t n_B  = (uint32_t)ggml_nelements(B);
     const uint32_t n_C  = (uint32_t)ggml_nelements(C);
+
+    const uint32_t nc = (uint32_t)s->ne[0];
+    const uint32_t nr = (uint32_t)x->ne[0];
+    const uint32_t nh = (uint32_t)x->ne[1];
+    const uint32_t nt = (uint32_t)x->ne[2];
+    const uint32_t ns = (uint32_t)x->ne[3];
+    const uint32_t tc = std::min<uint32_t>(nt, 32);
+    const uint32_t nch = CEIL_DIV(nt, tc);
+    const size_t chain_state_bytes = sizeof(float)*(size_t)nh*ns*nc*nr;
+    const size_t traj_bytes = tc*chain_state_bytes;
+    const size_t ckpt_bytes = nch*chain_state_bytes;
+    const size_t carry_bytes = chain_state_bytes;
 
     const vk_op_ssm_scan_back_push_constants pc = {
         (uint32_t)s->ne[0], (uint32_t)x->ne[0], (uint32_t)x->ne[1], (uint32_t)B->ne[1],
@@ -13564,11 +13578,14 @@ static void ggml_vk_ssm_scan_back(ggml_backend_vk_context * ctx, vk_context& sub
         (uint32_t)(B->nb[0]/esz),  (uint32_t)(B->nb[1]/esz),  (uint32_t)(B->nb[2]/esz),  (uint32_t)(B->nb[3]/esz),
         (uint32_t)(C->nb[0]/esz),  (uint32_t)(C->nb[1]/esz),  (uint32_t)(C->nb[2]/esz),  (uint32_t)(C->nb[3]/esz),
         (uint32_t)(ids->nb[0]/sizeof(int32_t)),
+        tc, 0, nt,
     };
 
-    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, s, x, dt, dst, dst->op);
-    GGML_ASSERT(pipeline != nullptr);
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    vk_pipeline pipeline_ckpt = ctx->device->pipeline_ssm_scan_back_ckpt_f32;
+    vk_pipeline pipeline_grad = ctx->device->pipeline_ssm_scan_back_grad_f32;
+    GGML_ASSERT(pipeline_ckpt != nullptr && pipeline_grad != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline_ckpt, 1);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline_grad, nch);
 
     vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
     vk_subbuffer src_buf[8] = {};
@@ -13576,23 +13593,51 @@ static void ggml_vk_ssm_scan_back(ggml_backend_vk_context * ctx, vk_context& sub
         src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i]);
     }
 
-    // the scatter accumulates with atomic adds, so start from zeros
+    if (ctx->prealloc_size_x < traj_bytes) {
+        ctx->prealloc_size_x = traj_bytes;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    if (ctx->prealloc_size_y < traj_bytes) {
+        ctx->prealloc_size_y = traj_bytes;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    if (ctx->prealloc_size_split_k < ckpt_bytes + carry_bytes) {
+        ctx->prealloc_size_split_k = ckpt_bytes + carry_bytes;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+
+    const vk_subbuffer traj_buf  = ggml_vk_subbuffer(ctx, ctx->prealloc_x);
+    const vk_subbuffer lam_buf   = ggml_vk_subbuffer(ctx, ctx->prealloc_y);
+    const vk_subbuffer ckpt_buf  = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k);
+    const vk_subbuffer carry_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, ckpt_bytes);
+
+    // Shared gradients still use atomics, so clear the packed destination.
     ggml_vk_buffer_memset_async(subctx, dst_buf.buffer, dst_buf.offset, 0, dst_buf.size);
     ggml_vk_sync_buffers(ctx, subctx);
 
-    const uint32_t total = pc.d_state * pc.head_dim * pc.n_head * pc.n_seq_tokens * pc.n_seqs;
-    std::array<uint32_t, 3> elements;
-    if (total > 262144) {
-        elements = { 512, 512, CEIL_DIV(total, 262144) };
-    } else if (total > 512) {
-        elements = { 512, CEIL_DIV(total, 512), 1 };
-    } else {
-        elements = { total, 1, 1 };
-    }
+    // Pass 0: checkpoint the forward state and seed the final lambda carry.
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_ckpt,
+        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[6], src_buf[7], ckpt_buf, carry_buf},
+        pc, { nh * 256, ns, 1 });
 
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], src_buf[6], src_buf[7], dst_buf},
-        pc, elements);
+    // Pass 1: chunks run last-to-first; the barrier carries lambda between
+    // dispatches and makes each chunk's scratch visible before it is consumed.
+    for (int32_t c = (int32_t)nch - 1; c >= 0; --c) {
+        ggml_vk_sync_buffers(ctx, subctx);
+        vk_op_ssm_scan_back_push_constants chunk_pc = pc;
+        chunk_pc.chunk_lo = (uint32_t)c * tc;
+        chunk_pc.chunk_hi = std::min(nt, chunk_pc.chunk_lo + tc);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_grad,
+            {src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], src_buf[6], src_buf[7],
+             dst_buf, traj_buf, lam_buf, ckpt_buf, carry_buf},
+            chunk_pc, { nh * 256, ns, 1 });
+    }
+    ctx->prealloc_x_need_sync = true;
+    ctx->prealloc_y_need_sync = true;
+    ctx->prealloc_split_k_need_sync = true;
+    ctx->prealloc_y_last_pipeline_used = nullptr;
+    ctx->prealloc_y_last_tensor_used = nullptr;
+    ctx->prealloc_y_last_decode_vector_staging = false;
 }
 
 static void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
@@ -17351,6 +17396,57 @@ static void ggml_backend_vk_set_tensor_async(ggml_backend_t backend, ggml_tensor
     ggml_backend_vk_set_tensor_2d_async(backend, tensor, data, offset, size, 1, size, size);
 }
 
+// Batch sparse scalar updates through one mapped staging upload and one Vulkan
+// copy command. This is used by the training label path, where active one-hot
+// cells are irregular and individual 4-byte tensor_set calls otherwise submit
+// and wait once per label.
+static bool ggml_backend_vk_set_sparse_f32(
+        ggml_backend_t backend,
+        ggml_tensor * tensor,
+        const size_t * offsets,
+        const float * values,
+        size_t count) {
+    if (count == 0) {
+        return true;
+    }
+    if (!backend || !tensor || !tensor->buffer || tensor->type != GGML_TYPE_F32 ||
+            !offsets || !values || !ggml_backend_buffer_is_vk(tensor->buffer)) {
+        return false;
+    }
+
+    const size_t tensor_size = ggml_nbytes(tensor);
+    const size_t staging_size = count*sizeof(float);
+    for (size_t i = 0; i < count; ++i) {
+        if (tensor_size < sizeof(float) || offsets[i] % sizeof(float) != 0 ||
+                offsets[i] > tensor_size - sizeof(float)) {
+            return false;
+        }
+    }
+
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
+
+    // The staging buffer is shared by synchronous backend transfers. Wait once
+    // per micro-batch before reusing it, instead of once per active label.
+    ggml_vk_synchronize(ctx);
+    ggml_vk_ensure_sync_staging_buffer(ctx, staging_size);
+    memcpy(ctx->sync_staging->ptr, values, staging_size);
+
+    std::vector<vk::BufferCopy> slices(count);
+    const size_t tensor_base = vk_tensor_offset(tensor) + tensor->view_offs;
+    for (size_t i = 0; i < count; ++i) {
+        slices[i].srcOffset = i*sizeof(float);
+        slices[i].dstOffset = tensor_base + offsets[i];
+        slices[i].size = sizeof(float);
+    }
+
+    vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
+    compute_ctx->s->buffer->buf.copyBuffer(
+            ctx->sync_staging->buffer, buf_ctx->dev_buffer->buffer, slices);
+    ggml_vk_sync_buffers(ctx, compute_ctx);
+    return true;
+}
+
 static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset,
                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     VK_LOG_DEBUG("ggml_backend_vk_get_tensor_2d_async(" << size << ", " << n_copies << ")");
@@ -20343,11 +20439,21 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_set_sparse_f32") == 0) {
+        ggml_backend_set_sparse_f32_t fct = ggml_backend_vk_set_sparse_f32;
+        return (void *)fct;
+    }
+    return nullptr;
+
+    UNUSED(reg);
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {
