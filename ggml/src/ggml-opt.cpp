@@ -9,8 +9,11 @@
 #include <cmath>
 #include <cstdint>
 #include <cinttypes>
+#include <cstring>
 #include <map>
 #include <random>
+#include <sstream>
+#include <string>
 #include <vector>
 
 struct ggml_opt_dataset {
@@ -66,6 +69,14 @@ struct ggml_opt_context {
     std::vector<struct ggml_tensor *> grad_accs;
     std::vector<struct ggml_tensor *> grad_m;
     std::vector<struct ggml_tensor *> grad_v;
+    // retro delta: compacted, name-keyed view of the momenta above. This is
+    // the pairing both the optimizer step and checkpointing use; grad_m/grad_v
+    // stay as the allocation-time storage, indexed by forward-graph node
+    // position, which is not a stable identity across graph builds.
+    std::vector<std::string>          momenta_names;
+    std::vector<struct ggml_tensor *> momenta_m;
+    std::vector<struct ggml_tensor *> momenta_v;
+    std::map<std::string, size_t>     momenta_index;
     // CE nodes are stamped once per ubatch. Cache their addresses across
     // repeated calls and rebuild the cache only when ggml_opt_build replaces
     // a dynamic graph.
@@ -560,6 +571,10 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
                 if (node->flags & GGML_TENSOR_FLAG_PARAM) {
                     opt_ctx->grad_m[i] = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
                     opt_ctx->grad_v[i] = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
+                    opt_ctx->momenta_index[node->name] = opt_ctx->momenta_m.size();
+                    opt_ctx->momenta_names.push_back(node->name);
+                    opt_ctx->momenta_m.push_back(opt_ctx->grad_m[i]);
+                    opt_ctx->momenta_v.push_back(opt_ctx->grad_v[i]);
                 } else {
                     opt_ctx->grad_m[i] = nullptr;
                     opt_ctx->grad_v[i] = nullptr;
@@ -646,8 +661,29 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             struct ggml_tensor * m = nullptr;
             struct ggml_tensor * v = nullptr;
             if (need_momenta) {
-                m = opt_ctx->grad_m[i];
-                v = opt_ctx->grad_v[i];
+                // retro delta: pair a parameter with its momenta by name.
+                //
+                // The momenta are allocated once, on the first build, and
+                // indexed there by forward-graph node position; a dynamic graph
+                // is rebuilt on every ggml_opt_alloc, so that position is only
+                // incidentally stable. Checkpointing hands these same tensors
+                // to the caller keyed by parameter name
+                // (ggml_opt_momenta_name), and a restore writes them back by
+                // name, so the two lookups must agree by construction rather
+                // than by coincidence: a disagreement would silently train with
+                // another parameter's momenta.
+                //
+                // The pairing has not been observed to diverge in practice; the
+                // point is that nothing enforced it. The assert below also
+                // turns "a parameter appeared after the momenta were allocated"
+                // — previously a null or mismatched grad_m[i] — into a failure.
+                const auto slot = opt_ctx->momenta_index.find(node->name);
+                GGML_ASSERT(slot != opt_ctx->momenta_index.end() &&
+                        "optimizer parameter has no momenta; it appeared after they were allocated");
+                m = opt_ctx->momenta_m[slot->second];
+                v = opt_ctx->momenta_v[slot->second];
+                GGML_ASSERT(ggml_are_same_shape(m, node) &&
+                        "optimizer parameter changed shape between graph builds");
                 ggml_format_name(m, "AdamW m for %s", node->name);
                 ggml_format_name(v, "AdamW v for %s", node->name);
             }
@@ -803,6 +839,65 @@ struct ggml_tensor * ggml_opt_ncorrect(ggml_opt_context_t opt_ctx) {
 
 struct ggml_tensor * ggml_opt_grad_acc(ggml_opt_context_t opt_ctx, struct ggml_tensor * node) {
     return ggml_graph_get_grad_acc(opt_ctx->gb_opt, node);
+}
+
+// ====== Optimizer state access (retro delta) ======
+
+int64_t ggml_opt_iter(ggml_opt_context_t opt_ctx) {
+    return opt_ctx->iter;
+}
+
+void ggml_opt_set_iter(ggml_opt_context_t opt_ctx, int64_t iter) {
+    opt_ctx->iter = iter;
+}
+
+int64_t ggml_opt_momenta_count(ggml_opt_context_t opt_ctx) {
+    return (int64_t) opt_ctx->momenta_names.size();
+}
+
+const char * ggml_opt_momenta_name(ggml_opt_context_t opt_ctx, int64_t index) {
+    if (index < 0 || index >= (int64_t) opt_ctx->momenta_names.size()) {
+        return nullptr;
+    }
+    return opt_ctx->momenta_names[index].c_str();
+}
+
+struct ggml_tensor * ggml_opt_momenta_m(ggml_opt_context_t opt_ctx, int64_t index) {
+    if (index < 0 || index >= (int64_t) opt_ctx->momenta_m.size()) {
+        return nullptr;
+    }
+    return opt_ctx->momenta_m[index];
+}
+
+struct ggml_tensor * ggml_opt_momenta_v(ggml_opt_context_t opt_ctx, int64_t index) {
+    if (index < 0 || index >= (int64_t) opt_ctx->momenta_v.size()) {
+        return nullptr;
+    }
+    return opt_ctx->momenta_v[index];
+}
+
+size_t ggml_opt_rng_state(ggml_opt_context_t opt_ctx, char * buffer, size_t n_buffer) {
+    std::ostringstream stream;
+    stream << opt_ctx->rng;
+    const std::string state = stream.str();
+    if (buffer && n_buffer > state.size()) {
+        std::memcpy(buffer, state.c_str(), state.size() + 1);
+    }
+    return state.size();
+}
+
+bool ggml_opt_set_rng_state(ggml_opt_context_t opt_ctx, const char * state) {
+    if (!state) {
+        return false;
+    }
+    std::istringstream stream(state);
+    std::mt19937 rng;
+    stream >> rng;
+    if (stream.fail()) {
+        return false;
+    }
+    opt_ctx->rng = rng;
+    return true;
 }
 
 // ====== Optimization Result ======

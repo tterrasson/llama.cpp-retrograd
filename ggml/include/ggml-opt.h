@@ -193,6 +193,28 @@ extern "C" {
     // get the gradient accumulator for a node from the forward graph
     GGML_API struct ggml_tensor * ggml_opt_grad_acc(ggml_opt_context_t opt_ctx, struct ggml_tensor * node);
 
+    // retro delta: optimizer-state access for training checkpoints.
+    //
+    // The AdamW momenta are allocated lazily, by the first ggml_opt_alloc that
+    // builds the optimizer graph; before that ggml_opt_momenta_count() is 0 and
+    // a checkpoint must record that it carries no momenta. Once allocated the
+    // tensors outlive individual graph allocations (they live in ctx_static),
+    // so they stay readable and writable between epochs, and they are indexed
+    // by a stable parameter name rather than by graph node order.
+    GGML_API int64_t ggml_opt_iter(    ggml_opt_context_t opt_ctx);
+    GGML_API void    ggml_opt_set_iter(ggml_opt_context_t opt_ctx, int64_t iter);
+
+    GGML_API int64_t               ggml_opt_momenta_count(ggml_opt_context_t opt_ctx);
+    GGML_API const char *          ggml_opt_momenta_name( ggml_opt_context_t opt_ctx, int64_t index);
+    GGML_API struct ggml_tensor  * ggml_opt_momenta_m(    ggml_opt_context_t opt_ctx, int64_t index);
+    GGML_API struct ggml_tensor  * ggml_opt_momenta_v(    ggml_opt_context_t opt_ctx, int64_t index);
+
+    // mt19937 state, serialized as the whitespace-separated decimal word list
+    // produced by operator<<. Returns the number of bytes required excluding
+    // the terminating NUL; writes only when n_buffer is large enough.
+    GGML_API size_t ggml_opt_rng_state(    ggml_opt_context_t opt_ctx, char * buffer, size_t n_buffer);
+    GGML_API bool   ggml_opt_set_rng_state(ggml_opt_context_t opt_ctx, const char * state);
+
     GGML_API enum ggml_opt_optimizer_type ggml_opt_context_optimizer_type(ggml_opt_context_t); //TODO consistent naming scheme
 
     GGML_API const char * ggml_opt_optimizer_name(enum ggml_opt_optimizer_type);

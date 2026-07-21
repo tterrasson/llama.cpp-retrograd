@@ -1622,6 +1622,11 @@ extern "C" {
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
 
+    // retro delta: the context's optimizer, or NULL before llama_opt_init.
+    // Exposed so a training checkpoint can read and restore the optimizer
+    // state (iteration counter, AdamW momenta, RNG) through the ggml-opt API.
+    LLAMA_API ggml_opt_context_t llama_opt_context(struct llama_context * lctx);
+
     LLAMA_API void llama_opt_epoch(
             struct llama_context    * lctx,
             ggml_opt_dataset_t        dataset,

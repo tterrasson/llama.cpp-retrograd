@@ -196,6 +196,9 @@ struct llama_context {
 
     void opt_init(struct llama_model * model, struct llama_opt_params lopt_params);
 
+    // retro delta: optimizer handle for checkpointing; NULL before opt_init.
+    ggml_opt_context_t opt_context() const { return opt_ctx; }
+
     // TODO: more flexible combinations of logical/physical batch size and context size
     // retro delta: label_weights optionally scales each label position's loss
     // contribution (dataset layout, nullable = all ones).
