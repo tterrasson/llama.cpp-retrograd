@@ -406,6 +406,13 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        // retro delta: build a KV cache the backward pass can traverse, so a
+        // LoRA on the K/V projections actually receives a gradient. Without it
+        // the attention reads a plain view of the cache buffer, which aliases
+        // the ggml_set_rows() that filled it instead of depending on it, and
+        // K/V train silently as no-ops. Costs one V transpose per layer per
+        // step; only a training context wants it.
+        bool kv_differentiable;
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

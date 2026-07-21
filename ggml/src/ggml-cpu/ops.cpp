@@ -12219,7 +12219,7 @@ static void ggml_compute_forward_opt_step_adamw_f32(
     GGML_ASSERT(ggml_are_same_shape(src0, src0_grad));
     GGML_ASSERT(ggml_are_same_shape(src0, src0_grad_m));
     GGML_ASSERT(ggml_are_same_shape(src0, src0_grad_v));
-    GGML_ASSERT(ggml_nelements(adamw_params) == 7);
+    GGML_ASSERT(ggml_nelements(adamw_params) == 9);
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -12245,6 +12245,9 @@ static void ggml_compute_forward_opt_step_adamw_f32(
     const float wd     = adamw_params_ptr[4];
     const float beta1h = adamw_params_ptr[5];
     const float beta2h = adamw_params_ptr[6];
+    // adamw_params_ptr[7] seeds stochastic rounding, which only the F16
+    // parameter path needs: an F32 parameter stores its update exactly.
+    const float gscale = adamw_params_ptr[8];
     const float keep   = 1.f - alpha * wd;
     for (int ir = ir0; ir < ir1; ++ir) {
         const int64_t i03 = ir/(ne02*ne01);
@@ -12259,8 +12262,9 @@ static void ggml_compute_forward_opt_step_adamw_f32(
         float       * v = (float       *) ((char       *) src0_grad_v->data + offset);
 
         for (int i00 = 0; i00 < ne00; ++i00) {
-            m[i00] = m[i00]*beta1 +        g[i00]*(1.0f - beta1);
-            v[i00] = v[i00]*beta2 + g[i00]*g[i00]*(1.0f - beta2);
+            const float gi = g[i00] * gscale;
+            m[i00] = m[i00]*beta1 +  gi*(1.0f - beta1);
+            v[i00] = v[i00]*beta2 + gi*gi*(1.0f - beta2);
 
             const float mh =       m[i00]*beta1h;
             const float vh = sqrtf(v[i00]*beta2h) + eps;
@@ -12270,6 +12274,56 @@ static void ggml_compute_forward_opt_step_adamw_f32(
             // See: https://arxiv.org/pdf/1711.05101v3.pdf
             w[i00] = w[i00] * keep - alpha * mh / vh;
         }
+    }
+}
+
+static void ggml_compute_forward_opt_step_adamw_f16(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    ggml_tensor * w_tensor       = dst->src[0];
+    const ggml_tensor * g_tensor = dst->src[1];
+    ggml_tensor * m_tensor       = dst->src[2];
+    ggml_tensor * v_tensor       = dst->src[3];
+    const ggml_tensor * pars     = dst->src[4];
+
+    GGML_ASSERT(w_tensor->type == GGML_TYPE_F16);
+    GGML_ASSERT(g_tensor->type == GGML_TYPE_F32);
+    GGML_ASSERT(m_tensor->type == GGML_TYPE_F32);
+    GGML_ASSERT(v_tensor->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(w_tensor));
+    GGML_ASSERT(ggml_is_contiguous(g_tensor));
+    GGML_ASSERT(ggml_is_contiguous(m_tensor));
+    GGML_ASSERT(ggml_is_contiguous(v_tensor));
+    GGML_ASSERT(ggml_nelements(pars) == 9);
+
+    const int64_t n = ggml_nelements(w_tensor);
+    const int64_t chunk = (n + params->nth - 1) / params->nth;
+    const int64_t begin = chunk * params->ith;
+    const int64_t end = MIN(begin + chunk, n);
+    const float * p = ggml_get_data_f32(pars);
+    const float alpha = p[0];
+    const float beta1 = p[1];
+    const float beta2 = p[2];
+    const float eps = p[3];
+    const float keep = 1.0f - alpha * p[4];
+    const float beta1h = p[5];
+    const float beta2h = p[6];
+    const uint32_t seed = (uint32_t) p[7];
+    const float gscale = p[8];
+
+    ggml_fp16_t * w = static_cast<ggml_fp16_t *>(w_tensor->data);
+    const float * g = static_cast<const float *>(g_tensor->data);
+    float * m = static_cast<float *>(m_tensor->data);
+    float * v = static_cast<float *>(v_tensor->data);
+    for (int64_t i = begin; i < end; ++i) {
+        const float gi = g[i] * gscale;
+        m[i] = m[i] * beta1 + gi * (1.0f - beta1);
+        v[i] = v[i] * beta2 + gi * gi * (1.0f - beta2);
+        const float mh = m[i] * beta1h;
+        const float vh = sqrtf(v[i] * beta2h) + eps;
+        const float updated = ggml_fp16_to_fp32(w[i]) * keep - alpha * mh / vh;
+        w[i] = ggml_fp32_to_fp16(
+                ggml_stochastic_round_f16(updated, ggml_sr_uniform(seed, (uint32_t) i)));
     }
 }
 
@@ -12283,6 +12337,10 @@ void ggml_compute_forward_opt_step_adamw(
         case GGML_TYPE_F32:
             {
                 ggml_compute_forward_opt_step_adamw_f32(params, dst);
+            } break;
+        case GGML_TYPE_F16:
+            {
+                ggml_compute_forward_opt_step_adamw_f16(params, dst);
             } break;
         default:
             {

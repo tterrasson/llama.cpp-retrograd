@@ -609,7 +609,8 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             /*.no_alloc   =*/ true,
         };
         opt_ctx->ctx_cpu = ggml_init(params);
-        const int64_t optimizer_param_count = need_momenta ? 7 : 2;
+        // AdamW carries seven hyperparameters plus the stochastic-rounding seed.
+        const int64_t optimizer_param_count = need_momenta ? 8 : 2;
         opt_ctx->opt_step_params = ggml_new_tensor_1d(
                 opt_ctx->ctx_cpu, GGML_TYPE_F32, optimizer_param_count + 1);
         ggml_set_input(opt_ctx->opt_step_params);
@@ -617,7 +618,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         ggml_format_name(opt_ctx->opt_step_params, "%s_params", optimizer_name);
         opt_ctx->buf_cpu = ggml_backend_alloc_ctx_tensors_from_buft(opt_ctx->ctx_cpu, ggml_backend_cpu_buffer_type());
     }
-    const int64_t optimizer_param_count = need_momenta ? 7 : 2;
+    const int64_t optimizer_param_count = need_momenta ? 8 : 2;
     ggml_tensor * optimizer_params = ggml_view_1d(
             opt_ctx->ctx_compute, opt_ctx->opt_step_params, optimizer_param_count, 0);
     ggml_tensor * max_grad_norm = ggml_view_1d(
@@ -651,13 +652,21 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             ggml_div(opt_ctx->ctx_compute, max_grad_norm, global_grad_norm),
             0.0f,
             1.0f);
+    // retro delta: AdamW folds the clipping scale into its own kernel, so the
+    // scale travels with the hyperparameters instead of being multiplied into a
+    // full-size copy of every gradient. The concat runs once per graph; the
+    // nine-element result -- seven hyperparameters, the rounding seed, then the
+    // clipping scale -- is shared by every parameter.
+    ggml_tensor * adamw_params = optimizer == GGML_OPT_OPTIMIZER_TYPE_ADAMW
+        ? ggml_concat(opt_ctx->ctx_compute, optimizer_params, grad_scale, 0)
+        : nullptr;
+
     const char * optimizer_name = ggml_opt_optimizer_name(opt_ctx->optimizer);
     for (int i = opt_ctx->gf->n_nodes-1; i >= 0; --i) {
         struct ggml_tensor * node = opt_ctx->gb_opt->nodes[i];
         struct ggml_tensor * grad = ggml_graph_get_grad(opt_ctx->gb_opt, node);
 
         if (grad && (node->flags & GGML_TENSOR_FLAG_PARAM)) {
-            struct ggml_tensor * clipped_grad = ggml_mul(opt_ctx->ctx_compute, grad, grad_scale);
             struct ggml_tensor * m = nullptr;
             struct ggml_tensor * v = nullptr;
             if (need_momenta) {
@@ -691,11 +700,13 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             switch (optimizer) {
                 case GGML_OPT_OPTIMIZER_TYPE_ADAMW:
                     opt_step = ggml_opt_step_adamw(
-                            opt_ctx->ctx_compute, node, clipped_grad, m, v, optimizer_params);
+                            opt_ctx->ctx_compute, node, grad, m, v, adamw_params);
                     break;
                 case GGML_OPT_OPTIMIZER_TYPE_SGD:
-                    opt_step = ggml_opt_step_sgd(
-                            opt_ctx->ctx_compute, node, clipped_grad, optimizer_params);
+                    // SGD keeps the explicit multiply: its kernel is untouched
+                    // by the F16 work and retroback only trains with AdamW.
+                    opt_step = ggml_opt_step_sgd(opt_ctx->ctx_compute, node,
+                            ggml_mul(opt_ctx->ctx_compute, grad, grad_scale), optimizer_params);
                     break;
                 default:
                     GGML_ABORT("fatal error");
@@ -1089,7 +1100,12 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
                 adamw_par_data[4] = opt_pars.adamw.wd;
                 adamw_par_data[5] = beta1h;
                 adamw_par_data[6] = beta2h;
-                adamw_par_data[7] = opt_pars.max_grad_norm;
+                // retro delta: per-step seed for the stochastic rounding an F16
+                // parameter needs. Exact as a float below 2^24 iterations; past
+                // that the stream repeats a step, which costs nothing but
+                // decorrelation.
+                adamw_par_data[7] = (float) opt_ctx->iter;
+                adamw_par_data[8] = opt_pars.max_grad_norm;
             } break;
             case GGML_OPT_OPTIMIZER_TYPE_SGD: {
                 GGML_ASSERT(opt_pars.sgd.alpha > 0.0f);

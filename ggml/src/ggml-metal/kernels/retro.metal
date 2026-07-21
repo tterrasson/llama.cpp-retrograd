@@ -1,5 +1,71 @@
 #include "common.h"
 #include "dequantize.h" // retro delta: quantized training kernels
+// retro delta: stochastic rounding for F16 parameters. Mirrors
+// ggml_sr_uniform / ggml_stochastic_round_f16 in ggml-impl.h bit for bit -- an
+// exact CPU-vs-GPU equality test covers the three implementations.
+static inline float retro_sr_uniform(uint seed, uint index) {
+    uint h = seed ^ (index * 0x9E3779B9u);
+    h ^= h >> 16; h *= 0x7FEB352Du;
+    h ^= h >> 15; h *= 0x846CA68Bu;
+    h ^= h >> 16;
+    return float(h >> 8) * (1.0f / 16777216.0f);
+}
+
+static inline ushort retro_f16_neighbour(ushort bits, bool up) {
+    const ushort sign = bits & 0x8000;
+    const ushort mag  = bits & 0x7FFF;
+    if (mag == 0) {
+        return up ? 0x0001 : 0x8001;
+    }
+    const bool grow = up ? (sign == 0) : (sign != 0);
+    return ushort(sign | ushort(grow ? mag + 1 : mag - 1));
+}
+
+static inline float retro_stochastic_round_f16(float x, float u) {
+    const half  nearest   = half(x);
+    const float nearest_f = float(nearest);
+    const float residual  = x - nearest_f;
+    if (residual == 0.0f) {
+        return nearest_f;
+    }
+    const ushort other   = retro_f16_neighbour(as_type<ushort>(nearest), residual > 0.0f);
+    const float  other_f = float(as_type<half>(other));
+    const float  span    = other_f - nearest_f;
+    const float  p = (span != 0.0f && isfinite(span)) ? residual / span : 0.0f;
+    return u < p ? other_f : nearest_f;
+}
+
+kernel void kernel_opt_step_adamw_f16(
+        constant    ggml_metal_kargs_opt_step_adamw & args,
+        device       half * x,
+        device const float * g,
+        device       float * g_m,
+        device       float * g_v,
+        device const float * pars,
+        uint        gid[[thread_position_in_grid]]) {
+    if (gid >= args.np) {
+        return;
+    }
+
+    const float alpha  = pars[0];
+    const float beta1  = pars[1];
+    const float beta2  = pars[2];
+    const float eps    = pars[3];
+    const float wd     = pars[4];
+    const float beta1h = pars[5];
+    const float beta2h = pars[6];
+    const float gi = g[gid] * pars[8];
+    const float gmi = g_m[gid] * beta1 + gi * (1.0f - beta1);
+    const float gvi = g_v[gid] * beta2 + gi * gi * (1.0f - beta2);
+    g_m[gid] = gmi;
+    g_v[gid] = gvi;
+    const float updated = float(x[gid]) * (1.0f - alpha * wd)
+            - alpha * (gmi * beta1h) / (sqrt(gvi * beta2h) + eps);
+    x[gid] = half(retro_stochastic_round_f16(
+            updated, retro_sr_uniform(uint(pars[7]), gid)));
+}
+
+
 // retro delta: RMS-norm backward for LoRA training.
 // src0 = dz (grad of output), src1 = x (forward input), same shape. Per row:
 //   sum_xx = Σ x², sum_xdz = Σ x·dz, rrms = 1/sqrt(sum_xx/n + eps)

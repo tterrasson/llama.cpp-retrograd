@@ -5503,7 +5503,6 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
-        case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
         case GGML_OP_FILL:
         case GGML_OP_CUMSUM:
@@ -5511,6 +5510,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_DIAG:
         case GGML_OP_SOLVE_TRI:
             return true;
+        case GGML_OP_OPT_STEP_ADAMW:
+            // CUDA's optimizer kernel currently treats every buffer as F32.
+            // Keep F16 parameters on a supported backend instead of silently
+            // reinterpreting their storage.
+            return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
 

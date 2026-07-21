@@ -6369,8 +6369,16 @@ struct ggml_tensor * ggml_opt_step_adamw(
     GGML_ASSERT(ggml_are_same_shape(a, grad));
     GGML_ASSERT(ggml_are_same_shape(a, m));
     GGML_ASSERT(ggml_are_same_shape(a, v));
+    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16);
+    GGML_ASSERT(grad->type == GGML_TYPE_F32);
+    GGML_ASSERT(m->type == GGML_TYPE_F32);
+    GGML_ASSERT(v->type == GGML_TYPE_F32);
     GGML_ASSERT(adamw_params->type == GGML_TYPE_F32);
-    GGML_ASSERT(ggml_nelements(adamw_params) == 7);
+    // retro delta: params[7] seeds the stochastic rounding an F16 parameter
+    // needs, params[8] is the gradient-clipping scale applied to the gradient
+    // inside the kernel. Materializing scale*grad as its own node cost one
+    // extra elementwise pass over every parameter on every step.
+    GGML_ASSERT(ggml_nelements(adamw_params) == 9);
 
     struct ggml_tensor * result = ggml_view_tensor(ctx, a);
 

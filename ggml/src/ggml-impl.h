@@ -448,6 +448,61 @@ static inline ggml_fp16_t ggml_compute_fp32_to_fp16(float f) {
 #define GGML_FP16_TO_FP32(x) GGML_COMPUTE_FP16_TO_FP32(x)
 #define GGML_FP32_TO_FP16(x) GGML_COMPUTE_FP32_TO_FP16(x)
 
+// retro delta: stochastic rounding, for training a parameter stored in F16.
+//
+// Round-to-nearest discards every update smaller than half an ULP, so a small
+// but systematic increment -- decoupled weight decay, or an AdamW step below
+// the F16 resolution of the weight it is applied to -- is rounded away on each
+// step and never accumulates. Picking one of the two neighbouring F16 values at
+// random, with a probability equal to the residual, keeps the update unbiased
+// in expectation (E[result] == x) at zero memory cost. The usual alternative,
+// an F32 master copy of every parameter, costs *more* memory than simply
+// training in F32, so it is never the right trade for LoRA.
+//
+// The Metal and Vulkan kernels reimplement this identically; keep the three in
+// sync, they are covered by an exact CPU-vs-GPU equality test.
+
+// Uniform in [0, 1), from a per-step seed and the element's flat index.
+static inline float ggml_sr_uniform(uint32_t seed, uint32_t index) {
+    uint32_t h = seed ^ (index * UINT32_C(0x9E3779B9));
+    h ^= h >> 16; h *= UINT32_C(0x7FEB352D);
+    h ^= h >> 15; h *= UINT32_C(0x846CA68B);
+    h ^= h >> 16;
+    return (float) (h >> 8) * (1.0f / 16777216.0f);
+}
+
+// The F16 value adjacent to `bits`, towards +inf when `up`, else towards -inf.
+// IEEE sign-magnitude ordering makes this a plain magnitude increment: it
+// crosses the subnormal/normal boundary correctly and saturates at infinity.
+static inline uint16_t ggml_f16_neighbour(uint16_t bits, int up) {
+    const uint16_t sign = bits & UINT16_C(0x8000);
+    const uint16_t mag  = bits & UINT16_C(0x7FFF);
+    if (mag == 0) {
+        return up ? UINT16_C(0x0001) : UINT16_C(0x8001);
+    }
+    const int grow = up ? (sign == 0) : (sign != 0);
+    return (uint16_t) (sign | (uint16_t) (grow ? mag + 1 : mag - 1));
+}
+
+// `x` snapped to one of its two neighbouring F16 values, unbiased in
+// expectation. `u` must be uniform in [0, 1). The result is exactly
+// representable in F16, so the caller's ordinary conversion stores it verbatim.
+static inline float ggml_stochastic_round_f16(float x, float u) {
+    const uint16_t nearest   = GGML_FP32_TO_FP16(x);
+    const float    nearest_f = GGML_FP16_TO_FP32(nearest);
+    const float    residual  = x - nearest_f;
+    if (residual == 0.0f) {
+        return nearest_f;
+    }
+    const uint16_t other   = ggml_f16_neighbour(nearest, residual > 0.0f);
+    const float    other_f = GGML_FP16_TO_FP32(other);
+    const float    span    = other_f - nearest_f;
+    // Saturating at infinity leaves an infinite span, hence probability zero:
+    // stochastic rounding never manufactures an overflow.
+    const float p = span != 0.0f && isfinite(span) ? residual / span : 0.0f;
+    return u < p ? other_f : nearest_f;
+}
+
 static inline float ggml_e8m0_to_fp32(uint8_t x) {
     uint32_t bits;  // Stores the raw bit representation of the float
 
