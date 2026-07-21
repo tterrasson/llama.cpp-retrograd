@@ -1677,6 +1677,19 @@ extern "C" {
             uint32_t                  n_sequences,
             ggml_opt_epoch_callback   callback);
 
+    // retro delta: monotonic wall-clock counters for optimizer graph work.
+    // The three fields split graph construction, backend planning/allocation,
+    // and evaluation (forward + backward + optimizer step), respectively.
+    typedef struct llama_opt_timing {
+        double graph_build_seconds;
+        double allocation_seconds;
+        double execution_seconds;
+    } llama_opt_timing;
+
+    LLAMA_API void llama_opt_get_timing(
+            const struct llama_context * lctx,
+            struct llama_opt_timing * out_timing);
+
     // retro delta: training-graph preflight. Requires llama_opt_init.
     enum llama_opt_preflight_check {
         LLAMA_OPT_PREFLIGHT_MISSING_GRAD    = 0, // op has no gradient rule in ggml (dev is NULL)

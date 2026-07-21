@@ -199,6 +199,8 @@ struct llama_context {
     // retro delta: optimizer handle for checkpointing; NULL before opt_init.
     ggml_opt_context_t opt_context() const { return opt_ctx; }
 
+    llama_opt_timing opt_timing_get() const { return opt_timing; }
+
     // TODO: more flexible combinations of logical/physical batch size and context size
     // retro delta: label_weights optionally scales each label position's loss
     // contribution (dataset layout, nullable = all ones).
@@ -389,6 +391,7 @@ private:
 
     void * opt_label_storage = nullptr;
     std::vector<size_t> opt_active_label_offsets;
+    llama_opt_timing opt_timing = {};
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;

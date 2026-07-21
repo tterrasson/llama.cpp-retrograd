@@ -14,6 +14,7 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -3755,10 +3756,14 @@ void llama_context::opt_epoch_iter(
 
             // the optimizer graph is allocated outside sched, so the next decode must rebuild
             gf_res_prev_active = nullptr;
+
+            const auto graph_build_started = std::chrono::steady_clock::now();
             res->reset();
-
             auto * gf = model.build_graph(gparams);
+            opt_timing.graph_build_seconds += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - graph_build_started).count();
 
+            const auto allocation_started = std::chrono::steady_clock::now();
             struct ggml_context * ctx_compute_opt;
             {
                 const size_t size_gf = ggml_graph_size(gf);
@@ -3775,6 +3780,8 @@ void llama_context::opt_epoch_iter(
             }
             ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
             ggml_opt_alloc(opt_ctx, train);
+            opt_timing.allocation_seconds += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - allocation_started).count();
 
             res->set_inputs(&ubatch);
             {
@@ -3823,7 +3830,10 @@ void llama_context::opt_epoch_iter(
                 }
                 ggml_opt_set_loss_active_rows(opt_ctx, n_active_labels);
             }
+            const auto execution_started = std::chrono::steady_clock::now();
             ggml_opt_eval(opt_ctx, result);
+            opt_timing.execution_seconds += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - execution_started).count();
             if (callback) {
                 callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_ubatch + 1, ndata_in_loop, t_loop_start);
             }
@@ -3937,12 +3947,16 @@ bool llama_context::opt_step_packed_sequences(
                 ggml_opt_set_graph_cache(opt_ctx, false);
                 opt_cached_compute_ctx.reset();
             }
+            const auto graph_build_started = std::chrono::steady_clock::now();
             res->reset();
             auto * gf = model.build_graph(gparams);
+            opt_timing.graph_build_seconds += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - graph_build_started).count();
             if (!gf) {
                 LLAMA_LOG_ERROR("%s: failed to build packed training graph\n", __func__);
                 break;
             }
+            const auto allocation_started = std::chrono::steady_clock::now();
             const size_t size_gf = ggml_graph_size(gf);
             const size_t size_meta = 4*size_gf*ggml_tensor_overhead()
                     + 2*ggml_graph_overhead_custom(size_gf, /*grads = */ true);
@@ -3956,12 +3970,17 @@ bool llama_context::opt_step_packed_sequences(
                     res->get_inp_tokens(), res->get_logits());
             ggml_opt_alloc(opt_ctx, /*backward =*/ true);
             ggml_opt_set_graph_cache(opt_ctx, true);
+            opt_timing.allocation_seconds += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - allocation_started).count();
         } else {
             // Token scoring and generation share this scheduler. They may have
             // replaced its allocation since the previous optimizer step; the
             // graph topology remains valid, only its placement must be redone.
+            const auto allocation_started = std::chrono::steady_clock::now();
             ggml_opt_invalidate_graph_allocation(opt_ctx);
             ggml_opt_alloc(opt_ctx, /*backward =*/ true);
+            opt_timing.allocation_seconds += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - allocation_started).count();
         }
         res->set_inputs(&ubatch);
 
@@ -4005,7 +4024,10 @@ bool llama_context::opt_step_packed_sequences(
             }
         }
         ggml_opt_set_loss_active_rows(opt_ctx, n_active_labels);
+        const auto execution_started = std::chrono::steady_clock::now();
         ggml_opt_eval(opt_ctx, result);
+        opt_timing.execution_seconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - execution_started).count();
         if (callback) {
             callback(true, opt_ctx, dataset, result, 1, 1, ggml_time_us());
         }
@@ -4890,6 +4912,15 @@ bool llama_opt_step_packed_sequences(
         ggml_opt_epoch_callback   callback) {
     return ctx->opt_step_packed_sequences(dataset, result, tokens, labels, label_weights,
             positions, seq_offsets, seq_ids, n_tokens, n_seq_ids, n_sequences, callback);
+}
+
+void llama_opt_get_timing(
+        const struct llama_context * ctx,
+        struct llama_opt_timing * out_timing) {
+    if (!ctx || !out_timing) {
+        return;
+    }
+    *out_timing = ctx->opt_timing_get();
 }
 
 //
