@@ -1659,6 +1659,24 @@ extern "C" {
             ggml_opt_epoch_callback   callback_eval,
             const float             * label_weights);
 
+    // retro delta: one differentiable packed multi-sequence training graph.
+    // Sequence membership is CSR, allowing several independent prompt groups
+    // and shared prefix tokens in the same physical micro-batch.
+    LLAMA_API bool llama_opt_step_packed_sequences(
+            struct llama_context    * lctx,
+            ggml_opt_dataset_t        dataset,
+            ggml_opt_result_t         result,
+            const llama_token       * tokens,
+            const llama_token       * labels,
+            const float             * label_weights,
+            const llama_pos         * positions,
+            const size_t            * seq_offsets,
+            const llama_seq_id      * seq_ids,
+            uint32_t                  n_tokens,
+            size_t                    n_seq_ids,
+            uint32_t                  n_sequences,
+            ggml_opt_epoch_callback   callback);
+
     // retro delta: training-graph preflight. Requires llama_opt_init.
     enum llama_opt_preflight_check {
         LLAMA_OPT_PREFLIGHT_MISSING_GRAD    = 0, // op has no gradient rule in ggml (dev is NULL)

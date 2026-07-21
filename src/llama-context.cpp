@@ -631,6 +631,7 @@ void llama_context::sched_reserve() {
     }
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
+    opt_graph_cache.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
 
@@ -3531,6 +3532,13 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
 
 int32_t llama_context::opt_preflight(llama_opt_preflight_cb callback, void * userdata) {
     GGML_ASSERT(opt_ctx);
+    // Preflight builds its own representative dynamic graph. Drop a cached
+    // packed graph first if callers run preflight again after training.
+    if (opt_cached_compute_ctx) {
+        ggml_opt_set_graph_cache(opt_ctx, false);
+        opt_cached_compute_ctx.reset();
+        opt_graph_cache->reset();
+    }
     const uint32_t n_ctx    = llama_model_n_ctx_train(&model);
     const uint32_t n_batch  = std::min(this->n_batch(),  n_ctx);
 
@@ -3832,6 +3840,178 @@ void llama_context::opt_epoch_iter(
     gf_res_prev->reset();
 }
 
+bool llama_context::opt_step_packed_sequences(
+        ggml_opt_dataset_t       dataset,
+        ggml_opt_result_t        result,
+        const llama_token      * tokens,
+        const llama_token      * labels_sparse,
+        const float            * label_weights,
+        const llama_pos        * positions,
+        const size_t           * seq_offsets,
+        const llama_seq_id     * seq_ids,
+        uint32_t                 n_tokens,
+        size_t                   n_seq_ids,
+        uint32_t                 n_sequences,
+        ggml_opt_epoch_callback  callback) {
+    GGML_ASSERT(opt_ctx);
+    if (!tokens || !labels_sparse || !label_weights || !positions ||
+            !seq_offsets || !seq_ids ||
+            n_tokens == 0 || n_tokens != this->n_ubatch() ||
+            n_seq_ids < n_tokens || n_sequences == 0 ||
+            seq_offsets[0] != 0 || seq_offsets[n_tokens] != n_seq_ids ||
+            n_sequences > cparams.n_seq_max) {
+        return false;
+    }
+
+    llama_batch batch = llama_batch_init(n_tokens, 0, n_sequences);
+    batch.n_tokens = static_cast<int32_t>(n_tokens);
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        batch.token[i]  = tokens[i];
+        batch.pos[i]    = positions[i];
+        batch.logits[i] = true;
+        const size_t begin = seq_offsets[i];
+        const size_t end = seq_offsets[i + 1];
+        if (begin >= end || end > n_seq_ids || end - begin > n_sequences) {
+            llama_batch_free(batch);
+            return false;
+        }
+        batch.n_seq_id[i] = static_cast<int32_t>(end - begin);
+        for (size_t s = begin; s < end; ++s) {
+            if (seq_ids[s] < 0 || static_cast<uint32_t>(seq_ids[s]) >= n_sequences) {
+                llama_batch_free(batch);
+                return false;
+            }
+            batch.seq_id[i][s - begin] = seq_ids[s];
+        }
+    }
+
+    memory->clear(true);
+    opt_label_storage = nullptr;
+    opt_active_label_offsets.clear();
+
+    bool ok = false;
+    do {
+        if (!balloc->init(batch, model.vocab, nullptr, model.hparams.n_embd_inp(),
+                cparams.n_seq_max, true)) {
+            LLAMA_LOG_ERROR("%s: batch allocator initialization failed\n", __func__);
+            break;
+        }
+        const uint32_t n_tokens_all = balloc->get_n_tokens();
+        n_queued_tokens += n_tokens_all;
+        embd_seq.clear();
+        if (output_reserve(n_tokens_all) < n_tokens_all) {
+            LLAMA_LOG_ERROR("%s: output reserve failed\n", __func__);
+            break;
+        }
+        auto mctx = memory->init_batch(*balloc, cparams.n_ubatch, true);
+        if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
+            LLAMA_LOG_ERROR("%s: memory batch initialization failed\n", __func__);
+            break;
+        }
+        const auto & ubatch = mctx->get_ubatch();
+        // A split here would detach the shared KV from a later branch graph.
+        // The public runtime contract therefore admits exactly one full
+        // physical micro-batch.
+        if (ubatch.n_tokens != n_tokens) {
+            LLAMA_LOG_ERROR("%s: shared batch split into %u of %u tokens\n",
+                    __func__, ubatch.n_tokens, n_tokens);
+            break;
+        }
+        n_outputs = ubatch.n_tokens;
+        if (!mctx->apply()) {
+            LLAMA_LOG_ERROR("%s: memory apply failed\n", __func__);
+            break;
+        }
+
+        auto * res = opt_graph_cache.get();
+        const auto gparams = graph_params(
+                res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
+        const bool reuse_graph = opt_cached_compute_ctx && res->can_reuse(gparams);
+        if (!reuse_graph) {
+            if (opt_cached_compute_ctx) {
+                ggml_opt_set_graph_cache(opt_ctx, false);
+                opt_cached_compute_ctx.reset();
+            }
+            res->reset();
+            auto * gf = model.build_graph(gparams);
+            if (!gf) {
+                LLAMA_LOG_ERROR("%s: failed to build packed training graph\n", __func__);
+                break;
+            }
+            const size_t size_gf = ggml_graph_size(gf);
+            const size_t size_meta = 4*size_gf*ggml_tensor_overhead()
+                    + 2*ggml_graph_overhead_custom(size_gf, /*grads = */ true);
+            struct ggml_init_params params = {
+                /*.mem_size   =*/ size_meta,
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            opt_cached_compute_ctx.reset(ggml_init(params));
+            ggml_opt_prepare_alloc(opt_ctx, opt_cached_compute_ctx.get(), gf,
+                    res->get_inp_tokens(), res->get_logits());
+            ggml_opt_alloc(opt_ctx, /*backward =*/ true);
+            ggml_opt_set_graph_cache(opt_ctx, true);
+        } else {
+            // Token scoring and generation share this scheduler. They may have
+            // replaced its allocation since the previous optimizer step; the
+            // graph topology remains valid, only its placement must be redone.
+            ggml_opt_invalidate_graph_allocation(opt_ctx);
+            ggml_opt_alloc(opt_ctx, /*backward =*/ true);
+        }
+        res->set_inputs(&ubatch);
+
+        struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
+        if (labels->ne[1] != n_tokens) {
+            LLAMA_LOG_ERROR("%s: optimizer label width %lld != %u\n",
+                    __func__, (long long) labels->ne[1], n_tokens);
+            ggml_opt_cancel(opt_ctx);
+            ggml_opt_set_graph_cache(opt_ctx, false);
+            opt_cached_compute_ctx.reset();
+            res->reset();
+            break;
+        }
+        ggml_set_zero(labels);
+        std::vector<size_t> sparse_offsets;
+        std::vector<float> sparse_values;
+        int32_t n_active_labels = 0;
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            const float weight = label_weights[i];
+            if (labels_sparse[i] >= 0 && weight != 0.0f) {
+                if (labels_sparse[i] >= labels->ne[0]) {
+                    ggml_opt_cancel(opt_ctx);
+                    ggml_opt_set_graph_cache(opt_ctx, false);
+                    opt_cached_compute_ctx.reset();
+                    res->reset();
+                    llama_batch_free(batch);
+                    memory->clear(true);
+                    return false;
+                }
+                sparse_offsets.push_back(
+                        (i*labels->ne[0] + labels_sparse[i])*sizeof(float));
+                sparse_values.push_back(weight);
+                ++n_active_labels;
+            }
+        }
+        if (!llama_backend_set_sparse_f32(
+                sched.get(), labels, sparse_offsets, sparse_values)) {
+            for (size_t i = 0; i < sparse_offsets.size(); ++i) {
+                ggml_backend_tensor_set(
+                        labels, &sparse_values[i], sparse_offsets[i], sizeof(float));
+            }
+        }
+        ggml_opt_set_loss_active_rows(opt_ctx, n_active_labels);
+        ggml_opt_eval(opt_ctx, result);
+        if (callback) {
+            callback(true, opt_ctx, dataset, result, 1, 1, ggml_time_us());
+        }
+        ok = true;
+    } while (false);
+
+    memory->clear(true);
+    llama_batch_free(batch);
+    return ok;
+}
+
 void llama_context::opt_epoch(
         ggml_opt_dataset_t        dataset,
         ggml_opt_result_t         result_train,
@@ -3840,6 +4020,14 @@ void llama_context::opt_epoch(
         ggml_opt_epoch_callback   callback_train,
         ggml_opt_epoch_callback   callback_eval,
         const float             * label_weights) {
+    // The row-oriented path has position-dependent ubatch graphs. It must not
+    // inherit the fixed-width packed graph retained by a preceding GRPO step
+    // (mixed callers and fallback geometries are both supported).
+    if (opt_cached_compute_ctx) {
+        ggml_opt_set_graph_cache(opt_ctx, false);
+        opt_cached_compute_ctx.reset();
+        opt_graph_cache->reset();
+    }
     const uint32_t n_ctx    = this->n_ctx();
     const uint32_t n_batch  = std::min(cparams.n_batch,  n_ctx);
     const uint32_t n_ubatch = std::min(cparams.n_ubatch, n_batch);
@@ -4679,6 +4867,24 @@ void llama_opt_epoch_weighted(
         callback_train,
         callback_eval,
         label_weights);
+}
+
+bool llama_opt_step_packed_sequences(
+        struct llama_context    * ctx,
+        ggml_opt_dataset_t        dataset,
+        ggml_opt_result_t         result,
+        const llama_token       * tokens,
+        const llama_token       * labels,
+        const float             * label_weights,
+        const llama_pos         * positions,
+        const size_t            * seq_offsets,
+        const llama_seq_id      * seq_ids,
+        uint32_t                  n_tokens,
+        size_t                    n_seq_ids,
+        uint32_t                  n_sequences,
+        ggml_opt_epoch_callback   callback) {
+    return ctx->opt_step_packed_sequences(dataset, result, tokens, labels, label_weights,
+            positions, seq_offsets, seq_ids, n_tokens, n_seq_ids, n_sequences, callback);
 }
 
 //

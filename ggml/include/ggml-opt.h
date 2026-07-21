@@ -251,6 +251,13 @@ extern "C" {
     // without evaluating it.
     GGML_API struct ggml_cgraph * ggml_opt_graph(ggml_opt_context_t opt_ctx);
 
+    // retro delta: retain a graph built through the dynamic API and reuse it
+    // on later evaluations. The caller must keep ctx_compute and the forward
+    // graph alive. Invalidating only the allocation is sufficient when another
+    // graph used the shared backend scheduler between evaluations.
+    GGML_API void ggml_opt_set_graph_cache(ggml_opt_context_t opt_ctx, bool enabled);
+    GGML_API void ggml_opt_invalidate_graph_allocation(ggml_opt_context_t opt_ctx);
+
     // retro delta: abandon a graph prepared with ggml_opt_alloc without
     // evaluating it, so the next ggml_opt_alloc starts from a clean state.
     // With dynamic graphs the caller frees the compute context afterwards.

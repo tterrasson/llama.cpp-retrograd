@@ -65,6 +65,7 @@ struct ggml_opt_context {
     struct ggml_cgraph * gb_grad = nullptr;
     struct ggml_cgraph * gb_opt  = nullptr;
     bool static_graphs           = false;
+    bool cache_dynamic_graph     = false;
     bool eval_ready              = false;
     std::vector<struct ggml_tensor *> grad_accs;
     std::vector<struct ggml_tensor *> grad_m;
@@ -1011,7 +1012,7 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
         opt_ctx->build_type = GGML_OPT_BUILD_TYPE_FORWARD;
     }
 
-    if (!opt_ctx->static_graphs) {
+    if (!opt_ctx->static_graphs && !opt_ctx->cache_dynamic_graph) {
         ggml_opt_build(opt_ctx);
     }
 
@@ -1060,8 +1061,31 @@ struct ggml_cgraph * ggml_opt_graph(ggml_opt_context_t opt_ctx) {
     return opt_ctx->allocated_graph_copy;
 }
 
+void ggml_opt_set_graph_cache(ggml_opt_context_t opt_ctx, bool enabled) {
+    GGML_ASSERT(!opt_ctx->static_graphs);
+    GGML_ASSERT(!enabled || opt_ctx->eval_ready);
+    if (opt_ctx->cache_dynamic_graph == enabled) {
+        return;
+    }
+    opt_ctx->cache_dynamic_graph = enabled;
+    if (!enabled) {
+        opt_ctx->gf                   = nullptr;
+        opt_ctx->gb_grad              = nullptr;
+        opt_ctx->gb_opt               = nullptr;
+        opt_ctx->allocated_graph      = nullptr;
+        opt_ctx->allocated_graph_copy = nullptr;
+        opt_ctx->ctx_compute          = nullptr;
+    }
+}
+
+void ggml_opt_invalidate_graph_allocation(ggml_opt_context_t opt_ctx) {
+    GGML_ASSERT(!opt_ctx->eval_ready);
+    opt_ctx->allocated_graph      = nullptr;
+    opt_ctx->allocated_graph_copy = nullptr;
+}
+
 void ggml_opt_cancel(ggml_opt_context_t opt_ctx) {
-    if (!opt_ctx->static_graphs) {
+    if (!opt_ctx->static_graphs && !opt_ctx->cache_dynamic_graph) {
         opt_ctx->gf                   = nullptr;
         opt_ctx->gb_grad              = nullptr;
         opt_ctx->gb_opt               = nullptr;
@@ -1125,7 +1149,7 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     opt_ctx->iter += opt_ctx->allocated_graph == opt_ctx->gb_opt;
     opt_ctx->opt_i = (opt_ctx->opt_i + 1) % opt_ctx->opt_period;
 
-    if (!opt_ctx->static_graphs) {
+    if (!opt_ctx->static_graphs && !opt_ctx->cache_dynamic_graph) {
         opt_ctx->gf                   = nullptr;
         opt_ctx->gb_grad              = nullptr;
         opt_ctx->gb_opt               = nullptr;
