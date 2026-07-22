@@ -3822,6 +3822,12 @@ void llama_context::opt_epoch_iter(
     // so every optimizer step still closes within the call.
     const uint32_t pos_end = n_evals == 0 ? n_ctx : std::min(n_ctx, n_evals * n_ubatch);
 
+    // retro delta: the optimizer reuses the decode scheduler but never runs the
+    // decode path that installs cparams.cb_eval, so a configured per-node eval
+    // callback (e.g. a NaN scanner) would never see the training graph. Install
+    // it here; a null callback is a no-op.
+    ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
     memory->clear(true);
 
     for (uint32_t pos_ctx = 0; pos_ctx < pos_end; pos_ctx += n_batch) {
@@ -3910,11 +3916,19 @@ void llama_context::opt_epoch_iter(
             {
                 struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
                 GGML_ASSERT(labels->ne[1] == n_ubatch);
-                const bool new_label_storage = opt_label_storage == nullptr || labels->data != opt_label_storage;
-                if (new_label_storage) {
-                    ggml_set_zero(labels);
-                    opt_label_storage = labels->data;
-                }
+                // retro delta: the incremental-clear optimization below only reset
+                // the previously-active one-hot offsets, assuming the backend
+                // buffer stays zeroed between reused allocations. That holds when
+                // the allocator hands back host memory that was never touched, but
+                // not on CUDA: the non-static opt graph reuses the labels buffer
+                // region for other tensors, so the non-active positions come back
+                // as uninitialized device memory (values near +/-FLT_MAX, NaN).
+                // The dense cross-entropy then reads those garbage labels and the
+                // loss is NaN. Always fully zero the dense labels; a cudaMemset of
+                // the [n_vocab, n_ubatch] tensor is cheap next to the vocab matmul.
+                const bool new_label_storage = true;
+                ggml_set_zero(labels);
+                opt_label_storage = labels->data;
 
                 std::vector<size_t> sparse_offsets;
                 std::vector<float> sparse_values;

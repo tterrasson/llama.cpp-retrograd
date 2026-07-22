@@ -1,4 +1,5 @@
 #include "out-prod.cuh"
+#include "convert.cuh"
 
 #include <cstdint>
 
@@ -30,7 +31,14 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    // retro delta: OUT_PROD with a quantized src0 is the weight-gradient of a
+    // quantized (frozen base) projection during LoRA training. Upstream CUDA
+    // only handles F32 x F32; the CPU/Vulkan forks dequantize src0 and accumulate
+    // in F32. Here we dequantize src0 to a contiguous F32 scratch with ggml-cuda's
+    // existing per-type kernels (bit-identical to the CPU oracle's dequant) and
+    // then reuse the proven cuBLAS path, so every quant type with a to_fp32
+    // kernel is covered with F32 accumulation.
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || ggml_is_quantized(src0->type));
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
@@ -44,17 +52,41 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(ne2 == src1->ne[2]);
     GGML_ASSERT(ne3 == src1->ne[3]);
 
-    const float * src0_d = (const float *) src0->data;
     const float * src1_d = (const float *) src1->data;
     float       *  dst_d = (float       *)  dst->data;
 
     cudaStream_t   stream = ctx.stream();
     cublasHandle_t handle = ctx.cublas_handle();
 
+    // src0 element strides (in floats). For a quantized src0 we dequantize into a
+    // fully contiguous F32 scratch, so the strides are the packed row layout.
+    int64_t lda, s02, s03;
+    const float * src0_d;
+    ggml_cuda_pool_alloc<float> src0_f32(ctx.pool());
+    if (ggml_is_quantized(src0->type)) {
+        // The dequant kernels consume a contiguous quantized block, matching the
+        // packed weight layout (nb00 == type size, rows tightly packed).
+        GGML_ASSERT(nb00 == ggml_type_size(src0->type));
+        GGML_ASSERT(ggml_is_contiguous(src0));
+        const int64_t n_src0 = ggml_nelements(src0);
+        src0_f32.alloc(n_src0);
+        to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(src0->type);
+        GGML_ASSERT(to_fp32 != nullptr);
+        to_fp32(src0->data, src0_f32.get(), n_src0, stream);
+        src0_d = src0_f32.get();
+        lda = ne00;
+        s02 = ne00*ne01;
+        s03 = ne00*ne01*ne02;
+    } else {
+        src0_d = (const float *) src0->data;
+        lda = nb01 / sizeof(float);
+        s02 = nb02 / sizeof(float);
+        s03 = nb03 / sizeof(float);
+    }
+
     const float alpha = 1.0f;
     const float beta = 0.0f;
 
-    const int64_t lda = nb01 / sizeof(float);
     const int64_t ldc = nb1  / sizeof(float);
 
     const bool src1_T = ggml_is_transposed(src1);
@@ -62,9 +94,8 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t           ldb            = (src1_T ?        nb10 :        nb11) /  sizeof(float);
     GGML_ASSERT(                             (src1_T ?        nb11 :        nb10) == sizeof(float));
 
-    // data strides in dimensions 2/3
-    const size_t s02 = nb02 / sizeof(float);
-    const size_t s03 = nb03 / sizeof(float);
+    // data strides in dimensions 2/3 (s02/s03 for src0 were resolved above so the
+    // dequantized-scratch layout is used when src0 is quantized)
     const size_t s12 = nb12 / sizeof(float);
     const size_t s13 = nb13 / sizeof(float);
     const size_t s2  = nb2  / sizeof(float);

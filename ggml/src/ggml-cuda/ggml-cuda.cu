@@ -25,6 +25,7 @@
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
+#include "ggml-cuda/flash-attn-back.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -49,6 +50,7 @@
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
 #include "ggml-cuda/ssm-scan.cuh"
+#include "ggml-cuda/ssm-back.cuh"
 #include "ggml-cuda/sum.cuh"
 #include "ggml-cuda/sumrows.cuh"
 #include "ggml-cuda/top-k.cuh"
@@ -2366,6 +2368,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_FLASH_ATTN_EXT:
             ggml_cuda_flash_attn_ext(ctx, dst);
+            break;
+        case GGML_OP_FLASH_ATTN_BACK:
+            ggml_cuda_flash_attn_back(ctx, dst);
+            break;
+        case GGML_OP_SSM_CONV_BACK:
+            ggml_cuda_ssm_conv_back(ctx, dst);
+            break;
+        case GGML_OP_SSM_SCAN_BACK:
+            ggml_cuda_ssm_scan_back(ctx, dst);
             break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
             ggml_cuda_cross_entropy_loss(ctx, dst);
@@ -5178,7 +5189,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
             } break;
         case GGML_OP_OUT_PROD:
-            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
+            // retro delta: quantized src0 is dequantized to F32 in ggml_cuda_out_prod
+            // (contiguous packed layout required), so any quant type with a to_fp32
+            // kernel is accepted in addition to F32.
+            return op->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   (op->src[0]->type == GGML_TYPE_F32 ||
+                    (ggml_is_quantized(op->src[0]->type) && ggml_is_contiguous(op->src[0]) &&
+                     op->src[0]->nb[0] == ggml_type_size(op->src[0]->type)));
         case GGML_OP_GET_ROWS:
             {
                 switch (op->src[0]->type) {
@@ -5501,6 +5518,61 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 op->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
+        case GGML_OP_FLASH_ATTN_BACK: {
+            // retro delta: reference FA backward (flash-attn-back.cu). q/dO/dst F32,
+            // K/V F16 or F32 (same type), optional F16 mask, no sinks, head dims <= 128.
+            const ggml_tensor * q = op->src[0];
+            const ggml_tensor * k = op->src[1];
+            const ggml_tensor * v = op->src[2];
+            const ggml_tensor * mask = op->src[3];
+            const ggml_tensor * d = op->src[5];
+            const ggml_tensor * sinks = op->src[6];
+            if (sinks) {
+                return false;
+            }
+            if (q->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
+                    !d || d->type != GGML_TYPE_F32) {
+                return false;
+            }
+            if (k->type != v->type ||
+                    (k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_F32)) {
+                return false;
+            }
+            if (mask && mask->type != GGML_TYPE_F16) {
+                return false;
+            }
+            if (q->ne[0] > 128 || v->ne[0] > 128) {
+                return false;
+            }
+            return q->ne[2] % k->ne[2] == 0;
+        }
+        case GGML_OP_SSM_CONV_BACK:
+            // retro delta: reference kernel (ssm-back.cu), contiguous F32 inputs.
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) &&
+                   op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[1]) &&
+                   op->src[2]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[2]);
+        case GGML_OP_SSM_SCAN_BACK: {
+            // retro delta: reference kernel (ssm-back.cu). F32 contiguous inputs,
+            // I32 slot ids.
+            if (op->type != GGML_TYPE_F32) {
+                return false;
+            }
+            for (int i = 0; i < 8; ++i) {
+                const ggml_tensor * si = op->src[i];
+                if (!si) {
+                    return false;
+                }
+                if (i == 6) {
+                    if (si->type != GGML_TYPE_I32) {
+                        return false;
+                    }
+                } else if (si->type != GGML_TYPE_F32 || !ggml_is_contiguous(si)) {
+                    return false;
+                }
+            }
+            return op->src[1]->ne[1] % op->src[4]->ne[1] == 0; // nh % ng == 0
+        }
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_SGD:
@@ -5511,10 +5583,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SOLVE_TRI:
             return true;
         case GGML_OP_OPT_STEP_ADAMW:
-            // CUDA's optimizer kernel currently treats every buffer as F32.
-            // Keep F16 parameters on a supported backend instead of silently
-            // reinterpreting their storage.
-            return op->src[0]->type == GGML_TYPE_F32;
+            // retro delta: F32 parameters, or F16 parameters with F32 moments and
+            // the fork's stochastic-rounding store (opt-step-adamw.cu). Gradient
+            // and moments remain F32 in both cases.
+            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+                   op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_F32 &&
+                   op->src[3]->type == GGML_TYPE_F32;
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
 
