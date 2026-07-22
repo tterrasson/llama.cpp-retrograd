@@ -1,0 +1,152 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_atomic_float : require
+
+// retro delta: forward of the fused sparse cross-entropy over a (possibly
+// quantized) projection head. One workgroup per token. The workgroup partitions
+// the vocabulary across its invocations, each accumulating a partial online
+// log-sum-exp in F32; a tree reduction merges them into the token's logsumexp.
+// The [n_vocab, n_tokens] logits are never materialized: each logit
+// z[v,t] = dot(w[:,v], h[:,t]) is recomputed on the fly. The per-token
+// contribution weight_t*(logsumexp_t - z[target_t]) is normalized by the active
+// token count and atomically summed into the scalar loss. All reductions are in
+// F32 so a low-precision head never biases the gradient.
+//
+// The head is dequantized through the backend's generic per-type helpers
+// (dequant_funcs.glsl), so a single shader source covers every quant type: the
+// generator (vulkan-shaders-gen.cpp) compiles one variant per DATA_A_* type,
+// exactly like get_rows_quant / mul_mat_vec. See docs/memory/GPUVOCAB.md and the
+// CPU oracle ggml_compute_forward_fused_sparse_ce_f32.
+
+// types.glsl defines A_TYPE / QUANT_K / QUANT_R for the head's DATA_A_* type;
+// dequant_funcs.glsl then provides dequantize()/get_dm() reading data_a. It also
+// needs FLOAT_TYPE and the data_a buffers declared first, so the order is:
+// types.glsl -> FLOAT_TYPE + buffer decls -> dequant_funcs.glsl.
+#include "types.glsl"
+
+#define FLOAT_TYPE float
+#define WG 256
+
+layout(local_size_x = WG, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint n_embd;
+    uint n_tokens;
+    uint n_vocab;
+    uint h_stride;
+    uint d_stride;
+} p;
+
+layout(binding = 0) readonly buffer H   {float data_h[];};
+// The head lives at binding 1. dequant_funcs.glsl reads it through data_a and its
+// packed aliases; all three views point at the same binding (as in
+// mul_mat_vec_iface.glsl).
+layout(binding = 1) readonly buffer A   {A_TYPE data_a[];};
+#if defined(A_TYPE_PACKED16)
+layout(binding = 1) readonly buffer A16 {A_TYPE_PACKED16 data_a_packed16[];};
+#endif
+#if defined(A_TYPE_PACKED32)
+layout(binding = 1) readonly buffer A32 {A_TYPE_PACKED32 data_a_packed32[];};
+#endif
+layout(binding = 2) readonly buffer Tgt {int   data_tgt[];};
+layout(binding = 3) readonly buffer Wgt {float data_wgt[];};
+layout(binding = 4) readonly buffer Cnt {uint  data_count[];};
+layout(binding = 5) coherent buffer Dst {float data_dst[];};
+
+#include "dequant_funcs.glsl"
+
+// z[v,t] = dot(w[:,v], h[:,t]) in F32. w is dequantized on the fly with the
+// generic helpers, using the same logical (ib, iqs, y_offset) mapping as
+// get_rows_quant.comp so the pairing with h is correct for every quant type
+// (the dot product is order independent, so we only need each dequantized value
+// multiplied by h at its own logical position).
+float w_dot_h(uint v, uint h_off) {
+    const uint nb       = p.n_embd / QUANT_K;         // blocks per column
+    const uint a_off    = v * nb;                     // first block of column v
+    const uint y_offset = (QUANT_R == 1) ? 1 : QUANT_K / 2;
+    float z = 0.0f;
+    for (uint i = 0; i < p.n_embd; i += 2) {
+        const uint ib   = a_off + i / QUANT_K;
+        const uint iqs  = (i % QUANT_K) / QUANT_R;
+        const uint iybs = i - i % QUANT_K;
+        vec2 dq = dequantize(ib, iqs, 0);
+#if !defined(DATA_A_F32) && !defined(DATA_A_F16)
+        const vec2 dm = get_dm(ib, 0);
+        dq = dq * dm.x + dm.y;
+#endif
+        z += dq.x * data_h[h_off + iybs + iqs];
+        z += dq.y * data_h[h_off + iybs + iqs + y_offset];
+    }
+    return z;
+}
+
+shared float sh_max[WG];
+shared float sh_sum[WG];
+shared float sh_ztgt;
+
+void main() {
+    const uint t = gl_WorkGroupID.x;
+    if (t >= p.n_tokens) {
+        return;
+    }
+    const uint lid = gl_LocalInvocationID.x;
+
+    const int   tgt = data_tgt[t];
+    const float wgt = data_wgt[t];
+    const bool  is_active = tgt >= 0 && uint(tgt) < p.n_vocab && wgt != 0.0f;
+    if (!is_active) {
+        return;
+    }
+
+    const uint h_off = t * p.h_stride;
+
+    if (lid == 0) {
+        sh_ztgt = 0.0f;
+    }
+    barrier();
+
+    float lmax = -3.4e38f; // effectively -inf; the first real logit overrides it
+    float lsum = 0.0f;
+    for (uint v = lid; v < p.n_vocab; v += WG) {
+        const float z = w_dot_h(v, h_off);
+        if (z > lmax) {
+            lsum = lsum * exp(lmax - z) + 1.0f;
+            lmax = z;
+        } else {
+            lsum += exp(z - lmax);
+        }
+        if (v == uint(tgt)) {
+            sh_ztgt = z;
+        }
+    }
+
+    sh_max[lid] = lmax;
+    sh_sum[lid] = lsum;
+    barrier();
+
+    // Tree reduction of the partial (max, sum-exp) pairs, merged in F32.
+    [[unroll]] for (uint s = WG / 2u; s > 0u; s >>= 1) {
+        if (lid < s) {
+            const float m1 = sh_max[lid];
+            const float s1 = sh_sum[lid];
+            const float m2 = sh_max[lid + s];
+            const float s2 = sh_sum[lid + s];
+            const float m = max(m1, m2);
+            const float sum = s1 * exp(m1 - m) + s2 * exp(m2 - m);
+            sh_max[lid] = m;
+            sh_sum[lid] = sum;
+        }
+        barrier();
+    }
+
+    if (lid == 0) {
+        const float lse = sh_max[0] + log(sh_sum[0]);
+        const uint n_active = data_count[0];
+        if (n_active > 0u) {
+            const float contrib = wgt * (lse - sh_ztgt) / float(n_active);
+            atomicAdd(data_dst[0], contrib);
+        }
+    }
+}

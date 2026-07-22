@@ -604,6 +604,13 @@ extern "C" {
         GGML_OP_SSM_CONV_BACK,
         GGML_OP_SSM_SCAN_BACK,
 
+        // retro delta: fused sparse cross-entropy over a projection head. Computes
+        // the weighted cross-entropy loss (and its gradient wrt the hidden states)
+        // by streaming the vocabulary in tiles, so the full [n_vocab, n_tokens]
+        // logits are never materialized. See docs/memory/03-vocab-logits-chunked-ce.md.
+        GGML_OP_FUSED_SPARSE_CE,
+        GGML_OP_FUSED_SPARSE_CE_BACK,
+
         GGML_OP_COUNT,
     };
 
@@ -2851,6 +2858,37 @@ extern "C" {
             struct ggml_tensor  * a,  // logits
             struct ggml_tensor  * b,  // labels
             struct ggml_tensor  * c); // gradients of cross_entropy_loss result
+
+    // retro delta: fused sparse cross-entropy over a projection head.
+    // Equivalent to cross_entropy_loss(mul_mat(w, h), labels) where labels is the
+    // sparse weighted one-hot [weights[t] at targets[t]], but streams the vocab in
+    // `n_tiles` tiles so the full [n_vocab, n_tokens] logits are never
+    // materialized. The projection head `w` is treated as frozen (no gradient).
+    //   h       : [n_embd, n_tokens]  F32 hidden states
+    //   w       : [n_embd, n_vocab]   projection head (any type, incl. quantized)
+    //   targets : [n_tokens]          I32 target vocab id, < 0 marks a masked token
+    //   weights : [n_tokens]          F32 per-token coefficient (may be negative)
+    // Result is the scalar loss, already averaged over the active tokens.
+    GGML_API struct ggml_tensor * ggml_fused_sparse_ce(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * h,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * targets,
+            struct ggml_tensor  * weights,
+            int                   n_tiles);
+
+    // Gradient of ggml_fused_sparse_ce wrt the hidden states `h`.
+    //   a       : scalar gradient of the loss result
+    //   h, w, targets, weights : the forward inputs
+    // Result has the shape of `h`.
+    GGML_API struct ggml_tensor * ggml_fused_sparse_ce_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * h,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * targets,
+            struct ggml_tensor  * weights,
+            int                   n_tiles);
 
     // AdamW optimizer step
     // Paper: https://arxiv.org/pdf/1711.05101v3.pdf

@@ -507,6 +507,22 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             opt_ctx->loss_per_datapoint = true;
             break;
         }
+        case GGML_OPT_LOSS_TYPE_EXTERNAL: {
+            // retro delta (plan 03): `outputs` is already the scalar loss (the
+            // fused sparse cross-entropy averages over the active tokens itself).
+            // Use it verbatim; autodiff still flows through it into the graph.
+            GGML_ASSERT(ggml_is_scalar(opt_ctx->outputs) &&
+                    "external loss must be a scalar output node");
+            opt_ctx->labels = nullptr;
+            opt_ctx->loss = opt_ctx->outputs;
+            ggml_set_name(opt_ctx->loss, "loss_external");
+            if (opt_ctx->opt_period > 1) {
+                opt_ctx->loss = ggml_scale(ctx_results, opt_ctx->loss, 1.0f / opt_ctx->opt_period);
+                ggml_set_name(opt_ctx->loss, "loss_external_scaled");
+            }
+            opt_ctx->loss_per_datapoint = true;
+            break;
+        }
         case GGML_OPT_LOSS_TYPE_MEAN_SQUARED_ERROR: {
             opt_ctx->labels = ggml_dup_tensor(ctx_results, opt_ctx->outputs);
             ggml_set_input(opt_ctx->labels);

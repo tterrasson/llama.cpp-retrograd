@@ -3498,7 +3498,16 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
         sched_reserve();
     }
 
-    ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
+    // retro delta (plan 03): the fused sparse cross-entropy supplies its own
+    // scalar loss node, so the optimizer uses GGML_OPT_LOSS_TYPE_EXTERNAL and
+    // never builds the dense [n_vocab, n_tokens] labels tensor.
+    opt_fused_ce = lopt_params.fused_sparse_ce;
+    opt_ce_tiles = lopt_params.n_ce_tiles > 0 ? lopt_params.n_ce_tiles : 1;
+    const enum ggml_opt_loss_type loss_type = opt_fused_ce
+            ? GGML_OPT_LOSS_TYPE_EXTERNAL
+            : GGML_OPT_LOSS_TYPE_CROSS_ENTROPY;
+
+    ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), loss_type);
     opt_params.opt_period      = n_batch / n_ubatch;
     opt_params.get_opt_pars    = lopt_params.get_opt_pars;
     opt_params.get_opt_pars_ud = lopt_params.get_opt_pars_ud;
@@ -3631,9 +3640,11 @@ int32_t llama_context::opt_preflight(llama_opt_preflight_cb callback, void * use
         }
 
         struct ggml_context * ctx_compute_opt;
+        const size_t size_gf = ggml_graph_size(gf);
         {
-            const size_t size_gf = ggml_graph_size(gf);
-            const size_t size_meta = 4*size_gf*ggml_tensor_overhead() + 2*ggml_graph_overhead_custom(size_gf, /*grads = */ true);
+            // The fused path adds one extra forward graph rooted at the loss.
+            const size_t n_graphs = opt_fused_ce ? 3 : 2;
+            const size_t size_meta = 4*size_gf*ggml_tensor_overhead() + n_graphs*ggml_graph_overhead_custom(size_gf, /*grads = */ true);
             struct ggml_init_params params = {
                 /*.mem_size   =*/ size_meta,
                 /*.mem_buffer =*/ nullptr,
@@ -3641,7 +3652,31 @@ int32_t llama_context::opt_preflight(llama_opt_preflight_cb callback, void * use
             };
             ctx_compute_opt = ggml_init(params);
         }
-        ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
+        if (opt_fused_ce) {
+            // retro delta (plan 03): validate the same fused-loss graph training
+            // uses. GGML_OPT_LOSS_TYPE_EXTERNAL requires a scalar `outputs`, so the
+            // full-vocab logits cannot be handed to the optimizer here.
+            struct ggml_tensor * t_logits = res->get_logits();
+            if (!t_logits || t_logits->op != GGML_OP_MUL_MAT ||
+                    !t_logits->src[0] || !t_logits->src[1]) {
+                LLAMA_LOG_ERROR("%s: fused CE needs a plain mul_mat output head\n", __func__);
+                ggml_free(ctx_compute_opt);
+                break;
+            }
+            struct ggml_tensor * ce_targets = ggml_new_tensor_1d(ctx_compute_opt, GGML_TYPE_I32, n_outputs);
+            struct ggml_tensor * ce_weights = ggml_new_tensor_1d(ctx_compute_opt, GGML_TYPE_F32, n_outputs);
+            ggml_set_input(ce_targets);
+            ggml_set_input(ce_weights);
+            struct ggml_tensor * fused_loss = ggml_fused_sparse_ce(
+                    ctx_compute_opt, t_logits->src[1], t_logits->src[0],
+                    ce_targets, ce_weights, opt_ce_tiles);
+            ggml_set_output(fused_loss);
+            struct ggml_cgraph * gf_fused = ggml_new_graph_custom(ctx_compute_opt, size_gf, /*grads =*/ true);
+            ggml_build_forward_expand(gf_fused, fused_loss);
+            ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf_fused, res->get_inp_tokens(), fused_loss);
+        } else {
+            ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
+        }
         ggml_opt_alloc(opt_ctx, /*backward =*/ true);
 
         // ggml_opt_build appended the loss chain to gf, so every node in gf
@@ -3941,6 +3976,11 @@ bool llama_context::opt_step_packed_sequences(
         // preflight/generation allocation leaves stale Vulkan buffers and can
         // bind an op to an input of the wrong type. Rebuild until dynamic graph
         // scheduling gains an immutable clone with input/output remapping.
+        // retro delta (plan 03): fused sparse cross-entropy input tensors, filled
+        // after allocation below. Left null on the standard (dense-labels) path.
+        struct ggml_tensor * ce_targets = nullptr;
+        struct ggml_tensor * ce_weights = nullptr;
+
         const bool reuse_graph = false;
         if (!reuse_graph) {
             if (opt_cached_compute_ctx) {
@@ -3958,16 +3998,56 @@ bool llama_context::opt_step_packed_sequences(
             }
             const auto allocation_started = std::chrono::steady_clock::now();
             const size_t size_gf = ggml_graph_size(gf);
+            // The fused path adds one extra forward graph rooted at the loss.
+            const size_t n_graphs = opt_fused_ce ? 3 : 2;
             const size_t size_meta = 4*size_gf*ggml_tensor_overhead()
-                    + 2*ggml_graph_overhead_custom(size_gf, /*grads = */ true);
+                    + n_graphs*ggml_graph_overhead_custom(size_gf, /*grads = */ true);
             struct ggml_init_params params = {
                 /*.mem_size   =*/ size_meta,
                 /*.mem_buffer =*/ nullptr,
                 /*.no_alloc   =*/ true,
             };
             opt_cached_compute_ctx.reset(ggml_init(params));
-            ggml_opt_prepare_alloc(opt_ctx, opt_cached_compute_ctx.get(), gf,
-                    res->get_inp_tokens(), res->get_logits());
+            if (opt_fused_ce) {
+                // Fuse the output projection with the cross-entropy: read the
+                // frozen head and the hidden states straight off the mul_mat that
+                // would otherwise produce the full [n_vocab, n_tokens] logits, then
+                // root a fresh forward graph at the fused scalar loss. Those logits
+                // are not an ancestor of the loss, so they are never allocated.
+                struct ggml_tensor * t_logits = res->get_logits();
+                if (!t_logits || t_logits->op != GGML_OP_MUL_MAT ||
+                        !t_logits->src[0] || !t_logits->src[1]) {
+                    LLAMA_LOG_ERROR("%s: fused CE needs a plain mul_mat output head\n", __func__);
+                    break;
+                }
+                struct ggml_tensor * proj_w = t_logits->src[0]; // [n_embd, n_vocab]
+                struct ggml_tensor * hidden = t_logits->src[1]; // [n_embd, n_tokens]
+                if (hidden->ne[1] != (int64_t) n_tokens) {
+                    LLAMA_LOG_ERROR("%s: fused CE hidden width %lld != %u\n",
+                            __func__, (long long) hidden->ne[1], n_tokens);
+                    break;
+                }
+                ce_targets = ggml_new_tensor_1d(opt_cached_compute_ctx.get(),
+                        GGML_TYPE_I32, n_tokens);
+                ce_weights = ggml_new_tensor_1d(opt_cached_compute_ctx.get(),
+                        GGML_TYPE_F32, n_tokens);
+                ggml_set_input(ce_targets);
+                ggml_set_input(ce_weights);
+                ggml_set_name(ce_targets, "ce_targets");
+                ggml_set_name(ce_weights, "ce_weights");
+                struct ggml_tensor * fused_loss = ggml_fused_sparse_ce(
+                        opt_cached_compute_ctx.get(), hidden, proj_w,
+                        ce_targets, ce_weights, opt_ce_tiles);
+                ggml_set_output(fused_loss);
+                struct ggml_cgraph * gf_fused = ggml_new_graph_custom(
+                        opt_cached_compute_ctx.get(), size_gf, /*grads =*/ true);
+                ggml_build_forward_expand(gf_fused, fused_loss);
+                ggml_opt_prepare_alloc(opt_ctx, opt_cached_compute_ctx.get(), gf_fused,
+                        res->get_inp_tokens(), fused_loss);
+            } else {
+                ggml_opt_prepare_alloc(opt_ctx, opt_cached_compute_ctx.get(), gf,
+                        res->get_inp_tokens(), res->get_logits());
+            }
             ggml_opt_alloc(opt_ctx, /*backward =*/ true);
             ggml_opt_set_graph_cache(opt_ctx, true);
             opt_timing.allocation_seconds += std::chrono::duration<double>(
@@ -3984,46 +4064,68 @@ bool llama_context::opt_step_packed_sequences(
         }
         res->set_inputs(&ubatch);
 
-        struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
-        if (labels->ne[1] != n_tokens) {
-            LLAMA_LOG_ERROR("%s: optimizer label width %lld != %u\n",
-                    __func__, (long long) labels->ne[1], n_tokens);
-            ggml_opt_cancel(opt_ctx);
-            ggml_opt_set_graph_cache(opt_ctx, false);
-            opt_cached_compute_ctx.reset();
-            res->reset();
-            break;
-        }
-        ggml_set_zero(labels);
-        std::vector<size_t> sparse_offsets;
-        std::vector<float> sparse_values;
-        int32_t n_active_labels = 0;
-        for (uint32_t i = 0; i < n_tokens; ++i) {
-            const float weight = label_weights[i];
-            if (labels_sparse[i] >= 0 && weight != 0.0f) {
-                if (labels_sparse[i] >= labels->ne[0]) {
-                    ggml_opt_cancel(opt_ctx);
-                    ggml_opt_set_graph_cache(opt_ctx, false);
-                    opt_cached_compute_ctx.reset();
-                    res->reset();
-                    llama_batch_free(batch);
-                    memory->clear(true);
-                    return false;
+        if (opt_fused_ce) {
+            // Fused path: hand the sparse targets/weights straight to the operator
+            // (target < 0 or weight 0 marks a masked token). No dense labels, no
+            // active-row override — the operator normalizes over active tokens.
+            if (!ce_targets || !ce_weights) {
+                LLAMA_LOG_ERROR("%s: fused CE inputs were not allocated\n", __func__);
+                ggml_opt_cancel(opt_ctx);
+                ggml_opt_set_graph_cache(opt_ctx, false);
+                opt_cached_compute_ctx.reset();
+                res->reset();
+                break;
+            }
+            std::vector<int32_t> targets_i32(n_tokens);
+            std::vector<float>   weights_f32(n_tokens);
+            for (uint32_t i = 0; i < n_tokens; ++i) {
+                targets_i32[i] = (int32_t) labels_sparse[i];
+                weights_f32[i] = label_weights[i];
+            }
+            ggml_backend_tensor_set(ce_targets, targets_i32.data(), 0, ggml_nbytes(ce_targets));
+            ggml_backend_tensor_set(ce_weights, weights_f32.data(), 0, ggml_nbytes(ce_weights));
+        } else {
+            struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
+            if (labels->ne[1] != n_tokens) {
+                LLAMA_LOG_ERROR("%s: optimizer label width %lld != %u\n",
+                        __func__, (long long) labels->ne[1], n_tokens);
+                ggml_opt_cancel(opt_ctx);
+                ggml_opt_set_graph_cache(opt_ctx, false);
+                opt_cached_compute_ctx.reset();
+                res->reset();
+                break;
+            }
+            ggml_set_zero(labels);
+            std::vector<size_t> sparse_offsets;
+            std::vector<float> sparse_values;
+            int32_t n_active_labels = 0;
+            for (uint32_t i = 0; i < n_tokens; ++i) {
+                const float weight = label_weights[i];
+                if (labels_sparse[i] >= 0 && weight != 0.0f) {
+                    if (labels_sparse[i] >= labels->ne[0]) {
+                        ggml_opt_cancel(opt_ctx);
+                        ggml_opt_set_graph_cache(opt_ctx, false);
+                        opt_cached_compute_ctx.reset();
+                        res->reset();
+                        llama_batch_free(batch);
+                        memory->clear(true);
+                        return false;
+                    }
+                    sparse_offsets.push_back(
+                            (i*labels->ne[0] + labels_sparse[i])*sizeof(float));
+                    sparse_values.push_back(weight);
+                    ++n_active_labels;
                 }
-                sparse_offsets.push_back(
-                        (i*labels->ne[0] + labels_sparse[i])*sizeof(float));
-                sparse_values.push_back(weight);
-                ++n_active_labels;
             }
-        }
-        if (!llama_backend_set_sparse_f32(
-                sched.get(), labels, sparse_offsets, sparse_values)) {
-            for (size_t i = 0; i < sparse_offsets.size(); ++i) {
-                ggml_backend_tensor_set(
-                        labels, &sparse_values[i], sparse_offsets[i], sizeof(float));
+            if (!llama_backend_set_sparse_f32(
+                    sched.get(), labels, sparse_offsets, sparse_values)) {
+                for (size_t i = 0; i < sparse_offsets.size(); ++i) {
+                    ggml_backend_tensor_set(
+                            labels, &sparse_values[i], sparse_offsets[i], sizeof(float));
+                }
             }
+            ggml_opt_set_loss_active_rows(opt_ctx, n_active_labels);
         }
-        ggml_opt_set_loss_active_rows(opt_ctx, n_active_labels);
         const auto execution_started = std::chrono::steady_clock::now();
         ggml_opt_eval(opt_ctx, result);
         opt_timing.execution_seconds += std::chrono::duration<double>(

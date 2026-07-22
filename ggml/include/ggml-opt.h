@@ -32,6 +32,11 @@ extern "C" {
         GGML_OPT_LOSS_TYPE_SUM,
         GGML_OPT_LOSS_TYPE_CROSS_ENTROPY,
         GGML_OPT_LOSS_TYPE_MEAN_SQUARED_ERROR,
+        // retro delta (plan 03): the caller supplies a scalar loss node directly
+        // as `outputs`; the optimizer uses it verbatim (loss = outputs) and runs
+        // autodiff through it. Used by the fused sparse cross-entropy path, whose
+        // loss node already averages over the active tokens.
+        GGML_OPT_LOSS_TYPE_EXTERNAL,
     };
 
     // ====== Dataset ======

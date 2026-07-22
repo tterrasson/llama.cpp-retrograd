@@ -1102,9 +1102,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "SSM_CONV_BACK",
     "SSM_SCAN_BACK",
+
+    "FUSED_SPARSE_CE",
+    "FUSED_SPARSE_CE_BACK",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1220,9 +1223,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "ssm_conv_back(x)",
     "ssm_scan_back(x)",
+
+    "fused_sparse_ce(h,w)",
+    "fused_sparse_ce_back(h,w)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6350,6 +6356,67 @@ struct ggml_tensor * ggml_cross_entropy_loss_back(
     return result;
 }
 
+// ggml_fused_sparse_ce
+
+struct ggml_tensor * ggml_fused_sparse_ce(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * h,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * targets,
+        struct ggml_tensor  * weights,
+        int                   n_tiles) {
+    GGML_ASSERT(h->type == GGML_TYPE_F32);
+    GGML_ASSERT(targets->type == GGML_TYPE_I32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_matrix(h) && ggml_is_matrix(w));
+    GGML_ASSERT(w->ne[0] == h->ne[0]);           // shared embedding dim
+    GGML_ASSERT(targets->ne[0] == h->ne[1]);     // one target per token
+    GGML_ASSERT(weights->ne[0] == h->ne[1]);     // one weight per token
+    GGML_ASSERT(n_tiles >= 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+
+    ggml_set_op_params_i32(result, 0, n_tiles);
+
+    result->op     = GGML_OP_FUSED_SPARSE_CE;
+    result->src[0] = h;
+    result->src[1] = w;
+    result->src[2] = targets;
+    result->src[3] = weights;
+
+    return result;
+}
+
+// ggml_fused_sparse_ce_back
+
+struct ggml_tensor * ggml_fused_sparse_ce_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * h,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * targets,
+        struct ggml_tensor  * weights,
+        int                   n_tiles) {
+    GGML_ASSERT(ggml_is_scalar(a));
+    GGML_ASSERT(h->type == GGML_TYPE_F32);
+    GGML_ASSERT(targets->type == GGML_TYPE_I32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(n_tiles >= 1);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, h);
+
+    ggml_set_op_params_i32(result, 0, n_tiles);
+
+    result->op     = GGML_OP_FUSED_SPARSE_CE_BACK;
+    result->src[0] = a;
+    result->src[1] = h;
+    result->src[2] = w;
+    result->src[3] = targets;
+    result->src[4] = weights;
+
+    return result;
+}
+
 // opt_step_adamw
 
 struct ggml_tensor * ggml_opt_step_adamw(
@@ -7441,6 +7508,18 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_cross_entropy_loss_back(ctx, grad, src0, src1));
             }
             GGML_ASSERT(!src1_needs_grads && "backward pass for labels not implemented");
+        } break;
+        case GGML_OP_FUSED_SPARSE_CE: {
+            // Only the hidden states (src0) receive a gradient; the projection
+            // head (src1) is frozen and the target/weight inputs are constants.
+            if (src0_needs_grads) {
+                const int32_t n_tiles = ggml_get_op_params_i32(tensor, 0);
+                ggml_add_or_set(ctx, cgraph, isrc0,
+                        ggml_fused_sparse_ce_back(ctx, grad, src0, tensor->src[1],
+                                tensor->src[2], tensor->src[3], n_tiles));
+            }
+            GGML_ASSERT(!src1_needs_grads && "fused CE: gradient for the projection head not implemented");
+            GGML_ASSERT(!src2_needs_grads && "fused CE: gradient for targets not defined");
         } break;
         case GGML_OP_GLU: {
             switch (ggml_get_glu_op(tensor)) {

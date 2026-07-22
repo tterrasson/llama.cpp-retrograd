@@ -393,6 +393,10 @@ private:
     std::vector<size_t> opt_active_label_offsets;
     llama_opt_timing opt_timing = {};
 
+    // retro delta (plan 03): fused sparse cross-entropy for the packed step.
+    bool    opt_fused_ce = false;
+    int32_t opt_ce_tiles = 1;
+
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;
 

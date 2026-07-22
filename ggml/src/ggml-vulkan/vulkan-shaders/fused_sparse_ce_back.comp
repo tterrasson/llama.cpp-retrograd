@@ -1,0 +1,192 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+// retro delta: backward of the fused sparse cross-entropy wrt the hidden states.
+// One workgroup per token. Pass 1 recomputes the token's logsumexp with the same
+// online, F32-accumulated reduction as the forward (checkpointing, so the
+// [n_vocab, n_tokens] logits are never stored). Pass 2 forms
+//   acc[e] = sum_v softmax(z[v]) * w[e,v]
+// streaming the vocabulary in workgroup-sized tiles: each tile's softmax weights
+// are computed thread-per-vocab into shared memory, then consumed thread-per-embd
+// so every accumulation stays in F32 registers with no shared-memory atomics.
+// Finally grad_h[:,t] = (grad * weight_t / n_active) * (acc[:] - w[:,target]).
+//
+// The head is dequantized through the backend's generic per-type helpers
+// (dequant_funcs.glsl), so a single shader source covers every quant type; the
+// generator compiles one variant per DATA_A_* type. Matches
+// ggml_compute_forward_fused_sparse_ce_back_f32. See docs/memory/GPUVOCAB.md.
+
+// See fused_sparse_ce.comp for the include ordering rationale.
+#include "types.glsl"
+
+#define FLOAT_TYPE float
+#define WG 256
+// Max embedding slots per thread: supports n_embd up to WG*MAXACC.
+#define MAXACC 32
+
+layout(local_size_x = WG, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint n_embd;
+    uint n_tokens;
+    uint n_vocab;
+    uint h_stride;
+    uint d_stride;
+} p;
+
+layout(binding = 0) readonly  buffer Grd {float data_grad[];};
+layout(binding = 1) readonly  buffer H   {float data_h[];};
+// The head lives at binding 2 (see fused_sparse_ce.comp for the aliasing note).
+layout(binding = 2) readonly  buffer A   {A_TYPE data_a[];};
+#if defined(A_TYPE_PACKED16)
+layout(binding = 2) readonly  buffer A16 {A_TYPE_PACKED16 data_a_packed16[];};
+#endif
+#if defined(A_TYPE_PACKED32)
+layout(binding = 2) readonly  buffer A32 {A_TYPE_PACKED32 data_a_packed32[];};
+#endif
+layout(binding = 3) readonly  buffer Tgt {int   data_tgt[];};
+layout(binding = 4) readonly  buffer Wgt {float data_wgt[];};
+layout(binding = 5) readonly  buffer Cnt {uint  data_count[];};
+layout(binding = 6) writeonly buffer Dst {float data_dst[];};
+
+#include "dequant_funcs.glsl"
+
+// z[v,t] = dot(w[:,v], h[:,t]) in F32 — identical to the forward.
+float w_dot_h(uint v, uint h_off) {
+    const uint nb       = p.n_embd / QUANT_K;
+    const uint a_off    = v * nb;
+    const uint y_offset = (QUANT_R == 1) ? 1 : QUANT_K / 2;
+    float z = 0.0f;
+    for (uint i = 0; i < p.n_embd; i += 2) {
+        const uint ib   = a_off + i / QUANT_K;
+        const uint iqs  = (i % QUANT_K) / QUANT_R;
+        const uint iybs = i - i % QUANT_K;
+        vec2 dq = dequantize(ib, iqs, 0);
+#if !defined(DATA_A_F32) && !defined(DATA_A_F16)
+        const vec2 dm = get_dm(ib, 0);
+        dq = dq * dm.x + dm.y;
+#endif
+        z += dq.x * data_h[h_off + iybs + iqs];
+        z += dq.y * data_h[h_off + iybs + iqs + y_offset];
+    }
+    return z;
+}
+
+// w[e,v] as F32: a single logical element e of column v. Inverts the generic
+// (iqs, y_offset) pairing of dequantize() so element e is fetched for any type.
+float w_at(uint v, uint e) {
+    const uint nb = p.n_embd / QUANT_K;
+    const uint ib = v * nb + e / QUANT_K;
+    const uint el = e % QUANT_K;              // logical index within the block
+#if QUANT_R == 1
+    // Pairs are (0,1),(2,3),...: iqs is the even index, .x/.y select the element.
+    const uint iqs = el & ~1u;
+    vec2 dq = dequantize(ib, iqs, 0);
+    float val = ((el & 1u) == 0u) ? dq.x : dq.y;
+#else
+    // QUANT_R == 2, y_offset == QUANT_K/2: pairs are (iqs, iqs + QUANT_K/2).
+    const uint half_k = QUANT_K / 2u;
+    const uint iqs = el % half_k;
+    vec2 dq = dequantize(ib, iqs, 0);
+    float val = (el < half_k) ? dq.x : dq.y;
+#endif
+#if !defined(DATA_A_F32) && !defined(DATA_A_F16)
+    const vec2 dm = get_dm(ib, 0);
+    val = val * dm.x + dm.y;
+#endif
+    return val;
+}
+
+shared float sh_max[WG];
+shared float sh_sum[WG];
+shared float sh_lse;
+shared float sh_p[WG];
+
+void main() {
+    const uint t = gl_WorkGroupID.x;
+    if (t >= p.n_tokens) {
+        return;
+    }
+    const uint lid = gl_LocalInvocationID.x;
+
+    const int   tgt = data_tgt[t];
+    const float wgt = data_wgt[t];
+    const uint  n_active = data_count[0];
+    const bool  is_active = tgt >= 0 && uint(tgt) < p.n_vocab && wgt != 0.0f && n_active > 0u;
+
+    const uint d_off = t * p.d_stride;
+
+    if (!is_active) {
+        for (uint e = lid; e < p.n_embd; e += WG) {
+            data_dst[d_off + e] = 0.0f;
+        }
+        return;
+    }
+
+    const uint h_off = t * p.h_stride;
+
+    // Pass 1: logsumexp (same F32 online reduction as the forward).
+    float lmax = -3.4e38f; // effectively -inf; the first real logit overrides it
+    float lsum = 0.0f;
+    for (uint v = lid; v < p.n_vocab; v += WG) {
+        const float z = w_dot_h(v, h_off);
+        if (z > lmax) {
+            lsum = lsum * exp(lmax - z) + 1.0f;
+            lmax = z;
+        } else {
+            lsum += exp(z - lmax);
+        }
+    }
+    sh_max[lid] = lmax;
+    sh_sum[lid] = lsum;
+    barrier();
+    [[unroll]] for (uint s = WG / 2u; s > 0u; s >>= 1) {
+        if (lid < s) {
+            const float m1 = sh_max[lid];
+            const float s1 = sh_sum[lid];
+            const float m2 = sh_max[lid + s];
+            const float s2 = sh_sum[lid + s];
+            const float m = max(m1, m2);
+            const float sum = s1 * exp(m1 - m) + s2 * exp(m2 - m);
+            sh_max[lid] = m;
+            sh_sum[lid] = sum;
+        }
+        barrier();
+    }
+    if (lid == 0) {
+        sh_lse = sh_max[0] + log(sh_sum[0]);
+    }
+    barrier();
+    const float lse = sh_lse;
+
+    // Pass 2: acc[e] = sum_v softmax(z[v]) * w[e,v], tiled over the vocabulary.
+    float acc[MAXACC];
+    [[unroll]] for (uint k = 0; k < MAXACC; ++k) {
+        acc[k] = 0.0f;
+    }
+
+    for (uint tile = 0; tile < p.n_vocab; tile += WG) {
+        const uint v = tile + lid;
+        sh_p[lid] = (v < p.n_vocab) ? exp(w_dot_h(v, h_off) - lse) : 0.0f;
+        barrier();
+
+        const uint tile_n = min(uint(WG), p.n_vocab - tile);
+        uint k = 0;
+        for (uint e = lid; e < p.n_embd; e += WG, ++k) {
+            float a = 0.0f;
+            for (uint j = 0; j < tile_n; ++j) {
+                a += sh_p[j] * w_at(tile + j, e);
+            }
+            acc[k] += a;
+        }
+        barrier();
+    }
+
+    const float coef = data_grad[0] * wgt / float(n_active);
+    uint k = 0;
+    for (uint e = lid; e < p.n_embd; e += WG, ++k) {
+        data_dst[d_off + e] = coef * (acc[k] - w_at(uint(tgt), e));
+    }
+}

@@ -1625,6 +1625,12 @@ extern "C" {
         void * get_opt_pars_ud;                     // userdata for calculating optimizer parameters
 
         enum ggml_opt_optimizer_type optimizer_type;
+
+        // retro delta (plan 03): fuse the output projection with the cross-entropy
+        // in the packed optimizer step so the full [n_vocab, n_tokens] logits are
+        // never materialized. n_ce_tiles is the vocabulary tile count C (>= 1).
+        bool    fused_sparse_ce;
+        int32_t n_ce_tiles;
     };
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);

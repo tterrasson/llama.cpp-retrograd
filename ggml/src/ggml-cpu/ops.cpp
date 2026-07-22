@@ -12206,6 +12206,245 @@ void ggml_compute_forward_cross_entropy_loss_back(
     }
 }
 
+// ggml_compute_forward_fused_sparse_ce
+//
+// retro delta: fused sparse cross-entropy over a (possibly quantized) projection
+// head. Streams the vocabulary tile by tile, computing each logit z[v,t] on
+// demand as dot(w[:,v], h[:,t]) with an online (running) log-sum-exp in F32, so
+// the [n_vocab, n_tokens] logits are never materialized. Reproduces exactly the
+// weighted, active-row-normalized loss of ggml_cross_entropy_loss applied to
+// mul_mat(w, h) with labels = weights[t]*onehot(targets[t]). See
+// docs/memory/03-vocab-logits-chunked-ce.md.
+
+static inline void ggml_fused_ce_row_to_f32(
+        const ggml_tensor * w, int64_t v, ggml_to_float_t to_float,
+        float * scratch, const float ** out_row) {
+    const void * w_row = (const char *) w->data + v*w->nb[1];
+    if (w->type == GGML_TYPE_F32) {
+        *out_row = (const float *) w_row;
+    } else {
+        to_float(w_row, scratch, w->ne[0]);
+        *out_row = scratch;
+    }
+}
+
+static void ggml_compute_forward_fused_sparse_ce_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * h       = dst->src[0]; // [n_embd, n_tokens] F32
+    const ggml_tensor * w       = dst->src[1]; // [n_embd, n_vocab]  any type
+    const ggml_tensor * targets = dst->src[2]; // [n_tokens] I32
+    const ggml_tensor * weights = dst->src[3]; // [n_tokens] F32
+
+    GGML_ASSERT(ggml_is_scalar(dst) && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(h->type == GGML_TYPE_F32);
+    GGML_ASSERT(targets->type == GGML_TYPE_I32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+
+    const int64_t n_embd   = h->ne[0];
+    const int64_t n_tokens = h->ne[1];
+    const int64_t n_vocab  = w->ne[1];
+    GGML_ASSERT(w->ne[0] == n_embd);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    ggml_to_float_t const to_float = ggml_get_type_traits(w->type)->to_float;
+    GGML_ASSERT(w->type == GGML_TYPE_F32 || to_float);
+
+    GGML_ASSERT(params->wsize >= sizeof(float) * (size_t)(nth + nth*n_embd));
+    float * sums = (float *) params->wdata;                 // [nth]
+    float * deq  = (float *) params->wdata + nth + ith*n_embd; // per-thread [n_embd]
+
+    const int32_t * tgt = (const int32_t *) targets->data;
+    const float   * wts = (const float   *) weights->data;
+
+    // Active tokens: real target and non-zero coefficient. Scanned per thread
+    // (cheap over n_tokens) so no cross-thread reduction of the count is needed.
+    int64_t n_active = 0;
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        if (tgt[t] >= 0 && tgt[t] < n_vocab && wts[t] != 0.0f) {
+            ++n_active;
+        }
+    }
+
+    const int64_t dt = (n_tokens + nth - 1)/nth;
+    const int64_t t0 = dt*ith;
+    const int64_t t1 = MIN(t0 + dt, n_tokens);
+
+    double sum_thread = 0.0;
+    for (int64_t t = t0; t < t1; ++t) {
+        if (!(tgt[t] >= 0 && tgt[t] < n_vocab && wts[t] != 0.0f)) {
+            continue;
+        }
+        const float * h_col = (const float *)((const char *) h->data + t*h->nb[1]);
+        float running_max = -INFINITY;
+        float running_sum = 0.0f;
+        float z_target    = 0.0f;
+        for (int64_t v = 0; v < n_vocab; ++v) {
+            const float * wv;
+            ggml_fused_ce_row_to_f32(w, v, to_float, deq, &wv);
+            float z = 0.0f;
+            for (int64_t e = 0; e < n_embd; ++e) {
+                z += wv[e]*h_col[e];
+            }
+            if (z > running_max) {
+                running_sum = running_sum*expf(running_max - z) + 1.0f;
+                running_max = z;
+            } else {
+                running_sum += expf(z - running_max);
+            }
+            if (v == tgt[t]) {
+                z_target = z;
+            }
+        }
+        const float lse = running_max + logf(running_sum);
+        sum_thread += (double) wts[t] * ((double) lse - (double) z_target);
+    }
+    sums[ith] = (float) sum_thread;
+    ggml_barrier(params->threadpool);
+
+    if (ith == 0) {
+        double total = 0.0;
+        for (int i = 0; i < nth; ++i) {
+            total += sums[i];
+        }
+        ((float *) dst->data)[0] = n_active > 0 ? (float) (total / (double) n_active) : 0.0f;
+    }
+}
+
+void ggml_compute_forward_fused_sparse_ce(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_fused_sparse_ce_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// ggml_compute_forward_fused_sparse_ce_back
+
+static void ggml_compute_forward_fused_sparse_ce_back_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * grad    = dst->src[0]; // scalar gradient of the loss
+    const ggml_tensor * h       = dst->src[1]; // [n_embd, n_tokens] F32
+    const ggml_tensor * w       = dst->src[2]; // [n_embd, n_vocab]  any type
+    const ggml_tensor * targets = dst->src[3]; // [n_tokens] I32
+    const ggml_tensor * weights = dst->src[4]; // [n_tokens] F32
+
+    GGML_ASSERT(ggml_is_scalar(grad));
+    GGML_ASSERT(h->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(h, dst));
+
+    const int64_t n_embd   = h->ne[0];
+    const int64_t n_tokens = h->ne[1];
+    const int64_t n_vocab  = w->ne[1];
+    GGML_ASSERT(w->ne[0] == n_embd);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    ggml_to_float_t const to_float = ggml_get_type_traits(w->type)->to_float;
+    GGML_ASSERT(w->type == GGML_TYPE_F32 || to_float);
+
+    GGML_ASSERT(params->wsize >= sizeof(float) * (size_t)(nth*n_embd));
+    float * deq = (float *) params->wdata + ith*n_embd; // per-thread [n_embd]
+
+    const int32_t * tgt = (const int32_t *) targets->data;
+    const float   * wts = (const float   *) weights->data;
+    const float     g   = ((const float *) grad->data)[0];
+
+    int64_t n_active = 0;
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        if (tgt[t] >= 0 && tgt[t] < n_vocab && wts[t] != 0.0f) {
+            ++n_active;
+        }
+    }
+
+    const int64_t dt = (n_tokens + nth - 1)/nth;
+    const int64_t t0 = dt*ith;
+    const int64_t t1 = MIN(t0 + dt, n_tokens);
+
+    for (int64_t t = t0; t < t1; ++t) {
+        float * grad_col = (float *)((char *) dst->data + t*dst->nb[1]);
+        const bool active = tgt[t] >= 0 && tgt[t] < n_vocab && wts[t] != 0.0f;
+        if (!active || n_active == 0) {
+            for (int64_t e = 0; e < n_embd; ++e) {
+                grad_col[e] = 0.0f;
+            }
+            continue;
+        }
+        const float * h_col = (const float *)((const char *) h->data + t*h->nb[1]);
+
+        // Pass 1: online log-sum-exp, identical to the forward.
+        float running_max = -INFINITY;
+        float running_sum = 0.0f;
+        for (int64_t v = 0; v < n_vocab; ++v) {
+            const float * wv;
+            ggml_fused_ce_row_to_f32(w, v, to_float, deq, &wv);
+            float z = 0.0f;
+            for (int64_t e = 0; e < n_embd; ++e) {
+                z += wv[e]*h_col[e];
+            }
+            if (z > running_max) {
+                running_sum = running_sum*expf(running_max - z) + 1.0f;
+                running_max = z;
+            } else {
+                running_sum += expf(z - running_max);
+            }
+        }
+        const float lse = running_max + logf(running_sum);
+
+        // Pass 2: grad_h = coef * ( sum_v softmax[v]*w[:,v] - w[:,target] ),
+        // coef = g * weight / n_active, recomputing logits tile by tile.
+        for (int64_t e = 0; e < n_embd; ++e) {
+            grad_col[e] = 0.0f;
+        }
+        for (int64_t v = 0; v < n_vocab; ++v) {
+            const float * wv;
+            ggml_fused_ce_row_to_f32(w, v, to_float, deq, &wv);
+            float z = 0.0f;
+            for (int64_t e = 0; e < n_embd; ++e) {
+                z += wv[e]*h_col[e];
+            }
+            const float p = expf(z - lse);
+            for (int64_t e = 0; e < n_embd; ++e) {
+                grad_col[e] += p*wv[e];
+            }
+        }
+        const float * w_target;
+        ggml_fused_ce_row_to_f32(w, tgt[t], to_float, deq, &w_target);
+        const float coef = g * wts[t] / (float) n_active;
+        for (int64_t e = 0; e < n_embd; ++e) {
+            grad_col[e] = coef*(grad_col[e] - w_target[e]);
+        }
+    }
+}
+
+void ggml_compute_forward_fused_sparse_ce_back(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[1]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_fused_sparse_ce_back_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 static void ggml_compute_forward_opt_step_adamw_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
