@@ -3892,10 +3892,12 @@ void llama_context::opt_epoch_iter(
 
             const auto allocation_started = std::chrono::steady_clock::now();
             struct ggml_context * ctx_compute_opt;
+            struct ggml_tensor * ce_targets = nullptr;
+            struct ggml_tensor * ce_weights = nullptr;
             {
                 const size_t size_gf = ggml_graph_size(gf);
                 const size_t size_meta = llama_opt_metadata_size(
-                        size_gf, /*fused_sparse_ce =*/ false,
+                        size_gf, opt_fused_ce,
                         /*gradient_checkpointing =*/ false);
                 if (opt_compute_meta.size() < size_meta) {
                     opt_compute_meta.resize(size_meta);
@@ -3907,13 +3909,48 @@ void llama_context::opt_epoch_iter(
                 };
                 ctx_compute_opt = ggml_init(params);
             }
-            ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
+            if (opt_fused_ce) {
+                // retro delta: SFT uses the same scalar fused loss as the
+                // packed PPO/GRPO path. Rooting the graph at this node removes
+                // the dense vocab logits and labels from every ubatch.
+                struct ggml_tensor * t_logits = res->get_logits();
+                GGML_ASSERT(t_logits && t_logits->op == GGML_OP_MUL_MAT &&
+                        t_logits->src[0] && t_logits->src[1]);
+                ce_targets = ggml_new_tensor_1d(ctx_compute_opt, GGML_TYPE_I32, n_outputs);
+                ce_weights = ggml_new_tensor_1d(ctx_compute_opt, GGML_TYPE_F32, n_outputs);
+                ggml_set_input(ce_targets);
+                ggml_set_input(ce_weights);
+                ggml_set_name(ce_targets, "ce_targets");
+                ggml_set_name(ce_weights, "ce_weights");
+                struct ggml_tensor * fused_loss = ggml_fused_sparse_ce(
+                        ctx_compute_opt, t_logits->src[1], t_logits->src[0],
+                        ce_targets, ce_weights, opt_ce_tiles);
+                ggml_set_output(fused_loss);
+                struct ggml_cgraph * gf_fused = ggml_new_graph_custom(
+                        ctx_compute_opt, ggml_graph_size(gf), /*grads =*/ true);
+                ggml_build_forward_expand(gf_fused, fused_loss);
+                ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf_fused,
+                        res->get_inp_tokens(), fused_loss);
+            } else {
+                ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf,
+                        res->get_inp_tokens(), res->get_logits());
+            }
             ggml_opt_alloc(opt_ctx, train);
             opt_timing.allocation_seconds += std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - allocation_started).count();
 
             res->set_inputs(&ubatch);
-            {
+            if (opt_fused_ce) {
+                std::vector<int32_t> targets_i32(n_outputs);
+                std::vector<float> weights_f32(n_outputs);
+                for (uint32_t pos_ubatch = 0; pos_ubatch < n_outputs; ++pos_ubatch) {
+                    const uint32_t ilabel = pos_ctx + pos_batch + pos_ubatch;
+                    targets_i32[pos_ubatch] = (int32_t) labels_sparse[ilabel];
+                    weights_f32[pos_ubatch] = label_weights ? label_weights[ilabel] : 1.0f;
+                }
+                ggml_backend_tensor_set(ce_targets, targets_i32.data(), 0, ggml_nbytes(ce_targets));
+                ggml_backend_tensor_set(ce_weights, weights_f32.data(), 0, ggml_nbytes(ce_weights));
+            } else {
                 struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
                 GGML_ASSERT(labels->ne[1] == n_ubatch);
                 // retro delta: the incremental-clear optimization below only reset
