@@ -246,6 +246,13 @@ extern "C" {
         struct ggml_tensor  * inputs,
         struct ggml_tensor  * outputs);
 
+    // Select forward tensors retained as activation checkpoints by the next
+    // dynamic backward build. Passing NULL/zero restores the ordinary path.
+    GGML_API void ggml_opt_set_gradient_checkpoints(
+        ggml_opt_context_t    opt_ctx,
+        struct ggml_tensor ** checkpoints,
+        int                   n_checkpoints);
+
     // allocate the next graph for evaluation, either forward or forward + backward
     // must be called exactly once prior to calling ggml_opt_eval
     GGML_API void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward);

@@ -2643,10 +2643,17 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         // this can happen when KV cache is not used (e.g. an embedding model with non-causal attn)
         if (k->type == GGML_TYPE_F32) {
             k = ggml_cast(ctx0, k, GGML_TYPE_F16);
+        } else if (cparams.kv_differentiable && !ggml_is_contiguous(k)) {
+            // A native F16 KV cache skips the cast above. Its permuted cache
+            // view is not contiguous, while differentiable Vulkan Flash
+            // Attention requires contiguous K/V inputs for the backward pass.
+            k = ggml_cont(ctx0, k);
         }
 
         if (v->type == GGML_TYPE_F32) {
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+        } else if (cparams.kv_differentiable && !ggml_is_contiguous(v)) {
+            v = ggml_cont(ctx0, v);
         }
 
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,

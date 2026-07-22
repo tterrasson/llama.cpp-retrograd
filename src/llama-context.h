@@ -396,6 +396,8 @@ private:
     // retro delta (plan 03): fused sparse cross-entropy for the packed step.
     bool    opt_fused_ce = false;
     int32_t opt_ce_tiles = 1;
+    bool    opt_gradient_checkpointing = false;
+    uint32_t opt_checkpoint_every_n_layers = 1;
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;

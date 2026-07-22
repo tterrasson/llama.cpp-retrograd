@@ -3481,6 +3481,83 @@ static void llama_set_param(struct ggml_tensor * tensor, llama_opt_param_filter 
     ggml_set_param(tensor);
 }
 
+static ggml_cgraph * llama_opt_build_forward_graph(
+        const llama_model & model,
+        llm_graph_params    params,
+        bool                gradient_checkpointing,
+        uint32_t            checkpoint_every_n_layers,
+        std::vector<ggml_tensor *> & checkpoints) {
+    checkpoints.clear();
+    if (!gradient_checkpointing) {
+        return model.build_graph(params);
+    }
+
+    const llm_graph_cb parent_cb = params.cb;
+    ggml_tensor * last_layer_output = nullptr;
+    params.cb = [parent_cb, checkpoint_every_n_layers, &checkpoints, &last_layer_output](
+            const llama_ubatch & ubatch,
+            ggml_tensor * cur,
+            const char * name,
+            int il) {
+        if (parent_cb) {
+            parent_cb(ubatch, cur, name, il);
+        }
+        if (cur && il >= 0 && strcmp(name, "l_out") == 0) {
+            last_layer_output = cur;
+            if ((uint32_t) (il + 1) % checkpoint_every_n_layers == 0) {
+                checkpoints.push_back(cur);
+            }
+        }
+    };
+
+    ggml_cgraph * gf = model.build_graph(params);
+    if (!gf) {
+        checkpoints.clear();
+        return nullptr;
+    }
+    if (last_layer_output && std::find(checkpoints.begin(), checkpoints.end(),
+                last_layer_output) == checkpoints.end()) {
+        checkpoints.push_back(last_layer_output);
+    }
+
+    // Some architectures construct auxiliary branches that are not ancestors
+    // of the selected output. Only graph members can be valid checkpoints.
+    std::set<ggml_tensor *> graph_nodes;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        graph_nodes.insert(ggml_graph_node(gf, i));
+    }
+    checkpoints.erase(std::remove_if(checkpoints.begin(), checkpoints.end(),
+                [&graph_nodes](ggml_tensor * tensor) {
+                    return graph_nodes.count(tensor) == 0;
+                }), checkpoints.end());
+    checkpoints.erase(std::unique(checkpoints.begin(), checkpoints.end()), checkpoints.end());
+    return gf;
+}
+
+static size_t llama_opt_metadata_size(
+        size_t size_gf,
+        bool   fused_sparse_ce,
+        bool   gradient_checkpointing) {
+    if (!gradient_checkpointing) {
+        const size_t n_graphs = fused_sparse_ce ? 3 : 2;
+        return 4*size_gf*ggml_tensor_overhead()
+                + n_graphs*ggml_graph_overhead_custom(size_gf, /*grads =*/ true);
+    }
+
+    // In addition to the ordinary backward tensors, checkpointing owns one
+    // temporary backward graph and at most one recompute tensor per forward
+    // node. The rewritten backward and optimizer graphs need room for both the
+    // ordinary nodes and those clones.
+    const size_t rewritten_size = 2*size_gf;
+    size_t result = 6*size_gf*ggml_tensor_overhead();
+    if (fused_sparse_ce) {
+        result += ggml_graph_overhead_custom(size_gf, /*grads =*/ true);
+    }
+    result += ggml_graph_overhead_custom(size_gf, /*grads =*/ true);
+    result += 2*ggml_graph_overhead_custom(rewritten_size, /*grads =*/ true);
+    return result;
+}
+
 void llama_context::opt_init(struct llama_model * model, struct llama_opt_params lopt_params) {
     GGML_ASSERT(!opt_ctx);
     model->hparams.n_ctx_train = lopt_params.n_ctx_train > 0 ? lopt_params.n_ctx_train : n_ctx();
@@ -3503,6 +3580,9 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     // never builds the dense [n_vocab, n_tokens] labels tensor.
     opt_fused_ce = lopt_params.fused_sparse_ce;
     opt_ce_tiles = lopt_params.n_ce_tiles > 0 ? lopt_params.n_ce_tiles : 1;
+    opt_gradient_checkpointing = lopt_params.gradient_checkpointing;
+    opt_checkpoint_every_n_layers = lopt_params.checkpoint_every_n_layers > 0
+            ? lopt_params.checkpoint_every_n_layers : 1;
     const enum ggml_opt_loss_type loss_type = opt_fused_ce
             ? GGML_OPT_LOSS_TYPE_EXTERNAL
             : GGML_OPT_LOSS_TYPE_CROSS_ENTROPY;
@@ -3596,7 +3676,10 @@ int32_t llama_context::opt_preflight(llama_opt_preflight_cb callback, void * use
         auto * res = gf_res_prev.get();
         const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
         res->reset();
-        auto * gf = model.build_graph(gparams);
+        std::vector<ggml_tensor *> gradient_checkpoints;
+        auto * gf = llama_opt_build_forward_graph(
+                model, gparams, opt_gradient_checkpointing,
+                opt_checkpoint_every_n_layers, gradient_checkpoints);
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to build the forward graph\n", __func__);
             break;
@@ -3642,9 +3725,8 @@ int32_t llama_context::opt_preflight(llama_opt_preflight_cb callback, void * use
         struct ggml_context * ctx_compute_opt;
         const size_t size_gf = ggml_graph_size(gf);
         {
-            // The fused path adds one extra forward graph rooted at the loss.
-            const size_t n_graphs = opt_fused_ce ? 3 : 2;
-            const size_t size_meta = 4*size_gf*ggml_tensor_overhead() + n_graphs*ggml_graph_overhead_custom(size_gf, /*grads = */ true);
+            const size_t size_meta = llama_opt_metadata_size(
+                    size_gf, opt_fused_ce, opt_gradient_checkpointing);
             struct ggml_init_params params = {
                 /*.mem_size   =*/ size_meta,
                 /*.mem_buffer =*/ nullptr,
@@ -3676,6 +3758,10 @@ int32_t llama_context::opt_preflight(llama_opt_preflight_cb callback, void * use
             ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf_fused, res->get_inp_tokens(), fused_loss);
         } else {
             ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
+        }
+        if (!gradient_checkpoints.empty()) {
+            ggml_opt_set_gradient_checkpoints(opt_ctx, gradient_checkpoints.data(),
+                    (int) gradient_checkpoints.size());
         }
         ggml_opt_alloc(opt_ctx, /*backward =*/ true);
 
@@ -3802,7 +3888,9 @@ void llama_context::opt_epoch_iter(
             struct ggml_context * ctx_compute_opt;
             {
                 const size_t size_gf = ggml_graph_size(gf);
-                const size_t size_meta = 4*size_gf*ggml_tensor_overhead() + 2*ggml_graph_overhead_custom(size_gf, /*grads = */ true);
+                const size_t size_meta = llama_opt_metadata_size(
+                        size_gf, /*fused_sparse_ce =*/ false,
+                        /*gradient_checkpointing =*/ false);
                 if (opt_compute_meta.size() < size_meta) {
                     opt_compute_meta.resize(size_meta);
                 }
@@ -3989,7 +4077,10 @@ bool llama_context::opt_step_packed_sequences(
             }
             const auto graph_build_started = std::chrono::steady_clock::now();
             res->reset();
-            auto * gf = model.build_graph(gparams);
+            std::vector<ggml_tensor *> gradient_checkpoints;
+            auto * gf = llama_opt_build_forward_graph(
+                    model, gparams, opt_gradient_checkpointing,
+                    opt_checkpoint_every_n_layers, gradient_checkpoints);
             opt_timing.graph_build_seconds += std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - graph_build_started).count();
             if (!gf) {
@@ -3998,10 +4089,8 @@ bool llama_context::opt_step_packed_sequences(
             }
             const auto allocation_started = std::chrono::steady_clock::now();
             const size_t size_gf = ggml_graph_size(gf);
-            // The fused path adds one extra forward graph rooted at the loss.
-            const size_t n_graphs = opt_fused_ce ? 3 : 2;
-            const size_t size_meta = 4*size_gf*ggml_tensor_overhead()
-                    + n_graphs*ggml_graph_overhead_custom(size_gf, /*grads = */ true);
+            const size_t size_meta = llama_opt_metadata_size(
+                    size_gf, opt_fused_ce, opt_gradient_checkpointing);
             struct ggml_init_params params = {
                 /*.mem_size   =*/ size_meta,
                 /*.mem_buffer =*/ nullptr,
@@ -4047,6 +4136,10 @@ bool llama_context::opt_step_packed_sequences(
             } else {
                 ggml_opt_prepare_alloc(opt_ctx, opt_cached_compute_ctx.get(), gf,
                         res->get_inp_tokens(), res->get_logits());
+            }
+            if (!gradient_checkpoints.empty()) {
+                ggml_opt_set_gradient_checkpoints(opt_ctx, gradient_checkpoints.data(),
+                        (int) gradient_checkpoints.size());
             }
             ggml_opt_alloc(opt_ctx, /*backward =*/ true);
             ggml_opt_set_graph_cache(opt_ctx, true);

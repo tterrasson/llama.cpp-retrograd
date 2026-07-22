@@ -1631,6 +1631,11 @@ extern "C" {
         // never materialized. n_ce_tiles is the vocabulary tile count C (>= 1).
         bool    fused_sparse_ce;
         int32_t n_ce_tiles;
+
+        // retro delta (plan 02): recompute transformer activations during the
+        // backward pass, retaining every Nth layer output as a checkpoint.
+        bool    gradient_checkpointing;
+        uint32_t checkpoint_every_n_layers;
     };
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);

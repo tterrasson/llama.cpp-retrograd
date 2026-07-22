@@ -2955,6 +2955,22 @@ extern "C" {
         struct ggml_cgraph  *  cgraph,
         struct ggml_tensor  ** grad_accs);
 
+    // Build a backward graph whose gradient nodes consume recomputed forward
+    // activations. Recursion stops at parameters, leaves, and the explicit
+    // checkpoints, allowing the allocator to release other forward
+    // activations before the backward pass. The returned graph is owned by
+    // `ctx`; `gf` and the checkpoint tensors must remain alive while it runs.
+    GGML_API struct ggml_cgraph * ggml_build_backward_gradient_checkpointing(
+        struct ggml_context *  ctx,
+        struct ggml_cgraph  *  gf,
+        struct ggml_tensor  ** grad_accs,
+        struct ggml_tensor  ** checkpoints,
+        int                    n_checkpoints,
+        void (*on_recompute)(struct ggml_tensor * original,
+                             struct ggml_tensor * clone,
+                             void * userdata),
+        void * userdata);
+
     // retro delta: preflight query for ggml_build_backward_expand. Simulates the
     // gradient propagation from `root` (the differentiated output, e.g. logits)
     // down to the parameters and collects the nodes whose op has no gradient

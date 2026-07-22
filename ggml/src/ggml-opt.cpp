@@ -70,6 +70,9 @@ struct ggml_opt_context {
     std::vector<struct ggml_tensor *> grad_accs;
     std::vector<struct ggml_tensor *> grad_m;
     std::vector<struct ggml_tensor *> grad_v;
+    // Forward tensors retained across the backward pass. Empty preserves the
+    // ordinary graph exactly; dynamic callers refresh this list per build.
+    std::vector<struct ggml_tensor *> gradient_checkpoints;
     // retro delta: compacted, name-keyed view of the momenta above. This is
     // the pairing both the optimizer step and checkpointing use; grad_m/grad_v
     // stay as the allocation-time storage, indexed by forward-graph node
@@ -430,6 +433,17 @@ static ggml_cgraph * dup_graph(ggml_context * ctx, ggml_cgraph * src) {
     return dst;
 }
 
+static void ggml_opt_copy_recompute_backend(
+        ggml_tensor * original,
+        ggml_tensor * clone,
+        void * userdata) {
+    ggml_backend_sched_t sched = static_cast<ggml_backend_sched_t>(userdata);
+    ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, original);
+    if (backend) {
+        ggml_backend_sched_set_tensor_backend(sched, clone, backend);
+    }
+}
+
 static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     GGML_ASSERT(opt_ctx->ctx_compute && "no compute context set, either use static graphs or set one with ggml_opt_prepare_alloc");
     GGML_ASSERT((!opt_ctx->static_graphs || opt_ctx->inputs->data) && "when using static graphs the inputs must be allocated statically");
@@ -601,8 +615,19 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     }
 
     // gb_grad == graph backward gradients, forward pass, then backward pass to calculate gradients.
-    opt_ctx->gb_grad = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gf, /*force_grads =*/ true);
-    ggml_build_backward_expand(opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->grad_accs.data());
+    if (opt_ctx->gradient_checkpoints.empty()) {
+        opt_ctx->gb_grad = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gf, /*force_grads =*/ true);
+        ggml_build_backward_expand(opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->grad_accs.data());
+    } else {
+        opt_ctx->gb_grad = ggml_build_backward_gradient_checkpointing(
+                opt_ctx->ctx_compute,
+                opt_ctx->gf,
+                opt_ctx->grad_accs.data(),
+                opt_ctx->gradient_checkpoints.data(),
+                (int) opt_ctx->gradient_checkpoints.size(),
+                ggml_opt_copy_recompute_backend,
+                opt_ctx->backend_sched);
+    }
 
     if (opt_ctx->buf_static) {
         if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_GRAD) {
@@ -1014,6 +1039,20 @@ void ggml_opt_prepare_alloc(
     opt_ctx->gf          = gf;
     opt_ctx->inputs      = inputs;
     opt_ctx->outputs     = outputs;
+    opt_ctx->gradient_checkpoints.clear();
+}
+
+void ggml_opt_set_gradient_checkpoints(
+        ggml_opt_context_t    opt_ctx,
+        struct ggml_tensor ** checkpoints,
+        int                   n_checkpoints) {
+    GGML_ASSERT(!opt_ctx->static_graphs);
+    GGML_ASSERT(n_checkpoints >= 0);
+    GGML_ASSERT(n_checkpoints == 0 || checkpoints != nullptr);
+    opt_ctx->gradient_checkpoints.clear();
+    if (n_checkpoints > 0) {
+        opt_ctx->gradient_checkpoints.assign(checkpoints, checkpoints + n_checkpoints);
+    }
 }
 
 void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
