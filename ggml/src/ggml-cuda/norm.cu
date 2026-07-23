@@ -412,15 +412,29 @@ static void rms_norm_mul_f32_cuda(const float *  x,
 // max(norm, eps) floor: when norm > eps the gradient carries the usual
 // cross term, when norm <= eps the forward scale is the local constant
 // 1/eps so no cross term applies.
+//
+// xf (the forward-pass input) can be a strided view rather than a fresh
+// contiguous tensor -- e.g. qwen3.5/qwen3next's GDN slice q/k out of an
+// interleaved qkv conv buffer before l2-normalizing them -- so xf is
+// addressed via explicit per-dim strides like l2_norm_f32 above. grad and
+// dst are always freshly allocated by the graph and stay contiguous.
 template <int block_size>
 static __global__ void l2_norm_back_f32(
-        const float * grad, const float * xf, float * dst, const int ncols, const float eps) {
-    const int row = blockIdx.x*blockDim.y + threadIdx.y;
+        const float * grad, const float * xf, float * dst, const int ncols,
+        const int64_t xf_stride_row, const int64_t xf_stride_channel, const int64_t xf_stride_sample,
+        const float eps) {
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+
+    const int row     = blockIdx.x;
+    const int channel = blockIdx.y;
+    const int sample  = blockIdx.z;
     const int tid = threadIdx.x;
 
-    grad += int64_t(row)*ncols;
-    xf   += int64_t(row)*ncols;
-    dst  += int64_t(row)*ncols;
+    const int64_t contig_off = ((int64_t(sample)*nchannels + channel)*nrows + row)*ncols;
+    grad += contig_off;
+    dst  += contig_off;
+    xf   += int64_t(sample)*xf_stride_sample + int64_t(channel)*xf_stride_channel + int64_t(row)*xf_stride_row;
 
     float sum_xx = 0.0f;
     float sum_xg = 0.0f;
@@ -469,13 +483,18 @@ static __global__ void l2_norm_back_f32(
     }
 }
 
-static void l2_norm_back_f32_cuda(const float * grad, const float * xf, float * dst, const int ncols, const int nrows, const float eps, cudaStream_t stream) {
+static void l2_norm_back_f32_cuda(
+        const float * grad, const float * xf, float * dst, const int ncols,
+        const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const int64_t xf_s01, const int64_t xf_s02, const int64_t xf_s03,
+        const float eps, cudaStream_t stream) {
+    const dim3 blocks_num(ne01, ne02, ne03);
     if (ncols < 1024) {
         const dim3 block_dims(WARP_SIZE, 1, 1);
-        l2_norm_back_f32<WARP_SIZE><<<nrows, block_dims, 0, stream>>>(grad, xf, dst, ncols, eps);
+        l2_norm_back_f32<WARP_SIZE><<<blocks_num, block_dims, 0, stream>>>(grad, xf, dst, ncols, xf_s01, xf_s02, xf_s03, eps);
     } else {
         const dim3 block_dims(1024, 1, 1);
-        l2_norm_back_f32<1024><<<nrows, block_dims, 0, stream>>>(grad, xf, dst, ncols, eps);
+        l2_norm_back_f32<1024><<<blocks_num, block_dims, 0, stream>>>(grad, xf, dst, ncols, xf_s01, xf_s02, xf_s03, eps);
     }
 }
 
@@ -781,18 +800,25 @@ void ggml_cuda_op_l2_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     cudaStream_t stream = ctx.stream();
 
     GGML_ASSERT(ggml_is_contiguous(grad));
-    GGML_ASSERT(ggml_is_contiguous(src0f));
+    // src0f (the forward input) only needs contiguous rows: qwen3.5/qwen3next
+    // slice q/k out of an interleaved qkv conv buffer via a view before
+    // l2-normalizing, so higher dims can be strided.
+    GGML_ASSERT(ggml_is_contiguous_rows(src0f));
 
     GGML_ASSERT( grad->type == GGML_TYPE_F32);
     GGML_ASSERT(src0f->type == GGML_TYPE_F32);
     GGML_ASSERT(  dst->type == GGML_TYPE_F32);
 
     const int64_t ne00 = src0f->ne[0];
-    const int64_t nrows = ggml_nrows(src0f);
+
+    const size_t ts0 = ggml_type_size(src0f->type);
+    const int64_t s01 = src0f->nb[1] / ts0;
+    const int64_t s02 = src0f->nb[2] / ts0;
+    const int64_t s03 = src0f->nb[3] / ts0;
 
     float eps;
     memcpy(&eps, dst->op_params, sizeof(float));
     GGML_ASSERT(eps >= 0.0f);
 
-    l2_norm_back_f32_cuda(grad_d, src0f_d, dst_d, ne00, nrows, eps, stream);
+    l2_norm_back_f32_cuda(grad_d, src0f_d, dst_d, ne00, src0f->ne[1], src0f->ne[2], src0f->ne[3], s01, s02, s03, eps, stream);
 }
