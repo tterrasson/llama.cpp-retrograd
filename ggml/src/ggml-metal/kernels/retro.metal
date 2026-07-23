@@ -1,5 +1,242 @@
 #include "common.h"
 #include "dequantize.h" // retro delta: quantized training kernels
+// retro delta: analytic backward for GATED_DELTA_NET (Qwen3-Next / KDA),
+// mirroring the CPU reference (ggml-cpu/ops.cpp) and the CUDA/Vulkan ports
+// (gated-delta-net-back.cu / gated_delta_net_back.comp). Correctness-first:
+// one thread per (head, sequence) unit recomputes the S_prev trajectory into
+// a scratch region appended after the packed destination buffer (sized by
+// ggml_metal_op_gated_delta_net_back_extra_tmp), then reverse-scans it.
+// grad_q/grad_k can be shared by several v-heads under GQA broadcast, so
+// those two outputs use atomic_fetch_add_explicit; every other output is
+// unique per (head, seq) and written directly. The caller zeroes `dst`
+// before dispatch.
+//
+// NOTE: unlike every other backend in this fork, this kernel has never been
+// compiled or run (no Metal toolchain in the environment that wrote it). It
+// is a careful line-by-line port of the verified CUDA/Vulkan/CPU references,
+// but treat it as unverified until it has run on real Metal hardware.
+kernel void kernel_gated_delta_net_back_f32(
+        constant ggml_metal_kargs_gated_delta_net_back & args,
+        device const float * data_q     [[buffer(1)]],
+        device const float * data_k     [[buffer(2)]],
+        device const float * data_v     [[buffer(3)]],
+        device const float * data_g     [[buffer(4)]],
+        device const float * data_beta  [[buffer(5)]],
+        device const float * data_state [[buffer(6)]],
+        device const float * data_grad  [[buffer(7)]],
+        device       float * data_dst   [[buffer(8)]],
+        device       float * data_scratch [[buffer(9)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 ntg  [[threads_per_threadgroup]],
+        uint3 tpitg[[thread_position_in_threadgroup]]) {
+    const uint tid = tgpig.x*ntg.x + tpitg.x;
+    if (tid >= (uint) (args.H*args.n_seqs)) {
+        return;
+    }
+    const uint iv1 = tid % (uint) args.H;
+    const uint iv3 = tid / (uint) args.H;
+
+    const uint iq1 = iv1 % (uint) args.neq1;
+    const uint ik1 = iv1 % (uint) args.nek1;
+    const uint iq3 = iv3 / (uint) args.rq3;
+    const uint ik3 = iv3 / (uint) args.rk3;
+
+    const uint S_v = (uint) args.S_v;
+    const uint SS  = S_v*S_v;
+    const uint H   = (uint) args.H;
+    const uint n_tokens = (uint) args.n_tokens;
+    const uint n_seqs   = (uint) args.n_seqs;
+    const uint neq1 = (uint) args.neq1;
+    const uint nek1 = (uint) args.nek1;
+    const bool kda  = args.kda != 0;
+
+    const uint n_q    = S_v * neq1 * n_tokens * (n_seqs / (uint) args.rq3);
+    const uint n_k    = S_v * nek1 * n_tokens * (n_seqs / (uint) args.rk3);
+    const uint n_v    = S_v * H * n_tokens * n_seqs;
+    const uint n_g    = (kda ? S_v : 1u) * H * n_tokens * n_seqs;
+    const uint n_beta = H * n_tokens * n_seqs;
+
+    const uint attn_score_elems    = S_v * H * n_tokens * n_seqs;
+    const uint state_size_per_snap = SS * H * n_seqs;
+    const uint state_seq_stride    = SS * H;
+
+    const uint g_q_off     = 0u;
+    const uint g_k_off     = g_q_off + n_q;
+    const uint g_v_off     = g_k_off + n_k;
+    const uint g_g_off     = g_v_off + n_v;
+    const uint g_beta_off  = g_g_off + n_g;
+    const uint g_state_off = g_beta_off + n_beta;
+
+    const uint traj_stride = n_tokens * SS;
+    const uint per_thread   = traj_stride + 4u*SS + 5u*S_v;
+    const uint base   = tid * per_thread;
+    const uint traj    = base;
+    const uint S1      = traj + traj_stride;
+    const uint Snew     = S1 + SS;
+    const uint dS       = Snew + SS;
+    const uint dS1      = dS + SS;
+    const uint pre      = dS1 + SS;
+    const uint delta    = pre + S_v;
+    const uint gexp     = delta + S_v;
+    const uint dpre     = gexp + S_v;
+    const uint ddelta   = dpre + S_v;
+
+    device atomic_float * atomic_dst = (device atomic_float *) data_dst;
+
+    // ---- forward recompute: fill the S_prev trajectory ----
+    const uint s0 = iv3*state_seq_stride + iv1*SS;
+    for (uint n = 0u; n < SS; ++n) {
+        data_scratch[traj + n] = data_state[s0 + n];
+    }
+
+    for (uint t = 0u; t + 1u < n_tokens; ++t) {
+        const uint k_off  = ik3*(uint)args.sk3 + t*(uint)args.sk2 + ik1*(uint)args.sk1;
+        const uint v_off  = iv3*(uint)args.sv3 + t*(uint)args.sv2 + iv1*(uint)args.sv1;
+        const uint gb_off = iv3*(uint)args.sb3 + t*(uint)args.sb2 + iv1*(uint)args.sb1;
+        const float beta_val = data_beta[gb_off];
+        const uint g_off = gb_off * (kda ? S_v : 1u);
+
+        const uint S_prev = traj + t*SS;
+        const uint S_next = traj + (t+1u)*SS;
+
+        if (kda) {
+            for (uint i = 0u; i < S_v; ++i) { data_scratch[gexp+i] = exp(data_g[g_off+i]); }
+        } else {
+            const float gv = exp(data_g[g_off]);
+            for (uint i = 0u; i < S_v; ++i) { data_scratch[gexp+i] = gv; }
+        }
+        for (uint j = 0u; j < S_v; ++j) {
+            for (uint i = 0u; i < S_v; ++i) {
+                data_scratch[S1 + i + j*S_v] = data_scratch[S_prev + i + j*S_v] * data_scratch[gexp+i];
+            }
+        }
+        for (uint j = 0u; j < S_v; ++j) {
+            float sum = 0.0f;
+            for (uint i = 0u; i < S_v; ++i) { sum += data_scratch[S1+i+j*S_v] * data_k[k_off+i]; }
+            data_scratch[delta+j] = (data_v[v_off+j] - sum) * beta_val;
+        }
+        for (uint j = 0u; j < S_v; ++j) {
+            for (uint i = 0u; i < S_v; ++i) {
+                data_scratch[S_next+i+j*S_v] = data_scratch[S1+i+j*S_v] + data_k[k_off+i]*data_scratch[delta+j];
+            }
+        }
+    }
+
+    // ---- reverse scan ----
+    for (uint n = 0u; n < SS; ++n) { data_scratch[dS+n] = 0.0f; }
+
+    for (int ti = (int) n_tokens - 1; ti >= 0; --ti) {
+        const uint t = (uint) ti;
+        const uint q_off  = iq3*(uint)args.sq3 + t*(uint)args.sq2 + iq1*(uint)args.sq1;
+        const uint k_off  = ik3*(uint)args.sk3 + t*(uint)args.sk2 + ik1*(uint)args.sk1;
+        const uint v_off  = iv3*(uint)args.sv3 + t*(uint)args.sv2 + iv1*(uint)args.sv1;
+        const uint gb_off = iv3*(uint)args.sb3 + t*(uint)args.sb2 + iv1*(uint)args.sb1;
+        const float beta_val = data_beta[gb_off];
+        const uint g_off = gb_off * (kda ? S_v : 1u);
+
+        const uint S_prev = traj + t*SS;
+
+        if (kda) {
+            for (uint i = 0u; i < S_v; ++i) { data_scratch[gexp+i] = exp(data_g[g_off+i]); }
+        } else {
+            const float gv = exp(data_g[g_off]);
+            for (uint i = 0u; i < S_v; ++i) { data_scratch[gexp+i] = gv; }
+        }
+        for (uint j = 0u; j < S_v; ++j) {
+            for (uint i = 0u; i < S_v; ++i) {
+                data_scratch[S1+i+j*S_v] = data_scratch[S_prev+i+j*S_v] * data_scratch[gexp+i];
+            }
+        }
+        for (uint j = 0u; j < S_v; ++j) {
+            float sum = 0.0f;
+            for (uint i = 0u; i < S_v; ++i) { sum += data_scratch[S1+i+j*S_v] * data_k[k_off+i]; }
+            data_scratch[pre+j]   = sum;
+            data_scratch[delta+j] = (data_v[v_off+j] - sum) * beta_val;
+        }
+        for (uint j = 0u; j < S_v; ++j) {
+            for (uint i = 0u; i < S_v; ++i) {
+                data_scratch[Snew+i+j*S_v] = data_scratch[S1+i+j*S_v] + data_k[k_off+i]*data_scratch[delta+j];
+            }
+        }
+
+        const uint d_out = (iv3*n_tokens*H + t*H + iv1) * S_v;
+
+        const uint gq_out = g_q_off + S_v*(iq1 + neq1*(t + n_tokens*iq3));
+        for (uint i = 0u; i < S_v; ++i) {
+            float dqi = 0.0f;
+            for (uint j = 0u; j < S_v; ++j) {
+                data_scratch[dS+i+j*S_v] += args.scale * data_grad[d_out+j] * data_q[q_off+i];
+                dqi += data_scratch[Snew+i+j*S_v] * data_grad[d_out+j];
+            }
+            atomic_fetch_add_explicit(&atomic_dst[gq_out+i], args.scale * dqi, memory_order_relaxed);
+        }
+
+        const uint target_slot = n_tokens - 1u - t;
+        if (target_slot < (uint) args.K) {
+            const uint d_snap = attn_score_elems + target_slot*state_size_per_snap + (iv3*H+iv1)*SS;
+            for (uint n = 0u; n < SS; ++n) {
+                data_scratch[dS+n] += data_grad[d_snap+n];
+            }
+        }
+
+        // step 3 backward: S_new = S1 + outer(k, delta)
+        for (uint n = 0u; n < SS; ++n) { data_scratch[dS1+n] = data_scratch[dS+n]; }
+        for (uint j = 0u; j < S_v; ++j) { data_scratch[ddelta+j] = 0.0f; }
+        const uint gk_out = g_k_off + S_v*(ik1 + nek1*(t + n_tokens*ik3));
+        for (uint i = 0u; i < S_v; ++i) {
+            float dki = 0.0f;
+            for (uint j = 0u; j < S_v; ++j) {
+                dki += data_scratch[dS+i+j*S_v] * data_scratch[delta+j];
+                data_scratch[ddelta+j] += data_scratch[dS+i+j*S_v] * data_k[k_off+i];
+            }
+            atomic_fetch_add_explicit(&atomic_dst[gk_out+i], dki, memory_order_relaxed);
+        }
+
+        // step 2 backward: delta[j] = beta*(v[j] - pre[j])
+        float dbeta_t = 0.0f;
+        for (uint j = 0u; j < S_v; ++j) { data_scratch[dpre+j] = -data_scratch[ddelta+j]*beta_val; }
+        for (uint j = 0u; j < S_v; ++j) {
+            dbeta_t += data_scratch[ddelta+j] * (data_v[v_off+j] - data_scratch[pre+j]);
+            data_dst[g_v_off + j + S_v*(iv1 + H*(t + n_tokens*iv3))] += data_scratch[ddelta+j]*beta_val;
+        }
+        data_dst[g_beta_off + iv1 + H*(t + n_tokens*iv3)] += dbeta_t;
+        for (uint j = 0u; j < S_v; ++j) {
+            for (uint i = 0u; i < S_v; ++i) {
+                data_scratch[dS1+i+j*S_v] += data_scratch[dpre+j]*data_k[k_off+i];
+            }
+        }
+        for (uint i = 0u; i < S_v; ++i) {
+            float dki2 = 0.0f;
+            for (uint j = 0u; j < S_v; ++j) { dki2 += data_scratch[dpre+j] * data_scratch[S1+i+j*S_v]; }
+            atomic_fetch_add_explicit(&atomic_dst[gk_out+i], dki2, memory_order_relaxed);
+        }
+
+        // step 1 backward: S1[i,j] = S_prev[i,j] * gexp[i]
+        if (kda) {
+            const uint gg_out = g_g_off + S_v*(iv1 + H*(t + n_tokens*iv3));
+            for (uint i = 0u; i < S_v; ++i) {
+                float dgexp_i = 0.0f;
+                for (uint j = 0u; j < S_v; ++j) {
+                    dgexp_i += data_scratch[dS1+i+j*S_v] * data_scratch[S_prev+i+j*S_v];
+                    data_scratch[dS+i+j*S_v] = data_scratch[dS1+i+j*S_v] * data_scratch[gexp+i];
+                }
+                data_dst[gg_out+i] += dgexp_i * data_scratch[gexp+i];
+            }
+        } else {
+            float dgexp_sum = 0.0f;
+            for (uint n = 0u; n < SS; ++n) { dgexp_sum += data_scratch[dS1+n]*data_scratch[S_prev+n]; }
+            for (uint n = 0u; n < SS; ++n) { data_scratch[dS+n] = data_scratch[dS1+n]*data_scratch[gexp+0]; }
+            data_dst[g_g_off + iv1 + H*(t + n_tokens*iv3)] += dgexp_sum * data_scratch[gexp+0];
+        }
+    }
+
+    const uint gs_out = g_state_off + iv3*state_seq_stride + iv1*SS;
+    for (uint n = 0u; n < SS; ++n) {
+        data_dst[gs_out+n] += data_scratch[dS+n];
+    }
+}
+
+
 // retro delta: stochastic rounding for F16 parameters. Mirrors
 // ggml_sr_uniform / ggml_stochastic_round_f16 in ggml-impl.h bit for bit -- an
 // exact CPU-vs-GPU equality test covers the three implementations.
@@ -65,6 +302,19 @@ kernel void kernel_opt_step_adamw_f16(
             updated, retro_sr_uniform(uint(pars[7]), gid)));
 }
 
+kernel void kernel_opt_step_sgd_f32(
+        constant    ggml_metal_kargs_opt_step_sgd & args,
+        device       float * x,
+        device const float * g,
+        device const float * pars,
+        uint        gid[[thread_position_in_grid]]) {
+
+    if (gid >= args.np) {
+        return;
+    }
+
+    x[gid] = x[gid] * (1.0f - pars[0] * pars[1]) - pars[0] * g[gid];
+}
 
 // retro delta: RMS-norm backward for LoRA training.
 // src0 = dz (grad of output), src1 = x (forward input), same shape. Per row:
@@ -126,6 +376,79 @@ kernel void kernel_rms_norm_back_f32(
 
     for (int i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) {
         dx[i00] = (dz[i00] + x[i00] * scale_x) * rrms;
+    }
+}
+
+// retro delta: L2-norm backward for LoRA training (Qwen3.5 gated delta net
+// k/q normalization). src0 = dz (grad of output), src1 = x (forward input),
+// same shape. Unlike RMS norm, l2_norm floors its forward scale at 1/eps
+// instead of adding eps under the sqrt, so the two regimes have different
+// gradients:
+//   norm > eps:  dx = (dz - x * (sum_xdz / sum_xx)) / norm
+//   norm <= eps: dx = dz / eps  (scale is a local constant, no cross term)
+// One threadgroup per row; mirrors kernel_rms_norm_back_f32.
+kernel void kernel_l2_norm_back_f32(
+        constant ggml_metal_kargs_l2_norm_back & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3 ntg[[threads_per_threadgroup]]) {
+    threadgroup float sh_xx [32];
+    threadgroup float sh_xdz[32];
+
+    if (sgitg == 0) {
+        sh_xx [tiisg] = 0.0f;
+        sh_xdz[tiisg] = 0.0f;
+    }
+
+    const int i01 = tgpig.x;
+    const int i02 = tgpig.y;
+    const int i03 = tgpig.z;
+
+    device const float * dz = (device const float *) (src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01);
+    device const float * x  = (device const float *) (src1 + i03*args.nb13 + i02*args.nb12 + i01*args.nb11);
+    device       float * dx = (device       float *) (dst  + i03*args.nb3  + i02*args.nb2  + i01*args.nb1);
+
+    float sum_xx  = 0.0f;
+    float sum_xdz = 0.0f;
+    for (int i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) {
+        const float xv = x[i00];
+        sum_xx  += xv * xv;
+        sum_xdz += xv * dz[i00];
+    }
+    sum_xx  = simd_sum(sum_xx);
+    sum_xdz = simd_sum(sum_xdz);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiisg == 0) {
+        sh_xx [sgitg] = sum_xx;
+        sh_xdz[sgitg] = sum_xdz;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sum_xx  = simd_sum(sh_xx [tiisg]);
+    sum_xdz = simd_sum(sh_xdz[tiisg]);
+
+    const float norm = sqrt(sum_xx);
+
+    float scale_g;
+    float scale_x;
+    if (norm > args.eps) {
+        scale_g = 1.0f / norm;
+        scale_x = -scale_g * sum_xdz / sum_xx;
+    } else {
+        scale_g = 1.0f / args.eps;
+        scale_x = 0.0f;
+    }
+
+    for (int i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) {
+        dx[i00] = dz[i00] * scale_g + x[i00] * scale_x;
     }
 }
 

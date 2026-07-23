@@ -4366,6 +4366,94 @@ void ggml_compute_forward_l2_norm(
     }
 }
 
+// retro delta: analytic backward for GGML_OP_L2_NORM.
+//
+// forward: y = x * scale, scale = 1/max(norm, eps), norm = sqrt(sum(x*x))
+//
+// Unlike RMS norm, l2_norm floors the scale at 1/eps instead of adding eps
+// under the sqrt, so the two regimes have different gradients:
+//   - norm > eps: scale depends on x, so
+//         dx = (dz - x * (sum(x*dz) / (norm*norm))) * scale
+//   - norm <= eps: scale == 1/eps is locally constant (subgradient), so
+//         dx = dz * scale
+static void ggml_compute_forward_l2_norm_back_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0]; // gradients from forward pass output
+    const ggml_tensor * src1 = dst->src[1]; // src0 (x) from forward pass
+
+    GGML_ASSERT(ggml_are_same_shape(src0, dst) && ggml_are_same_shape(src0, src1));
+
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+    GGML_ASSERT(src1->nb[0] == sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    for (int64_t i03 = 0; i03 < ne03; i03++) {
+        for (int64_t i02 = 0; i02 < ne02; i02++) {
+            for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
+                const int64_t i11 = i01;
+                const int64_t i12 = i02;
+                const int64_t i13 = i03;
+
+                const float * dz = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
+                const float * x  = (float *) ((char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13);
+
+                ggml_float sum_xx = 0.0;
+                ggml_float sum_xdz = 0.0;
+
+                for (int64_t i00 = 0; i00 < ne00; i00++) {
+                    sum_xx  += (ggml_float)(x[i00] * x[i00]);
+                    sum_xdz += (ggml_float)(x[i00] * dz[i00]);
+                }
+
+                float * dx = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
+
+                const float norm = sqrtf((float) sum_xx);
+
+                if (norm > eps) {
+                    const float scale   = 1.0f / norm;
+                    const float scale_x = (float) (-sum_xdz) / (float) sum_xx;
+                    for (int64_t i00 = 0; i00 < ne00; i00++) {
+                        dx[i00] = (dz[i00] + x[i00] * scale_x) * scale;
+                    }
+                } else {
+                    const float scale = 1.0f / eps;
+                    for (int64_t i00 = 0; i00 < ne00; i00++) {
+                        dx[i00] = dz[i00] * scale;
+                    }
+                }
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_l2_norm_back(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_l2_norm_back_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_out_prod
 
 static void ggml_compute_forward_out_prod_f32(
@@ -11121,6 +11209,11 @@ static void ggml_compute_forward_solve_tri_f32(const struct ggml_compute_params 
     const int ith = params->ith;
     const int nth = params->nth;
 
+    // retro delta: op_params[0] selects lower (forward substitution, the
+    // upstream default) vs upper (back substitution). The upper branch backs
+    // the GATED_DELTA_NET backward pass's A^T solve.
+    const bool lower = ggml_get_op_params_i32(dst, 0) != 0;
+
     const int64_t k = ne10;   // number of RHS columns
     const int64_t n = ne11;   // A is n×n
     const int64_t nr = ne02 * ne03 * k; // we're parallelizing on columns here, so seq x token x column will be the unit
@@ -11146,16 +11239,30 @@ static void ggml_compute_forward_solve_tri_f32(const struct ggml_compute_params 
 
         float * X_batch = X + i02 * nb2 / sizeof(float) + i03 * nb3 / sizeof(float);
 
-        for (int64_t i00 = 0; i00 < n; ++i00) {
-            float sum = 0.0f;
-            for (int64_t t = 0; t < i00; ++t) {
-                sum += A_batch[i00 * n + t] * X_batch[t * k + i01];
+        if (lower) {
+            for (int64_t i00 = 0; i00 < n; ++i00) {
+                float sum = 0.0f;
+                for (int64_t t = 0; t < i00; ++t) {
+                    sum += A_batch[i00 * n + t] * X_batch[t * k + i01];
+                }
+
+                const float diag = A_batch[i00 * n + i00];
+                assert(diag != 0.0f && "Zero diagonal in triangular matrix");
+
+                X_batch[i00 * k + i01] = (B_batch[i00 * k + i01] - sum) / diag;
             }
+        } else {
+            for (int64_t i00 = n - 1; i00 >= 0; --i00) {
+                float sum = 0.0f;
+                for (int64_t t = i00 + 1; t < n; ++t) {
+                    sum += A_batch[i00 * n + t] * X_batch[t * k + i01];
+                }
 
-            const float diag = A_batch[i00 * n + i00];
-            assert(diag != 0.0f && "Zero diagonal in triangular matrix");
+                const float diag = A_batch[i00 * n + i00];
+                assert(diag != 0.0f && "Zero diagonal in triangular matrix");
 
-            X_batch[i00 * k + i01] = (B_batch[i00 * k + i01] - sum) / diag;
+                X_batch[i00 * k + i01] = (B_batch[i00 * k + i01] - sum) / diag;
+            }
         }
     }
 }
@@ -11384,6 +11491,276 @@ void ggml_compute_forward_gated_delta_net(
     }
 }
 
+
+// ggml_compute_forward_gated_delta_net_back
+//
+// retro delta: analytic backward for GGML_OP_GATED_DELTA_NET. Per (head, seq)
+// the forward op is a sequential recurrence over tokens (see
+// ggml_compute_forward_gated_delta_net_one_chunk):
+//   S1        = S_prev * diag(gexp)     (gexp = exp(g); per-row for KDA, scalar otherwise)
+//   pre[j]    = sum_i S1[i,j] * k[i]
+//   delta[j]  = beta * (v[j] - pre[j])
+//   S_new     = S1 + outer(k, delta)
+//   out[j]    = scale * sum_i S_new[i,j] * q[i]
+// S_new becomes S_prev for the next token, and/or a rollback snapshot read
+// directly from the packed output. This mirrors ggml_compute_forward_ssm_scan_back's
+// structure: recompute the state trajectory forward once, then reverse-scan
+// it, accumulating the state adjoint and each token's input gradients.
+//
+// Parallelized across sequences only (n_seqs), not heads: q/k can be
+// broadcast across several v-heads (H_v % H_k == 0), so every v-head sharing
+// a given q/k head must land in one thread to stay race-free without atomics.
+static void ggml_compute_forward_gated_delta_net_back_f32(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * src_q     = dst->src[0];
+    const ggml_tensor * src_k     = dst->src[1];
+    const ggml_tensor * src_v     = dst->src[2];
+    const ggml_tensor * src_g     = dst->src[3];
+    const ggml_tensor * src_beta  = dst->src[4];
+    const ggml_tensor * src_state = dst->src[5];
+    const ggml_tensor * src_grad  = dst->src[6];
+
+    const int64_t S_v      = src_v->ne[0];
+    const int64_t H        = src_v->ne[1];
+    const int64_t n_tokens = src_v->ne[2];
+    const int64_t n_seqs   = src_v->ne[3];
+
+    GGML_TENSOR_LOCALS(int64_t, neq, src_q, ne);
+    GGML_TENSOR_LOCALS(size_t,  nbq, src_q, nb);
+    GGML_TENSOR_LOCALS(int64_t, nek, src_k, ne);
+    GGML_TENSOR_LOCALS(size_t,  nbk, src_k, nb);
+    GGML_TENSOR_LOCALS(size_t,  nbv, src_v, nb);
+    GGML_TENSOR_LOCALS(int64_t, neg, src_g, ne);
+    GGML_TENSOR_LOCALS(size_t,  nbg, src_g, nb);
+    GGML_TENSOR_LOCALS(size_t,  nbb, src_beta, nb);
+
+    const bool kda = (neg0 == S_v);
+    const int64_t K = ggml_get_op_params_i32(dst, 0);
+    GGML_ASSERT(K >= 1);
+
+    const int64_t rq3 = src_v->ne[3] / neq3;
+    const int64_t rk3 = src_v->ne[3] / nek3;
+
+    const float scale = 1.0f / sqrtf((float) S_v);
+
+    // packed output: [ grad_q | grad_k | grad_v | grad_g | grad_beta | grad_state ]
+    const int64_t n_q    = ggml_nelements(src_q);
+    const int64_t n_k    = ggml_nelements(src_k);
+    const int64_t n_v    = ggml_nelements(src_v);
+    const int64_t n_g    = ggml_nelements(src_g);
+    const int64_t n_beta = ggml_nelements(src_beta);
+
+    float * g_q     = (float *) dst->data;
+    float * g_k     = g_q + n_q;
+    float * g_v     = g_k + n_k;
+    float * g_g     = g_v + n_v;
+    float * g_beta  = g_g + n_g;
+    float * g_state = g_beta + n_beta;
+
+    if (params->ith == 0) {
+        memset(dst->data, 0, ggml_nbytes(dst));
+    }
+    ggml_barrier(params->threadpool);
+
+    const int64_t attn_score_elems    = S_v * H * n_tokens * n_seqs;
+    const int64_t state_size_per_snap = S_v * S_v * H * n_seqs;
+    const float * grad_attn_base  = (const float *) src_grad->data;
+    const float * grad_state_base = (const float *) src_grad->data + attn_score_elems;
+
+    const int64_t state_seq_stride = src_state->nb[3] / sizeof(float);
+    const float * state_in_base = (const float *) src_state->data;
+
+    std::vector<float> traj((size_t) n_tokens * S_v * S_v); // traj[t]: S_prev at token t
+    std::vector<float> S1(S_v * S_v);
+    std::vector<float> Snew(S_v * S_v);
+    std::vector<float> pre(S_v);
+    std::vector<float> delta(S_v);
+    std::vector<float> gexp(S_v);
+    std::vector<float> dS(S_v * S_v);  // adjoint of S_new at the current t
+    std::vector<float> dS1(S_v * S_v);
+    std::vector<float> dpre(S_v);
+    std::vector<float> ddelta(S_v);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    for (int64_t iv3 = ith; iv3 < n_seqs; iv3 += nth) {
+        for (int64_t iv1 = 0; iv1 < H; ++iv1) {
+            const int64_t iq1 = iv1 % neq1;
+            const int64_t ik1 = iv1 % nek1;
+            const int64_t iq3 = iv3 / rq3;
+            const int64_t ik3 = iv3 / rk3;
+
+            // ---- forward recompute: fill the S_prev trajectory ----
+            const float * s0 = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
+            memcpy(traj.data(), s0, S_v * S_v * sizeof(float));
+
+            for (int64_t t = 0; t < n_tokens - 1; ++t) {
+                const float * k_d = (const float *)((const char *)src_k->data + ik3*nbk3 + t*nbk2 + ik1*nbk1);
+                const float * v_d = (const float *)((const char *)src_v->data + iv3*nbv3 + t*nbv2 + iv1*nbv1);
+                const float beta_val = *(const float *)((const char *)src_beta->data + iv3*nbb3 + t*nbb2 + iv1*nbb1);
+                const float * g_d = (const float *)((const char *)src_g->data + iv3*nbg3 + t*nbg2 + iv1*nbg1);
+
+                float * S_prev = traj.data() + t * S_v * S_v;
+                float * S_next = traj.data() + (t + 1) * S_v * S_v;
+
+                if (kda) {
+                    for (int64_t i = 0; i < S_v; ++i) { gexp[i] = expf(g_d[i]); }
+                } else {
+                    std::fill(gexp.begin(), gexp.end(), expf(g_d[0]));
+                }
+                for (int64_t j = 0; j < S_v; ++j) {
+                    for (int64_t i = 0; i < S_v; ++i) {
+                        S1[i + j*S_v] = S_prev[i + j*S_v] * gexp[i];
+                    }
+                }
+                for (int64_t j = 0; j < S_v; ++j) {
+                    float sum = 0.0f;
+                    for (int64_t i = 0; i < S_v; ++i) { sum += S1[i + j*S_v] * k_d[i]; }
+                    delta[j] = (v_d[j] - sum) * beta_val;
+                }
+                for (int64_t j = 0; j < S_v; ++j) {
+                    for (int64_t i = 0; i < S_v; ++i) {
+                        S_next[i + j*S_v] = S1[i + j*S_v] + k_d[i] * delta[j];
+                    }
+                }
+            }
+
+            // ---- reverse scan ----
+            std::fill(dS.begin(), dS.end(), 0.0f);
+
+            for (int64_t t = n_tokens - 1; t >= 0; --t) {
+                const float * q_d = (const float *)((const char *)src_q->data + iq3*nbq3 + t*nbq2 + iq1*nbq1);
+                const float * k_d = (const float *)((const char *)src_k->data + ik3*nbk3 + t*nbk2 + ik1*nbk1);
+                const float * v_d = (const float *)((const char *)src_v->data + iv3*nbv3 + t*nbv2 + iv1*nbv1);
+                const float beta_val = *(const float *)((const char *)src_beta->data + iv3*nbb3 + t*nbb2 + iv1*nbb1);
+                const float * g_d = (const float *)((const char *)src_g->data + iv3*nbg3 + t*nbg2 + iv1*nbg1);
+
+                const float * S_prev = traj.data() + t * S_v * S_v;
+
+                // recompute this token's forward quantities
+                if (kda) {
+                    for (int64_t i = 0; i < S_v; ++i) { gexp[i] = expf(g_d[i]); }
+                } else {
+                    std::fill(gexp.begin(), gexp.end(), expf(g_d[0]));
+                }
+                for (int64_t j = 0; j < S_v; ++j) {
+                    for (int64_t i = 0; i < S_v; ++i) {
+                        S1[i + j*S_v] = S_prev[i + j*S_v] * gexp[i];
+                    }
+                }
+                for (int64_t j = 0; j < S_v; ++j) {
+                    float sum = 0.0f;
+                    for (int64_t i = 0; i < S_v; ++i) { sum += S1[i + j*S_v] * k_d[i]; }
+                    pre[j]   = sum;
+                    delta[j] = (v_d[j] - sum) * beta_val;
+                }
+                for (int64_t j = 0; j < S_v; ++j) {
+                    for (int64_t i = 0; i < S_v; ++i) {
+                        Snew[i + j*S_v] = S1[i + j*S_v] + k_d[i] * delta[j];
+                    }
+                }
+
+                // dS currently holds dL/dS_new_t inherited from token t+1 (0 if t == n_tokens-1).
+                // add this token's own contributions: the attention-output gradient and,
+                // when this S_new_t is a rollback snapshot, its direct gradient.
+                const float * d_out = grad_attn_base + (iv3 * n_tokens * H + t * H + iv1) * S_v;
+
+                float * gq_out = g_q + S_v * (iq1 + neq1 * (t + n_tokens * iq3));
+                for (int64_t i = 0; i < S_v; ++i) {
+                    float dqi = 0.0f;
+                    for (int64_t j = 0; j < S_v; ++j) {
+                        dS[i + j*S_v] += scale * d_out[j] * q_d[i];
+                        dqi += Snew[i + j*S_v] * d_out[j];
+                    }
+                    gq_out[i] += scale * dqi;
+                }
+
+                const int64_t target_slot = n_tokens - 1 - t;
+                if (target_slot < K) {
+                    const float * d_snap = grad_state_base + target_slot * state_size_per_snap
+                            + (iv3 * H + iv1) * S_v * S_v;
+                    for (int64_t n = 0; n < S_v * S_v; ++n) {
+                        dS[n] += d_snap[n];
+                    }
+                }
+
+                // step 3 backward: S_new = S1 + outer(k, delta)
+                std::copy(dS.begin(), dS.end(), dS1.begin());
+                for (int64_t j = 0; j < S_v; ++j) { ddelta[j] = 0.0f; }
+                float * gk_out = g_k + S_v * (ik1 + nek1 * (t + n_tokens * ik3));
+                for (int64_t i = 0; i < S_v; ++i) {
+                    float dki = 0.0f;
+                    for (int64_t j = 0; j < S_v; ++j) {
+                        dki       += dS[i + j*S_v] * delta[j];
+                        ddelta[j] += dS[i + j*S_v] * k_d[i];
+                    }
+                    gk_out[i] += dki;
+                }
+
+                // step 2 backward: delta[j] = beta*(v[j] - pre[j])
+                float dbeta_t = 0.0f;
+                for (int64_t j = 0; j < S_v; ++j) { dpre[j] = -ddelta[j] * beta_val; }
+                for (int64_t j = 0; j < S_v; ++j) {
+                    dbeta_t += ddelta[j] * (v_d[j] - pre[j]);
+                    g_v[j + S_v * (iv1 + H * (t + n_tokens * iv3))] += ddelta[j] * beta_val;
+                }
+                g_beta[iv1 + H * (t + n_tokens * iv3)] += dbeta_t;
+                for (int64_t j = 0; j < S_v; ++j) {
+                    for (int64_t i = 0; i < S_v; ++i) {
+                        dS1[i + j*S_v] += dpre[j] * k_d[i];
+                    }
+                }
+                for (int64_t i = 0; i < S_v; ++i) {
+                    float dki2 = 0.0f;
+                    for (int64_t j = 0; j < S_v; ++j) { dki2 += dpre[j] * S1[i + j*S_v]; }
+                    gk_out[i] += dki2;
+                }
+
+                // step 1 backward: S1[i,j] = S_prev[i,j] * gexp[i]
+                if (kda) {
+                    float * gg_out = g_g + S_v * (iv1 + H * (t + n_tokens * iv3));
+                    for (int64_t i = 0; i < S_v; ++i) {
+                        float dgexp_i = 0.0f;
+                        for (int64_t j = 0; j < S_v; ++j) {
+                            dgexp_i += dS1[i + j*S_v] * S_prev[i + j*S_v];
+                            dS[i + j*S_v] = dS1[i + j*S_v] * gexp[i]; // -> dS_prev, becomes next iter's dS
+                        }
+                        gg_out[i] += dgexp_i * gexp[i];
+                    }
+                } else {
+                    float dgexp_sum = 0.0f;
+                    for (int64_t n = 0; n < S_v * S_v; ++n) { dgexp_sum += dS1[n] * S_prev[n]; }
+                    for (int64_t n = 0; n < S_v * S_v; ++n) { dS[n] = dS1[n] * gexp[0]; }
+                    g_g[iv1 + H * (t + n_tokens * iv3)] += dgexp_sum * gexp[0];
+                }
+            }
+
+            // dS now holds dL/d(state_in) for this (head, seq)
+            float * gs_out = g_state + iv3 * state_seq_stride + iv1 * S_v * S_v;
+            for (int64_t n = 0; n < S_v * S_v; ++n) { gs_out[n] += dS[n]; }
+        }
+    }
+}
+
+void ggml_compute_forward_gated_delta_net_back(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_gated_delta_net_back_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
 
 // ggml_compute_forward_dsv4_hc_comb
 

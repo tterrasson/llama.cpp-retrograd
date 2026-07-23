@@ -240,6 +240,10 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
             {
                 res += ggml_metal_op_ssm_scan_back_extra_tmp(tensor);
             } break;
+        case GGML_OP_GATED_DELTA_NET_BACK: // retro delta
+            {
+                res += ggml_metal_op_gated_delta_net_back_extra_tmp(tensor);
+            } break;
         case GGML_OP_CUMSUM:
         case GGML_OP_ARGSORT:
             {

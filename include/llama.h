@@ -414,6 +414,15 @@ extern "C" {
         // step; only a training context wants it.
         bool kv_differentiable;
 
+        // retro delta: force the Gated Delta Net graph builder (Qwen3-Next /
+        // Qwen3.5) onto its unfused, primitive-op chunking path instead of the
+        // fused GGML_OP_GATED_DELTA_NET kernel. The fused op has no gradient
+        // rule; the unfused path is built entirely from ops ggml_compute_backward
+        // already differentiates (or now does: TRI, CUMSUM, SOLVE_TRI, FILL).
+        // Only a training context wants this — the fused kernel stays default
+        // for inference/generation contexts.
+        bool no_fused_gdn;
+
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)

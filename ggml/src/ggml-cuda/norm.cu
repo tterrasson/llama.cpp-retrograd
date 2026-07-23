@@ -407,6 +407,78 @@ static void rms_norm_mul_f32_cuda(const float *  x,
     }
 }
 
+// retro delta: analytic backward for GGML_OP_L2_NORM. Mirrors
+// rms_norm_back_f32 but without the /ncols mean and with l2_norm's
+// max(norm, eps) floor: when norm > eps the gradient carries the usual
+// cross term, when norm <= eps the forward scale is the local constant
+// 1/eps so no cross term applies.
+template <int block_size>
+static __global__ void l2_norm_back_f32(
+        const float * grad, const float * xf, float * dst, const int ncols, const float eps) {
+    const int row = blockIdx.x*blockDim.y + threadIdx.y;
+    const int tid = threadIdx.x;
+
+    grad += int64_t(row)*ncols;
+    xf   += int64_t(row)*ncols;
+    dst  += int64_t(row)*ncols;
+
+    float sum_xx = 0.0f;
+    float sum_xg = 0.0f;
+
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xfi = xf[col];
+        sum_xx += xfi * xfi;
+        sum_xg += xfi * grad[col];
+    }
+
+    sum_xx = warp_reduce_sum(sum_xx);
+    sum_xg = warp_reduce_sum(sum_xg);
+    if constexpr (block_size > WARP_SIZE) {
+        static_assert(block_size == 1024, "unexpected block_size");
+        __shared__ float s_sum_xx[32];
+        __shared__ float s_sum_xg[32];
+        const int warp_id = threadIdx.x / WARP_SIZE;
+        const int lane_id = threadIdx.x % WARP_SIZE;
+        if (lane_id == 0) {
+            s_sum_xx[warp_id] = sum_xx;
+            s_sum_xg[warp_id] = sum_xg;
+        }
+        __syncthreads();
+
+        sum_xx = s_sum_xx[lane_id];
+        sum_xx = warp_reduce_sum(sum_xx);
+
+        sum_xg = s_sum_xg[lane_id];
+        sum_xg = warp_reduce_sum(sum_xg);
+    }
+
+    const float norm = sqrtf(sum_xx);
+
+    float scale_grad;
+    float scale_x;
+    if (norm > eps) {
+        scale_grad = 1.0f / norm;
+        scale_x    = -scale_grad * sum_xg / sum_xx;
+    } else {
+        scale_grad = 1.0f / eps;
+        scale_x    = 0.0f;
+    }
+
+    for (int col = tid; col < ncols; col += block_size) {
+        dst[col] = scale_grad*grad[col] + scale_x*xf[col];
+    }
+}
+
+static void l2_norm_back_f32_cuda(const float * grad, const float * xf, float * dst, const int ncols, const int nrows, const float eps, cudaStream_t stream) {
+    if (ncols < 1024) {
+        const dim3 block_dims(WARP_SIZE, 1, 1);
+        l2_norm_back_f32<WARP_SIZE><<<nrows, block_dims, 0, stream>>>(grad, xf, dst, ncols, eps);
+    } else {
+        const dim3 block_dims(1024, 1, 1);
+        l2_norm_back_f32<1024><<<nrows, block_dims, 0, stream>>>(grad, xf, dst, ncols, eps);
+    }
+}
+
 static void rms_norm_back_f32_cuda(const float * grad, const float * xf, float * dst, const int ncols, const int nrows, const float eps, cudaStream_t stream) {
     if (ncols < 1024) {
         const dim3 block_dims(WARP_SIZE, 1, 1);
@@ -695,4 +767,32 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s03 = nb03 / ts0;
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+}
+
+// retro delta: analytic backward for GGML_OP_L2_NORM
+void ggml_cuda_op_l2_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * grad  = dst->src[0]; // gradients
+    const ggml_tensor * src0f = dst->src[1]; // src0 from forward pass
+
+    const float * grad_d  = (const float *) grad->data;
+    const float * src0f_d = (const float *) src0f->data;
+    float       * dst_d   = (float       *) dst->data;
+
+    cudaStream_t stream = ctx.stream();
+
+    GGML_ASSERT(ggml_is_contiguous(grad));
+    GGML_ASSERT(ggml_is_contiguous(src0f));
+
+    GGML_ASSERT( grad->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0f->type == GGML_TYPE_F32);
+    GGML_ASSERT(  dst->type == GGML_TYPE_F32);
+
+    const int64_t ne00 = src0f->ne[0];
+    const int64_t nrows = ggml_nrows(src0f);
+
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    l2_norm_back_f32_cuda(grad_d, src0f_d, dst_d, ne00, nrows, eps, stream);
 }

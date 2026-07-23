@@ -131,6 +131,17 @@ llama_context::llama_context(
                         __func__, cparams.n_rs_seq);
         cparams.n_rs_seq = 0;
     }
+    // retro delta: recurrent-state rollback (llm_arch_supports_rs_rollback,
+    // currently Qwen3.5/Qwen3.5-MoE only) is written by the fused Gated Delta
+    // Net kernel's K-snapshot output; the differentiable chunking path used
+    // when no_fused_gdn is set only ever produces the final state, so a
+    // rollback slot would silently read stale/uninitialized data. Clamp it
+    // off instead — training falls back to full-sequence rescoring.
+    if (cparams.n_rs_seq > 0 && params.no_fused_gdn) {
+        LLAMA_LOG_DEBUG("%s: no_fused_gdn requested; clamping n_rs_seq to 0 "
+                        "(recurrent-state rollback needs the fused, non-differentiable GDN kernel)\n", __func__);
+        cparams.n_rs_seq = 0;
+    }
 
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;
@@ -253,8 +264,12 @@ llama_context::llama_context(
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
 
-    cparams.fused_gdn_ar = true;
-    cparams.fused_gdn_ch = true;
+    // retro delta: training contexts need the differentiable, unfused Gated
+    // Delta Net graph; the fused op has no gradient rule (see llama.h's
+    // no_fused_gdn doc comment). auto_fgdn stays off, as upstream: the probe
+    // only ever turns the fused paths back on.
+    cparams.fused_gdn_ar = !params.no_fused_gdn;
+    cparams.fused_gdn_ch = !params.no_fused_gdn;
     cparams.auto_fgdn    = false;
 
     cparams.fused_lid = true;
@@ -4561,6 +4576,7 @@ llama_context_params llama_context_default_params() {
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
         /*.kv_differentiable           =*/ false,
+        /*.no_fused_gdn                =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

@@ -1041,6 +1041,21 @@ typedef struct {
     uint64_t nb_out; // 0 => snapshots are appended after the attn scores (unfused)
 } ggml_metal_kargs_gated_delta_net;
 
+// retro delta: analytic backward for GATED_DELTA_NET (Qwen3-Next / KDA),
+// mirroring the CPU reference (ggml-cpu/ops.cpp) and the CUDA/Vulkan ports
+// (gated-delta-net-back.cu / gated_delta_net_back.comp). Strides are in
+// float elements; K is the rollback-snapshot slot count.
+typedef struct {
+    int32_t  S_v, H, n_tokens, n_seqs, K;
+    int32_t  neq1, nek1, rq3, rk3;
+    int32_t  sq1, sq2, sq3;
+    int32_t  sk1, sk2, sk3;
+    int32_t  sv1, sv2, sv3;
+    int32_t  sb1, sb2, sb3;
+    int32_t  kda;
+    float    scale;
+} ggml_metal_kargs_gated_delta_net_back;
+
 typedef struct {
     int32_t  ne00;
     int32_t  ne01;
@@ -1411,6 +1426,16 @@ typedef struct {
     uint64_t nb11; uint64_t nb12; uint64_t nb13; // src1 = x  (forward input)
     uint64_t nb1;  uint64_t nb2;  uint64_t nb3;  // dst
 } ggml_metal_kargs_rms_norm_back;
+
+// retro delta: L2-norm backward (LoRA training on Metal; Qwen3.5 gated delta
+// net k/q normalization)
+typedef struct {
+     int32_t ne00;
+     float   eps;
+    uint64_t nb01; uint64_t nb02; uint64_t nb03; // src0 = dz (grad)
+    uint64_t nb11; uint64_t nb12; uint64_t nb13; // src1 = x  (forward input)
+    uint64_t nb1;  uint64_t nb2;  uint64_t nb3;  // dst
+} ggml_metal_kargs_l2_norm_back;
 
 // retro delta: out-prod / weight-gradient GEMM (LoRA training on Metal)
 // src1/dst strides are in ELEMENTS (host divides byte strides by sizeof(float));
