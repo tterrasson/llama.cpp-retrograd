@@ -20521,7 +20521,15 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 const ggml_tensor * w       = back ? op->src[2] : op->src[1];
                 const ggml_tensor * targets = back ? op->src[3] : op->src[2];
                 const ggml_tensor * weights = back ? op->src[4] : op->src[3];
+                const ggml_tensor * bias    = back ? op->src[5] : op->src[4];
                 if (!h || !w || !targets || !weights) {
+                    return false;
+                }
+                // retro delta: the Vulkan kernels do not implement the optional
+                // per-vocab bias yet (see ggml_fused_sparse_ce). Reject explicitly
+                // rather than silently dropping it — ggml_backend_sched must not
+                // schedule this node here when a bias is present.
+                if (bias != nullptr) {
                     return false;
                 }
                 if (back && (op->src[0] == nullptr || op->src[0]->type != GGML_TYPE_F32)) {

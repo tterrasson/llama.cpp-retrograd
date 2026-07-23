@@ -3062,8 +3062,11 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_FUSED_SPARSE_CE_BACK:
                     {
                         // retro delta: per-thread dequantization scratch for one
-                        // projection-head row (n_embd = src[1]->ne[0], src[1] = h).
-                        cur = ggml_type_size(GGML_TYPE_F32)*node->src[1]->ne[0]*n_tasks;
+                        // projection-head row plus a per-thread copy of the hidden
+                        // column, which the backward reads after it has started
+                        // writing grad_h over it (feature 3 in-place aliasing).
+                        // n_embd = src[1]->ne[0], src[1] = h.
+                        cur = ggml_type_size(GGML_TYPE_F32)*2*node->src[1]->ne[0]*n_tasks;
                     } break;
                 case GGML_OP_GATED_DELTA_NET:
                     {

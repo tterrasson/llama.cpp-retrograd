@@ -5600,6 +5600,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             const ggml_tensor * w       = back ? op->src[2] : op->src[1];
             const ggml_tensor * targets = back ? op->src[3] : op->src[2];
             const ggml_tensor * weights = back ? op->src[4] : op->src[3];
+            const ggml_tensor * bias    = back ? op->src[5] : op->src[4]; // retro delta: optional [n_vocab] F32 bias
             if (!h || !w || !targets || !weights ||
                     (back && (!grad || grad->type != GGML_TYPE_F32)) ||
                     h->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
@@ -5608,6 +5609,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     weights->ne[0] != h->ne[1] || !ggml_is_contiguous(h) ||
                     !ggml_is_contiguous(w) || !ggml_is_contiguous(targets) ||
                     !ggml_is_contiguous(weights) || !ggml_is_contiguous(op) ||
+                    (bias && (bias->type != GGML_TYPE_F32 || bias->ne[0] != w->ne[1] ||
+                            !ggml_is_contiguous(bias))) ||
                     (back && h->ne[0] > 8192)) {
                 return false;
             }

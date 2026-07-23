@@ -50,6 +50,29 @@ bool ggml_op_can_inplace(enum ggml_op op) {
     }
 }
 
+// retro delta (plan rl/OPTIMIZE feature 3): FUSED_SPARSE_CE_BACK can write grad_h
+// straight over the hidden states it reads, but only when the node was built with
+// offload_h set (op_params[2]) — the backends then stage each token chunk out of
+// `h` before overwriting it. Without the flag the kernels read `h` while writing
+// `dst` and must not alias, so the decision is per node, not per op.
+static bool ggml_node_can_inplace(const struct ggml_tensor * node) {
+    if (node->op == GGML_OP_FUSED_SPARSE_CE_BACK) {
+        return ggml_get_op_params_i32(node, 2) != 0;
+    }
+    return ggml_op_can_inplace(node->op);
+}
+
+// Which sources a node may take its buffer from. FUSED_SPARSE_CE_BACK only ever
+// aliases the hidden states (src[1]); the same-layout test alone would in
+// principle also accept the projection head, and reusing that would be silent
+// corruption of a model weight.
+static bool ggml_node_can_inplace_src(const struct ggml_tensor * node, int i) {
+    if (node->op == GGML_OP_FUSED_SPARSE_CE_BACK) {
+        return i == 1;
+    }
+    return true;
+}
+
 static size_t aligned_offset(const void * buffer, size_t offset, size_t alignment) {
     assert(alignment && !(alignment & (alignment - 1))); // power of 2
     size_t align = (alignment - (((uintptr_t)buffer + offset) % alignment)) % alignment;
@@ -629,10 +652,10 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
         assert(hn->addr.offset == 0);
 
         // try to reuse a parent's buffer (inplace)
-        if (ggml_op_can_inplace(node->op)) {
+        if (ggml_node_can_inplace(node)) {
             for (int i = 0; i < GGML_MAX_SRC; i++) {
                 struct ggml_tensor * parent = node->src[i];
-                if (parent == NULL) {
+                if (parent == NULL || !ggml_node_can_inplace_src(node, i)) {
                     continue;
                 }
 

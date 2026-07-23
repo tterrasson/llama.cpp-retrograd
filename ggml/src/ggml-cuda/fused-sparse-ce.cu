@@ -10,6 +10,12 @@
 // [min(tile, 1024), n_tokens] logits, never [n_vocab, n_tokens].  Each tile is
 // folded into an online F32 log-sum-exp; backward recomputes it, converts the
 // tile to scaled probabilities, and accumulates grad_h with another GEMM.
+//
+// retro delta: optional fixed per-vocab bias (src[4] forward / src[5]
+// backward, may be null). Added to every GEMM tile right after cuBLAS and
+// before it is folded into the log-sum-exp / turned into probabilities, so it
+// participates in the softmax exactly like the CPU oracle. The bias never
+// receives a gradient, so the grad_h GEMMs are untouched.
 
 static __global__ void fused_sparse_ce_count_active(
         const int32_t * targets, const float * weights, int32_t * n_active,
@@ -29,17 +35,35 @@ static __global__ void fused_sparse_ce_init(float * maxima, float * sums, float 
     }
 }
 
+static __global__ void fused_sparse_ce_add_bias(
+        float * logits, const float * bias, int64_t v0,
+        int64_t tile_size, int64_t tile_stride, int64_t n_tokens) {
+    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    const int64_t n = tile_size*n_tokens;
+    if (i >= n) {
+        return;
+    }
+    const int64_t t = i/tile_size;
+    const int64_t v = i - t*tile_size;
+    logits[t*tile_stride + v] += bias[v0 + v];
+}
+
+// retro delta (plan rl/OPTIMIZE feature 1): logits holds only the current token
+// chunk [tile_size, nt_tok], so it is indexed by the local token lt while the
+// per-token state (maxima/sums/target_logits/targets) is indexed by the global
+// token t0_tok + lt.
 static __global__ void fused_sparse_ce_update_lse(
         const float * logits, const int32_t * targets, float * maxima,
         float * sums, float * target_logits, int64_t tile_start,
-        int64_t tile_size, int64_t tile_stride, int64_t n_tokens) {
-    const int64_t t = blockIdx.x;
-    if (t >= n_tokens || threadIdx.x != 0) {
+        int64_t tile_size, int64_t tile_stride, int64_t t0_tok, int64_t nt_tok) {
+    const int64_t lt = blockIdx.x;
+    if (lt >= nt_tok || threadIdx.x != 0) {
         return;
     }
+    const int64_t t = t0_tok + lt;
     float running_max = maxima[t];
     float running_sum = sums[t];
-    const float * column = logits + t*tile_stride;
+    const float * column = logits + lt*tile_stride;
     for (int64_t i = 0; i < tile_size; ++i) {
         const float z = column[i];
         if (z > running_max) {
@@ -75,17 +99,18 @@ static __global__ void fused_sparse_ce_make_probs(
         float * logits, const float * grad, const int32_t * targets,
         const float * weights, const int32_t * n_active, const float * maxima,
         const float * sums, int64_t tile_size, int64_t tile_stride,
-        int64_t n_tokens, int64_t n_vocab) {
+        int64_t t0_tok, int64_t nt_tok, int64_t n_vocab) {
     const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
-    const int64_t n = tile_size*n_tokens;
+    const int64_t n = tile_size*nt_tok;
     if (i >= n) {
         return;
     }
-    const int64_t t = i/tile_size;
-    const int64_t v = i - t*tile_size;
+    const int64_t lt = i/tile_size;
+    const int64_t v = i - lt*tile_size;
+    const int64_t t = t0_tok + lt;
     const bool active = targets[t] >= 0 && targets[t] < n_vocab && weights[t] != 0.0f && *n_active > 0;
     const float coef = active ? *grad*weights[t]/(float) *n_active : 0.0f;
-    const int64_t offset = t*tile_stride + v;
+    const int64_t offset = lt*tile_stride + v;
     logits[offset] = active ? coef*expf(logits[offset] - maxima[t])/sums[t] : 0.0f;
 }
 
@@ -148,23 +173,43 @@ static int64_t fused_sparse_ce_tile_size(const ggml_tensor * dst, int64_t n_voca
     return std::min<int64_t>(1024, (n_vocab + requested_tiles - 1)/requested_tiles);
 }
 
+// retro delta (plan rl/OPTIMIZE feature 1): op_params[1] caps how many tokens of
+// the flattened (batch x seq) axis are processed per pass. 0 means "all tokens"
+// (unchanged). The logits intermediate is then [tile_capacity, seq_chunk] instead
+// of [tile_capacity, n_tokens], so its peak no longer grows with sequence length.
+static int64_t fused_sparse_ce_seq_chunk(const ggml_tensor * dst, int64_t n_tokens) {
+    const int32_t seq_chunk = ggml_get_op_params_i32(dst, 1);
+    return seq_chunk > 0 ? std::min<int64_t>(seq_chunk, n_tokens) : n_tokens;
+}
+
+// Online log-sum-exp for one token chunk [t0, t0+nt). `logits` is a scratch of
+// [tile_capacity, nt]; `h` points at the full [n_embd, n_tokens] hidden states
+// (offset to the chunk here). maxima/sums/target_logits are the global per-token
+// state, indexed by the absolute token id inside the kernels.
 static void fused_sparse_ce_lse(
         ggml_backend_cuda_context & ctx, const float * h, const float * w,
-        const ggml_tensor * targets, int64_t n_embd, int64_t n_tokens,
-        int64_t n_vocab, int64_t tile_capacity, float * logits,
-        fused_sparse_ce_work & work) {
+        const ggml_tensor * targets, const float * bias, int64_t n_embd,
+        int64_t t0, int64_t nt, int64_t n_vocab, int64_t tile_capacity,
+        float * logits, fused_sparse_ce_work & work) {
     cudaStream_t stream = ctx.stream();
     cublasHandle_t handle = ctx.cublas_handle();
     CUBLAS_CHECK(cublasSetStream(handle, stream));
     const float alpha = 1.0f, beta = 0.0f;
+    const int threads = 256;
     for (int64_t v0 = 0; v0 < n_vocab; v0 += tile_capacity) {
         const int64_t nv = std::min(tile_capacity, n_vocab - v0);
         CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-            nv, n_tokens, n_embd, &alpha, w + v0*n_embd, n_embd,
-            h, n_embd, &beta, logits, tile_capacity));
-        fused_sparse_ce_update_lse<<<n_tokens, 1, 0, stream>>>(
+            nv, nt, n_embd, &alpha, w + v0*n_embd, n_embd,
+            h + t0*n_embd, n_embd, &beta, logits, tile_capacity));
+        if (bias) {
+            const int64_t n_bias = nv*nt;
+            fused_sparse_ce_add_bias<<<(n_bias + threads - 1)/threads, threads, 0, stream>>>(
+                logits, bias, v0, nv, tile_capacity, nt);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        fused_sparse_ce_update_lse<<<nt, 1, 0, stream>>>(
             logits, (const int32_t *) targets->data, work.maxima.get(), work.sums.get(),
-            work.target_logits.get(), v0, nv, tile_capacity, n_tokens);
+            work.target_logits.get(), v0, nv, tile_capacity, t0, nt);
         CUDA_CHECK(cudaGetLastError());
     }
 }
@@ -172,21 +217,28 @@ static void fused_sparse_ce_lse(
 void ggml_cuda_fused_sparse_ce(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * h = dst->src[0], * w = dst->src[1];
     const ggml_tensor * targets = dst->src[2], * weights = dst->src[3];
+    const ggml_tensor * bias = dst->src[4];
     const int64_t n_embd = h->ne[0], n_tokens = h->ne[1], n_vocab = w->ne[1];
     GGML_ASSERT(h->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
     GGML_ASSERT(targets->type == GGML_TYPE_I32 && weights->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(h) && ggml_is_contiguous(w));
+    GGML_ASSERT(!bias || (bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias)));
 
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t stream = ctx.stream();
     ggml_cuda_pool_alloc<float> w_scratch(pool);
     const float * w_f32 = fused_sparse_ce_head_f32(w, w_scratch, stream);
+    const float * bias_f32 = bias ? (const float *) bias->data : nullptr;
     fused_sparse_ce_work work(pool, n_tokens);
     fused_sparse_ce_prepare(stream, targets, weights, n_vocab, work);
-    const int64_t tile = fused_sparse_ce_tile_size(dst, n_vocab);
-    ggml_cuda_pool_alloc<float> logits(pool, tile*n_tokens);
-    fused_sparse_ce_lse(ctx, (const float *) h->data, w_f32, targets,
-        n_embd, n_tokens, n_vocab, tile, logits.get(), work);
+    const int64_t tile  = fused_sparse_ce_tile_size(dst, n_vocab);
+    const int64_t chunk = fused_sparse_ce_seq_chunk(dst, n_tokens);
+    ggml_cuda_pool_alloc<float> logits(pool, tile*chunk);
+    for (int64_t t0 = 0; t0 < n_tokens; t0 += chunk) {
+        const int64_t nt = std::min(chunk, n_tokens - t0);
+        fused_sparse_ce_lse(ctx, (const float *) h->data, w_f32, targets, bias_f32,
+            n_embd, t0, nt, n_vocab, tile, logits.get(), work);
+    }
 
     ggml_cuda_pool_alloc<float> losses(pool, n_tokens);
     const int threads = 256;
@@ -200,42 +252,75 @@ void ggml_cuda_fused_sparse_ce(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 void ggml_cuda_fused_sparse_ce_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * grad = dst->src[0], * h = dst->src[1], * w = dst->src[2];
     const ggml_tensor * targets = dst->src[3], * weights = dst->src[4];
+    const ggml_tensor * bias = dst->src[5];
     const int64_t n_embd = h->ne[0], n_tokens = h->ne[1], n_vocab = w->ne[1];
     GGML_ASSERT(grad->type == GGML_TYPE_F32 && h->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(h) && ggml_is_contiguous(w) && ggml_is_contiguous(dst));
+    GGML_ASSERT(!bias || (bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias)));
 
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t stream = ctx.stream();
     ggml_cuda_pool_alloc<float> w_scratch(pool);
     const float * w_f32 = fused_sparse_ce_head_f32(w, w_scratch, stream);
+    const float * bias_f32 = bias ? (const float *) bias->data : nullptr;
     fused_sparse_ce_work work(pool, n_tokens);
     fused_sparse_ce_prepare(stream, targets, weights, n_vocab, work);
-    const int64_t tile = fused_sparse_ce_tile_size(dst, n_vocab);
-    ggml_cuda_pool_alloc<float> logits(pool, tile*n_tokens);
-    fused_sparse_ce_lse(ctx, (const float *) h->data, w_f32, targets,
-        n_embd, n_tokens, n_vocab, tile, logits.get(), work);
+    const int64_t tile  = fused_sparse_ce_tile_size(dst, n_vocab);
+    const int64_t chunk = fused_sparse_ce_seq_chunk(dst, n_tokens);
+    ggml_cuda_pool_alloc<float> logits(pool, tile*chunk);
+
+    // retro delta (plan rl/OPTIMIZE feature 3): with offload_h the graph allocator
+    // gives grad_h the buffer of `h`, so writing a column would destroy the hidden
+    // state the very next vocab tile still has to read. Accumulate the chunk into a
+    // [n_embd, chunk] staging buffer instead and copy it back once the chunk is
+    // done; chunks own disjoint columns, so the eviction is exact. The staging
+    // buffer only bounds the peak when seq_chunk > 0 -- that is why the flag is
+    // gated on it upstream.
+    const bool inplace = dst->data == h->data;
+    ggml_cuda_pool_alloc<float> grad_stage(pool);
+    if (inplace) {
+        grad_stage.alloc(n_embd*chunk);
+    }
 
     cublasHandle_t handle = ctx.cublas_handle();
     CUBLAS_CHECK(cublasSetStream(handle, stream));
     const float alpha = 1.0f, beta0 = 0.0f, beta1 = 1.0f;
     const int threads = 256;
-    bool first = true;
-    for (int64_t v0 = 0; v0 < n_vocab; v0 += tile) {
-        const int64_t nv = std::min(tile, n_vocab - v0);
-        CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-            nv, n_tokens, n_embd, &alpha, w_f32 + v0*n_embd, n_embd,
-            (const float *) h->data, n_embd, &beta0, logits.get(), tile));
-        const int64_t n_probs = nv*n_tokens;
-        fused_sparse_ce_make_probs<<<(n_probs + threads - 1)/threads, threads, 0, stream>>>(
-            logits.get(), (const float *) grad->data, (const int32_t *) targets->data,
-            (const float *) weights->data, work.n_active.get(), work.maxima.get(), work.sums.get(),
-            nv, tile, n_tokens, n_vocab);
-        CUDA_CHECK(cudaGetLastError());
-        const float * beta = first ? &beta0 : &beta1;
-        CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
-            n_embd, n_tokens, nv, &alpha, w_f32 + v0*n_embd, n_embd,
-            logits.get(), tile, beta, (float *) dst->data, n_embd));
-        first = false;
+    for (int64_t t0 = 0; t0 < n_tokens; t0 += chunk) {
+        const int64_t nt = std::min(chunk, n_tokens - t0);
+        float * out = inplace ? grad_stage.get() : (float *) dst->data + t0*n_embd;
+        // Recompute this chunk's online log-sum-exp (checkpointing over the
+        // sequence axis), then accumulate grad_h tile by tile.
+        fused_sparse_ce_lse(ctx, (const float *) h->data, w_f32, targets, bias_f32,
+            n_embd, t0, nt, n_vocab, tile, logits.get(), work);
+        bool first = true;
+        for (int64_t v0 = 0; v0 < n_vocab; v0 += tile) {
+            const int64_t nv = std::min(tile, n_vocab - v0);
+            CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                nv, nt, n_embd, &alpha, w_f32 + v0*n_embd, n_embd,
+                (const float *) h->data + t0*n_embd, n_embd, &beta0, logits.get(), tile));
+            if (bias_f32) {
+                const int64_t n_bias = nv*nt;
+                fused_sparse_ce_add_bias<<<(n_bias + threads - 1)/threads, threads, 0, stream>>>(
+                    logits.get(), bias_f32, v0, nv, tile, nt);
+                CUDA_CHECK(cudaGetLastError());
+            }
+            const int64_t n_probs = nv*nt;
+            fused_sparse_ce_make_probs<<<(n_probs + threads - 1)/threads, threads, 0, stream>>>(
+                logits.get(), (const float *) grad->data, (const int32_t *) targets->data,
+                (const float *) weights->data, work.n_active.get(), work.maxima.get(), work.sums.get(),
+                nv, tile, t0, nt, n_vocab);
+            CUDA_CHECK(cudaGetLastError());
+            const float * beta = first ? &beta0 : &beta1;
+            CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                n_embd, nt, nv, &alpha, w_f32 + v0*n_embd, n_embd,
+                logits.get(), tile, beta, out, n_embd));
+            first = false;
+        }
+        if (inplace) {
+            CUDA_CHECK(cudaMemcpyAsync((float *) dst->data + t0*n_embd, out,
+                n_embd*nt*sizeof(float), cudaMemcpyDeviceToDevice, stream));
+        }
     }
     const int64_t n_out = n_embd*n_tokens;
     fused_sparse_ce_subtract_target<<<(n_out + threads - 1)/threads, threads, 0, stream>>>(
