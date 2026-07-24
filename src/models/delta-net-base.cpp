@@ -498,27 +498,32 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         // [TAG_RECURRENT_ROLLBACK_SPLITS]
         // this logic assumes that the last (n_rs_seq + 1) tokens of a sequence in a batch are inside
         //   the same ubatch, which `split_equal()` guarantees via its n_keep_tail argument
+        //
+        // retro delta: gathers all K overlapping snapshot windows in a single
+        // fused kernel (ggml_conv_rs_gather) plus one strided cpy, instead of a
+        // host-side loop building K separate view+cpy graph nodes. That loop
+        // cost K kernel launches per GDN layer per forward pass (K = n_rs_seq+1,
+        // e.g. 97), which dominated the forward pass for callers running with a
+        // full rollback budget. Implemented on CPU, CUDA, Vulkan and Metal.
+        //
+        // Note that Retroback itself never reaches this branch: retro_backend.cpp
+        // pins n_rs_seq to 0 because the snapshots never pay for themselves (see
+        // the measurements there). It is kept for llama.cpp callers that do
+        // enable rollback. See docs/cuda/STATUS.md.
 
         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
 
-        for (int64_t t = 1; t <= K; ++t) {
-            const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
-            const int64_t s_slot = K - t;
+        ggml_tensor * conv_gathered = ggml_conv_rs_gather(ctx0, conv_input, conv_kernel_size - 1, K);
+        cb(conv_gathered, "conv_rs_gather", il);
 
-            ggml_tensor * conv_state_last =
-                ggml_view_3d(ctx0, conv_input,
-                        conv_kernel_size - 1, conv_channels, n_seqs,
-                        conv_input->nb[1], conv_input->nb[2],
-                        ggml_row_size(conv_input->type, s_idx));
+        ggml_tensor * conv_state_update_all =
+            ggml_view_3d(ctx0, conv_states_all,
+                    row_count, n_seqs, K,
+                    conv_states_all->nb[1], mem_size * row_size,
+                    kv_head * row_size);
+        cb(conv_state_update_all, "conv_state_update_all", il);
 
-            ggml_tensor * conv_state_update =
-                ggml_view_2d(ctx0,
-                        conv_states_all, row_count, n_seqs,
-                        conv_states_all->nb[1],
-                        (s_slot * mem_size + kv_head) * row_size);
-
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
-        }
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_gathered, conv_state_update_all));
     }
 
     return conv_input;

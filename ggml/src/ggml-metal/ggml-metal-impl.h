@@ -972,6 +972,19 @@ typedef struct {
     uint64_t nb20; uint64_t nb21; uint64_t nb22;
 } ggml_metal_kargs_ssm_conv_back;
 
+// retro delta: recurrent-state rollback snapshot gather (see ggml_conv_rs_gather).
+// `base` is conv_input->ne[0] - kernel_m1, i.e. the new-token count; source
+// strides are in bytes.
+typedef struct {
+    int64_t  kernel_m1;
+    int64_t  n_channels;
+    int64_t  n_seqs;
+    int64_t  K;
+    int64_t  base;
+    int64_t  total;
+    uint64_t nb00; uint64_t nb01; uint64_t nb02;
+} ggml_metal_kargs_conv_rs_gather;
+
 // retro delta: SSM scan backward. The destination is the packed F32 vector
 // [grad_x | grad_dt | grad_A | grad_B | grad_C | grad_s]. Source strides are
 // bytes; packed-output offsets are element offsets. The time axis is processed

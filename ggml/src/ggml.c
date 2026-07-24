@@ -1108,9 +1108,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "FUSED_SPARSE_CE",
     "FUSED_SPARSE_CE_BACK",
+
+    "CONV_RS_GATHER",
 };
 
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1232,9 +1234,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "fused_sparse_ce(h,w)",
     "fused_sparse_ce_back(h,w)",
+
+    "conv_rs_gather(x)",
 };
 
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6657,6 +6661,34 @@ struct ggml_tensor * ggml_gated_delta_net_back(
     return result;
 }
 
+// ggml_conv_rs_gather
+
+struct ggml_tensor * ggml_conv_rs_gather(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * conv_input,
+        int64_t               kernel_m1,
+        int64_t               K) {
+    GGML_ASSERT(ggml_is_contiguous_rows(conv_input));
+    GGML_ASSERT(conv_input->type == GGML_TYPE_F32);
+    GGML_ASSERT(kernel_m1 >= 1);
+    GGML_ASSERT(K >= 1);
+    GGML_ASSERT(conv_input->ne[0] >= kernel_m1);
+
+    const int64_t n_channels = conv_input->ne[1];
+    const int64_t n_seqs     = conv_input->ne[2];
+
+    const int64_t ne[4] = { kernel_m1 * n_channels, n_seqs, K, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) kernel_m1);
+    ggml_set_op_params_i32(result, 1, (int32_t) K);
+
+    result->op     = GGML_OP_CONV_RS_GATHER;
+    result->src[0] = conv_input;
+
+    return result;
+}
+
 // ggml_lightning_indexer
 
 struct ggml_tensor * ggml_lightning_indexer(
@@ -7959,6 +7991,7 @@ void ggml_build_backward_expand(
             case GGML_OP_IM2COL:      // only used for its shape
             case GGML_OP_IM2COL_BACK: // same as IM2COL
             case GGML_OP_FILL:        // retro delta: only used for shape/dtype, output is a constant
+            case GGML_OP_CONV_RS_GATHER: // retro delta: rollback-cache bookkeeping, no forward consumers
                 ignore_src[0] = true;
                 break;
             case GGML_OP_UNARY: {
@@ -8175,6 +8208,7 @@ static void ggml_backward_ignored_srcs(const struct ggml_tensor * node, bool ign
         case GGML_OP_IM2COL:
         case GGML_OP_IM2COL_BACK:
         case GGML_OP_FILL:
+        case GGML_OP_CONV_RS_GATHER:
             ignore_src[0] = true;
             break;
         case GGML_OP_UNARY: {

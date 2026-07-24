@@ -632,6 +632,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_back(
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_rs_gather(
+        ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_CONV_RS_GATHER);
+
+    const char * name = "kernel_conv_rs_gather_f32";
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan_back_ckpt(
         ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_ASSERT(op->op == GGML_OP_SSM_SCAN_BACK);

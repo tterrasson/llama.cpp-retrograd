@@ -620,6 +620,9 @@ extern "C" {
         GGML_OP_FUSED_SPARSE_CE,
         GGML_OP_FUSED_SPARSE_CE_BACK,
 
+        // retro delta: see ggml_conv_rs_gather.
+        GGML_OP_CONV_RS_GATHER,
+
         GGML_OP_COUNT,
     };
 
@@ -2729,6 +2732,25 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             struct ggml_tensor  * grad,
+            int64_t               K);
+
+    // retro delta: gathers the K overlapping causal-conv rollback snapshot
+    // windows used by the shared-prefix GRPO scorer's recurrent-state rollback
+    // (see build_conv_state / [TAG_RECURRENT_ROLLBACK_SPLITS] in
+    // delta-net-base.cpp) in a single kernel launch, replacing a host-side loop
+    // that previously built K separate view+cpy graph nodes per call (K-1
+    // slots fall back to slot 0's clamped window when n_seq_tokens < K, exactly
+    // mirroring that loop's `std::max<int64_t>(0, ...)` clamp).
+    //
+    // conv_input: [kernel_m1 + n_seq_tokens, n_channels, n_seqs], contiguous rows.
+    // result:     [kernel_m1 * n_channels, n_seqs, K, 1], contiguous; slot 0 is
+    //             the most recent window (ending at the last token), slot s is
+    //             s tokens back. Copy into the recurrent-state cache with a
+    //             single ggml_cpy against a matching 3D view.
+    GGML_API struct ggml_tensor * ggml_conv_rs_gather(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * conv_input,
+            int64_t               kernel_m1,
             int64_t               K);
 
     // DSA lightning indexer

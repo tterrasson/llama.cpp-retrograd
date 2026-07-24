@@ -4,20 +4,77 @@
 
 // retro delta: analytic backward for GGML_OP_GATED_DELTA_NET, mirroring the
 // CPU reference (ggml-cpu/ops.cpp: ggml_compute_forward_gated_delta_net_back_f32).
-// Correctness-first, like ssm-back.cu: one thread per (head, sequence) unit
-// recomputes the S_prev trajectory forward, then reverse-scans it, exactly as
-// the CPU does. grad_q/grad_k can be shared by several v-heads when q/k are
-// GQA-broadcast (H_v % H_qk == 0), so those two outputs use atomicAdd; every
-// other output (grad_v/grad_g/grad_beta/grad_state) is unique per (head, seq)
-// and written directly.
+// One *block* per (head, sequence) unit recomputes the S_prev trajectory
+// forward, then reverse-scans it. The token scan is inherently sequential, but
+// every step inside it is O(S_v^2) and is spread across the block: the state
+// matrices are walked flat (coalesced, thread-stride), the reductions over the
+// contiguous `i` axis use one warp per column `j`, and the reductions over `j`
+// give each thread a whole row `i` (also coalesced, since threads then differ
+// only in the contiguous index).
 //
-// Memory note: like the CPU reference, each thread keeps the full per-token
+// An earlier revision ran one *thread* per (head, sequence). For a typical
+// LoRA ubatch that is H_v*n_seqs threads in total -- 64 for Qwen3.5 at
+// n_seqs=4 -- i.e. two warps for the whole GPU, each serially grinding
+// n_tokens * S_v^2 scalar FLOPs with fully uncoalesced access. That kernel
+// measured 3.7 s per launch and 99% of training wall-clock.
+//
+// grad_q/grad_k can be shared by several v-heads when q/k are GQA-broadcast
+// (H_v % H_qk == 0), so those two outputs use atomicAdd; every other output
+// (grad_v/grad_g/grad_beta/grad_state) is unique per (head, seq) and written
+// directly.
+//
+// Memory note: like the CPU reference, each unit keeps the full per-token
 // state trajectory (n_tokens * S_v * S_v floats) live at once, so the pool
 // scratch buffer scales with n_tokens * S_v^2 * H * n_seqs. Fine for the LoRA
 // ubatch sizes Retroback targets; a chunked/checkpointed backward would be
 // needed for very long contexts.
 
-static __global__ void gated_delta_net_back_kernel(
+#define GDN_BACK_BLOCK 256
+
+// Sum `val` across the block. `red` holds one float per warp. Safe to call
+// repeatedly: the trailing barrier keeps a later call from overwriting `red`
+// while earlier readers are still using it.
+static __device__ __forceinline__ float gdn_block_reduce_sum(float val, float * red) {
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int wid  = threadIdx.x / WARP_SIZE;
+    const int nw   = blockDim.x / WARP_SIZE;
+
+    val = warp_reduce_sum(val);
+    if (lane == 0) {
+        red[wid] = val;
+    }
+    __syncthreads();
+
+    float total = 0.0f;
+    for (int i = 0; i < nw; ++i) {
+        total += red[i];
+    }
+    __syncthreads();
+    return total;
+}
+
+// out[j] = sum_i M[i + j*S_v] * vec[i], one warp per column so the reduced
+// axis is the contiguous one and every warp read is coalesced.
+static __device__ __forceinline__ void gdn_col_dot(
+        const float * __restrict__ M, const float * __restrict__ vec,
+        float * __restrict__ out, const int64_t S_v) {
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int wid  = threadIdx.x / WARP_SIZE;
+    const int nw   = blockDim.x / WARP_SIZE;
+
+    for (int64_t j = wid; j < S_v; j += nw) {
+        float acc = 0.0f;
+        for (int64_t i = lane; i < S_v; i += WARP_SIZE) {
+            acc += M[i + j*S_v] * vec[i];
+        }
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) {
+            out[j] = acc;
+        }
+    }
+}
+
+static __global__ __launch_bounds__(GDN_BACK_BLOCK) void gated_delta_net_back_kernel(
         const float * __restrict__ q, const float * __restrict__ k, const float * __restrict__ v,
         const float * __restrict__ g, const float * __restrict__ beta, const float * __restrict__ state0,
         const float * __restrict__ grad,
@@ -32,12 +89,15 @@ static __global__ void gated_delta_net_back_kernel(
         const bool kda, const float scale, const int K,
         const int64_t n_q, const int64_t n_k, const int64_t n_v, const int64_t n_g, const int64_t n_beta,
         const int64_t state_seq_stride) {
-    const int64_t tid = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (tid >= H * n_seqs) {
+    const int64_t unit = blockIdx.x;
+    if (unit >= H * n_seqs) {
         return;
     }
-    const int64_t iv1 = tid % H;
-    const int64_t iv3 = tid / H;
+    const int     tid  = threadIdx.x;
+    const int     nthr = blockDim.x;
+
+    const int64_t iv1 = unit % H;
+    const int64_t iv3 = unit / H;
 
     const int64_t iq1 = iv1 % neq1;
     const int64_t ik1 = iv1 % nek1;
@@ -51,29 +111,45 @@ static __global__ void gated_delta_net_back_kernel(
     float * g_beta  = g_g + n_g;
     float * g_state = g_beta + n_beta;
 
+    const int64_t SS                  = S_v * S_v;
     const int64_t attn_score_elems    = S_v * H * n_tokens * n_seqs;
-    const int64_t state_size_per_snap = S_v * S_v * H * n_seqs;
+    const int64_t state_size_per_snap = SS * H * n_seqs;
     const float * grad_attn_base  = grad;
     const float * grad_state_base = grad + attn_score_elems;
 
-    const float * s0 = state0 + iv3 * state_seq_stride + iv1 * S_v * S_v;
+    const float * s0 = state0 + iv3 * state_seq_stride + iv1 * SS;
 
-    float * base   = scratch + tid * scratch_stride;
-    float * traj   = base;                       // n_tokens*S_v*S_v : S_prev per token
-    float * S1     = traj + n_tokens * S_v * S_v; // S_v*S_v
-    float * Snew   = S1 + S_v * S_v;              // S_v*S_v
-    float * dS     = Snew + S_v * S_v;            // S_v*S_v
-    float * dS1    = dS + S_v * S_v;              // S_v*S_v
-    float * pre    = dS1 + S_v * S_v;             // S_v
-    float * delta  = pre + S_v;                   // S_v
-    float * gexp   = delta + S_v;                 // S_v
-    float * dpre   = gexp + S_v;                  // S_v
-    float * ddelta = dpre + S_v;                  // S_v
+    float * base = scratch + unit * scratch_stride;
+    float * traj = base;                  // n_tokens*S_v*S_v : S_prev per token
+    float * S1   = traj + n_tokens * SS;  // S_v*S_v
+    float * Snew = S1 + SS;               // S_v*S_v
+    float * dS   = Snew + SS;             // S_v*S_v
+    float * dS1  = dS + SS;               // S_v*S_v
+
+    extern __shared__ float smem[];
+    float * s_k      = smem;              // S_v
+    float * s_v      = s_k + S_v;         // S_v
+    float * s_q      = s_v + S_v;         // S_v
+    float * s_do     = s_q + S_v;         // S_v
+    float * s_gexp   = s_do + S_v;        // S_v
+    float * s_pre    = s_gexp + S_v;      // S_v
+    float * s_delta  = s_pre + S_v;       // S_v
+    float * s_dpre   = s_delta + S_v;     // S_v
+    float * s_ddelta = s_dpre + S_v;      // S_v
+    float * s_red    = s_ddelta + S_v;    // blockDim.x / WARP_SIZE
+
+    // Flat walk of an S_v*S_v matrix keeping (i, j) in step without a modulo
+    // in the inner loop.
+    const int64_t i0     = tid % S_v;
+    const int64_t j0     = tid / S_v;
+    const int64_t i_step = nthr % S_v;
+    const int64_t j_step = nthr / S_v;
 
     // ---- forward recompute: fill the S_prev trajectory ----
-    for (int64_t n = 0; n < S_v * S_v; ++n) {
+    for (int64_t n = tid; n < SS; n += nthr) {
         traj[n] = s0[n];
     }
+    __syncthreads();
 
     for (int64_t t = 0; t < n_tokens - 1; ++t) {
         const float * k_d = k + ik3 * sk3 + t * sk2 + ik1 * sk1;
@@ -82,34 +158,45 @@ static __global__ void gated_delta_net_back_kernel(
         const float beta_val = beta[gb_off];
         const float * g_d = g + gb_off * (kda ? S_v : 1);
 
-        float * S_prev = traj + t * S_v * S_v;
-        float * S_next = traj + (t + 1) * S_v * S_v;
+        const float * S_prev = traj + t * SS;
+        float *       S_next = traj + (t + 1) * SS;
 
-        if (kda) {
-            for (int64_t i = 0; i < S_v; ++i) { gexp[i] = expf(g_d[i]); }
-        } else {
-            const float gv = expf(g_d[0]);
-            for (int64_t i = 0; i < S_v; ++i) { gexp[i] = gv; }
+        for (int64_t i = tid; i < S_v; i += nthr) {
+            s_k[i]    = k_d[i];
+            s_v[i]    = v_d[i];
+            s_gexp[i] = expf(kda ? g_d[i] : g_d[0]);
         }
-        for (int64_t j = 0; j < S_v; ++j) {
-            for (int64_t i = 0; i < S_v; ++i) {
-                S1[i + j * S_v] = S_prev[i + j * S_v] * gexp[i];
-            }
+        __syncthreads();
+
+        for (int64_t n = tid, i = i0; n < SS; n += nthr) {
+            S1[n] = S_prev[n] * s_gexp[i];
+            i += i_step;
+            if (i >= S_v) i -= S_v;
         }
-        for (int64_t j = 0; j < S_v; ++j) {
-            float sum = 0.0f;
-            for (int64_t i = 0; i < S_v; ++i) { sum += S1[i + j * S_v] * k_d[i]; }
-            delta[j] = (v_d[j] - sum) * beta_val;
+        __syncthreads();
+
+        gdn_col_dot(S1, s_k, s_pre, S_v);
+        __syncthreads();
+
+        for (int64_t j = tid; j < S_v; j += nthr) {
+            s_delta[j] = (s_v[j] - s_pre[j]) * beta_val;
         }
-        for (int64_t j = 0; j < S_v; ++j) {
-            for (int64_t i = 0; i < S_v; ++i) {
-                S_next[i + j * S_v] = S1[i + j * S_v] + k_d[i] * delta[j];
-            }
+        __syncthreads();
+
+        for (int64_t n = tid, i = i0, j = j0; n < SS; n += nthr) {
+            S_next[n] = S1[n] + s_k[i] * s_delta[j];
+            i += i_step;
+            j += j_step;
+            if (i >= S_v) { i -= S_v; ++j; }
         }
+        __syncthreads();
     }
 
     // ---- reverse scan ----
-    for (int64_t n = 0; n < S_v * S_v; ++n) { dS[n] = 0.0f; }
+    for (int64_t n = tid; n < SS; n += nthr) {
+        dS[n] = 0.0f;
+    }
+    __syncthreads();
 
     for (int64_t t = n_tokens - 1; t >= 0; --t) {
         const float * q_d = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
@@ -119,105 +206,142 @@ static __global__ void gated_delta_net_back_kernel(
         const float beta_val = beta[gb_off];
         const float * g_d = g + gb_off * (kda ? S_v : 1);
 
-        const float * S_prev = traj + t * S_v * S_v;
+        const float * S_prev = traj + t * SS;
+        const float * d_out  = grad_attn_base + (iv3 * n_tokens * H + t * H + iv1) * S_v;
 
-        if (kda) {
-            for (int64_t i = 0; i < S_v; ++i) { gexp[i] = expf(g_d[i]); }
-        } else {
-            const float gv = expf(g_d[0]);
-            for (int64_t i = 0; i < S_v; ++i) { gexp[i] = gv; }
+        for (int64_t i = tid; i < S_v; i += nthr) {
+            s_k[i]    = k_d[i];
+            s_v[i]    = v_d[i];
+            s_q[i]    = q_d[i];
+            s_do[i]   = d_out[i];
+            s_gexp[i] = expf(kda ? g_d[i] : g_d[0]);
         }
-        for (int64_t j = 0; j < S_v; ++j) {
-            for (int64_t i = 0; i < S_v; ++i) {
-                S1[i + j * S_v] = S_prev[i + j * S_v] * gexp[i];
-            }
-        }
-        for (int64_t j = 0; j < S_v; ++j) {
-            float sum = 0.0f;
-            for (int64_t i = 0; i < S_v; ++i) { sum += S1[i + j * S_v] * k_d[i]; }
-            pre[j]   = sum;
-            delta[j] = (v_d[j] - sum) * beta_val;
-        }
-        for (int64_t j = 0; j < S_v; ++j) {
-            for (int64_t i = 0; i < S_v; ++i) {
-                Snew[i + j * S_v] = S1[i + j * S_v] + k_d[i] * delta[j];
-            }
-        }
+        __syncthreads();
 
-        const float * d_out = grad_attn_base + (iv3 * n_tokens * H + t * H + iv1) * S_v;
+        for (int64_t n = tid, i = i0; n < SS; n += nthr) {
+            S1[n] = S_prev[n] * s_gexp[i];
+            i += i_step;
+            if (i >= S_v) i -= S_v;
+        }
+        __syncthreads();
 
+        gdn_col_dot(S1, s_k, s_pre, S_v);
+        __syncthreads();
+
+        for (int64_t j = tid; j < S_v; j += nthr) {
+            s_delta[j] = (s_v[j] - s_pre[j]) * beta_val;
+        }
+        __syncthreads();
+
+        for (int64_t n = tid, i = i0, j = j0; n < SS; n += nthr) {
+            Snew[n] = S1[n] + s_k[i] * s_delta[j];
+            i += i_step;
+            j += j_step;
+            if (i >= S_v) { i -= S_v; ++j; }
+        }
+        __syncthreads();
+
+        // dS += scale * outer(q, d_out); grad_q = scale * Snew . d_out
         float * gq_out = g_q + S_v * (iq1 + neq1 * (t + n_tokens * iq3));
-        for (int64_t i = 0; i < S_v; ++i) {
+        for (int64_t i = tid; i < S_v; i += nthr) {
+            const float q_i = s_q[i];
             float dqi = 0.0f;
             for (int64_t j = 0; j < S_v; ++j) {
-                dS[i + j * S_v] += scale * d_out[j] * q_d[i];
-                dqi += Snew[i + j * S_v] * d_out[j];
+                dS[i + j*S_v] += scale * s_do[j] * q_i;
+                dqi           += Snew[i + j*S_v] * s_do[j];
             }
             atomicAdd(&gq_out[i], scale * dqi);
         }
+        __syncthreads();
 
         const int64_t target_slot = n_tokens - 1 - t;
         if (target_slot < K) {
             const float * d_snap = grad_state_base + target_slot * state_size_per_snap
-                    + (iv3 * H + iv1) * S_v * S_v;
-            for (int64_t n = 0; n < S_v * S_v; ++n) {
+                    + (iv3 * H + iv1) * SS;
+            for (int64_t n = tid; n < SS; n += nthr) {
                 dS[n] += d_snap[n];
             }
+            __syncthreads();
         }
 
         // step 3 backward: S_new = S1 + outer(k, delta)
-        for (int64_t n = 0; n < S_v * S_v; ++n) { dS1[n] = dS[n]; }
-        for (int64_t j = 0; j < S_v; ++j) { ddelta[j] = 0.0f; }
+        for (int64_t n = tid; n < SS; n += nthr) {
+            dS1[n] = dS[n];
+        }
+        gdn_col_dot(dS, s_k, s_ddelta, S_v);
         float * gk_out = g_k + S_v * (ik1 + nek1 * (t + n_tokens * ik3));
-        for (int64_t i = 0; i < S_v; ++i) {
+        for (int64_t i = tid; i < S_v; i += nthr) {
             float dki = 0.0f;
             for (int64_t j = 0; j < S_v; ++j) {
-                dki       += dS[i + j * S_v] * delta[j];
-                ddelta[j] += dS[i + j * S_v] * k_d[i];
+                dki += dS[i + j*S_v] * s_delta[j];
             }
             atomicAdd(&gk_out[i], dki);
         }
+        __syncthreads();
 
         // step 2 backward: delta[j] = beta*(v[j] - pre[j])
-        float dbeta_t = 0.0f;
-        for (int64_t j = 0; j < S_v; ++j) { dpre[j] = -ddelta[j] * beta_val; }
-        for (int64_t j = 0; j < S_v; ++j) {
-            dbeta_t += ddelta[j] * (v_d[j] - pre[j]);
-            g_v[j + S_v * (iv1 + H * (t + n_tokens * iv3))] += ddelta[j] * beta_val;
+        float dbeta_partial = 0.0f;
+        for (int64_t j = tid; j < S_v; j += nthr) {
+            const float dd = s_ddelta[j];
+            s_dpre[j] = -dd * beta_val;
+            dbeta_partial += dd * (s_v[j] - s_pre[j]);
+            g_v[j + S_v * (iv1 + H * (t + n_tokens * iv3))] += dd * beta_val;
         }
-        g_beta[iv1 + H * (t + n_tokens * iv3)] += dbeta_t;
-        for (int64_t j = 0; j < S_v; ++j) {
-            for (int64_t i = 0; i < S_v; ++i) {
-                dS1[i + j * S_v] += dpre[j] * k_d[i];
-            }
+        const float dbeta_t = gdn_block_reduce_sum(dbeta_partial, s_red);
+        if (tid == 0) {
+            g_beta[iv1 + H * (t + n_tokens * iv3)] += dbeta_t;
         }
-        for (int64_t i = 0; i < S_v; ++i) {
+        __syncthreads();
+
+        for (int64_t n = tid, i = i0, j = j0; n < SS; n += nthr) {
+            dS1[n] += s_dpre[j] * s_k[i];
+            i += i_step;
+            j += j_step;
+            if (i >= S_v) { i -= S_v; ++j; }
+        }
+        __syncthreads();
+
+        for (int64_t i = tid; i < S_v; i += nthr) {
             float dki2 = 0.0f;
-            for (int64_t j = 0; j < S_v; ++j) { dki2 += dpre[j] * S1[i + j * S_v]; }
+            for (int64_t j = 0; j < S_v; ++j) {
+                dki2 += s_dpre[j] * S1[i + j*S_v];
+            }
             atomicAdd(&gk_out[i], dki2);
         }
+        __syncthreads();
 
         // step 1 backward: S1[i,j] = S_prev[i,j] * gexp[i]
         if (kda) {
             float * gg_out = g_g + S_v * (iv1 + H * (t + n_tokens * iv3));
-            for (int64_t i = 0; i < S_v; ++i) {
+            for (int64_t i = tid; i < S_v; i += nthr) {
+                const float ge = s_gexp[i];
                 float dgexp_i = 0.0f;
                 for (int64_t j = 0; j < S_v; ++j) {
-                    dgexp_i += dS1[i + j * S_v] * S_prev[i + j * S_v];
-                    dS[i + j * S_v] = dS1[i + j * S_v] * gexp[i];
+                    const int64_t idx = i + j*S_v;
+                    dgexp_i += dS1[idx] * S_prev[idx];
+                    dS[idx]  = dS1[idx] * ge;
                 }
-                gg_out[i] += dgexp_i * gexp[i];
+                gg_out[i] += dgexp_i * ge;
             }
         } else {
-            float dgexp_sum = 0.0f;
-            for (int64_t n = 0; n < S_v * S_v; ++n) { dgexp_sum += dS1[n] * S_prev[n]; }
-            for (int64_t n = 0; n < S_v * S_v; ++n) { dS[n] = dS1[n] * gexp[0]; }
-            g_g[iv1 + H * (t + n_tokens * iv3)] += dgexp_sum * gexp[0];
+            const float ge = s_gexp[0];
+            float dgexp_partial = 0.0f;
+            for (int64_t n = tid; n < SS; n += nthr) {
+                dgexp_partial += dS1[n] * S_prev[n];
+                dS[n] = dS1[n] * ge;
+            }
+            const float dgexp_sum = gdn_block_reduce_sum(dgexp_partial, s_red);
+            if (tid == 0) {
+                g_g[iv1 + H * (t + n_tokens * iv3)] += dgexp_sum * ge;
+            }
         }
+        __syncthreads();
     }
 
-    float * gs_out = g_state + iv3 * state_seq_stride + iv1 * S_v * S_v;
-    for (int64_t n = 0; n < S_v * S_v; ++n) { gs_out[n] += dS[n]; }
+    float * gs_out = g_state + iv3 * state_seq_stride + iv1 * SS;
+    for (int64_t n = tid; n < SS; n += nthr) {
+        gs_out[n] += dS[n];
+    }
 }
 
 void ggml_cuda_op_gated_delta_net_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -273,13 +397,16 @@ void ggml_cuda_op_gated_delta_net_back(ggml_backend_cuda_context & ctx, ggml_ten
     float * dst_d = (float *) dst->data;
     CUDA_CHECK(cudaMemsetAsync(dst_d, 0, ggml_nbytes(dst), stream));
 
-    const int64_t scratch_stride = n_tokens * S_v * S_v + 4 * S_v * S_v + 5 * S_v;
-    const int64_t n_threads = H * n_seqs;
-    ggml_cuda_pool_alloc<float> scratch(ctx.pool(), (size_t) (n_threads * scratch_stride));
+    // The trajectory dominates; S1/Snew/dS/dS1 are the four working matrices.
+    // pre/delta/gexp/dpre/ddelta moved to shared memory.
+    const int64_t scratch_stride = n_tokens * S_v * S_v + 4 * S_v * S_v;
+    const int64_t n_units = H * n_seqs;
+    ggml_cuda_pool_alloc<float> scratch(ctx.pool(), (size_t) (n_units * scratch_stride));
 
-    const int block = 32;
-    const int grid = (int) ((n_threads + block - 1) / block);
-    gated_delta_net_back_kernel<<<grid, block, 0, stream>>>(
+    const int block  = GDN_BACK_BLOCK;
+    const int grid   = (int) n_units;
+    const size_t shmem = (9 * (size_t) S_v + block / WARP_SIZE) * sizeof(float);
+    gated_delta_net_back_kernel<<<grid, block, shmem, stream>>>(
         (const float *) src_q->data, (const float *) src_k->data, (const float *) src_v->data,
         (const float *) src_g->data, (const float *) src_beta->data, (const float *) src_state->data,
         (const float *) src_grad->data, dst_d,

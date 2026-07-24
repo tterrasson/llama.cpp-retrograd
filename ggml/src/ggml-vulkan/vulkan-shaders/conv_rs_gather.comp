@@ -1,0 +1,48 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// retro delta: gathers the K overlapping causal-conv rollback snapshot windows
+// used by the shared-prefix GRPO scorer's recurrent-state rollback (see
+// build_conv_state / [TAG_RECURRENT_ROLLBACK_SPLITS] in delta-net-base.cpp) in a
+// single dispatch, replacing a host-side loop that previously built K separate
+// view+cpy graph nodes per call.
+//
+// One thread per output element; every element is an independent gather, so
+// there is no cross-thread accumulation.
+//   result[k + c*kernel_m1, s, slot] = conv_input[max(0, base - slot) + k, c, s]
+// with base = ne0 - kernel_m1 (the number of new tokens). The clamp reproduces
+// the original loop's `std::max<int64_t>(0, ...)`: when n_seq_tokens < K the
+// trailing slots all fall back to slot 0's clamped window.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint kernel_m1;   // conv_kernel_size - 1
+    uint n_channels;
+    uint n_seqs;
+    uint K;
+    uint base;        // conv_input->ne[0] - kernel_m1
+    uint nb00, nb01, nb02;  // conv_input strides, element units
+    uint total;       // kernel_m1 * n_channels * n_seqs * K
+} p;
+
+layout(binding = 0) readonly  buffer Src { float data_src[]; };
+layout(binding = 1) writeonly buffer Dst { float data_dst[]; };
+
+void main() {
+    const uint gid = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+    if (gid >= p.total) {
+        return;
+    }
+
+    uint r = gid;
+    const uint k    = r % p.kernel_m1; r /= p.kernel_m1;
+    const uint c    = r % p.n_channels; r /= p.n_channels;
+    const uint s    = r % p.n_seqs;
+    const uint slot = r / p.n_seqs;
+
+    const uint s_idx = slot >= p.base ? 0u : p.base - slot;
+
+    data_dst[gid] = data_src[(s_idx + k)*p.nb00 + c*p.nb01 + s*p.nb02];
+}

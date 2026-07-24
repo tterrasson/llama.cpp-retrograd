@@ -2,21 +2,45 @@
 
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_atomic_float : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 
 // retro delta: analytic backward for GATED_DELTA_NET (Qwen3-Next / KDA),
 // mirroring the CPU reference (ggml-cpu/ops.cpp) and the CUDA port
-// (gated-delta-net-back.cu). Correctness-first: one invocation per
-// (head, sequence) unit recomputes the S_prev trajectory forward into a
-// scratch buffer, then reverse-scans it. grad_q/grad_k can be shared by
-// several v-heads under GQA broadcast, so those two outputs use atomicAdd;
-// every other output is unique per (head, seq) and written directly. The
-// caller zeroes `dst` before dispatch.
+// (gated-delta-net-back.cu). One *workgroup* per (head, sequence) unit
+// recomputes the S_prev trajectory forward into a scratch buffer, then
+// reverse-scans it. The token scan is inherently sequential, but every step
+// inside it is O(S_v^2) and is spread across the workgroup: the state matrices
+// are walked flat (coalesced, thread-stride), the reductions over the
+// contiguous `i` axis use one subgroup per column `j`, and the reductions over
+// `j` give each thread a whole row `i` (also coalesced, since threads then
+// differ only in the contiguous index).
 //
-// Memory note: like the CPU/CUDA references, each invocation keeps the full
-// per-token state trajectory (n_tokens * S_v * S_v floats) live in the
-// scratch buffer at once.
+// An earlier revision ran one *invocation* per (head, sequence). For a typical
+// LoRA ubatch that is H*n_seqs invocations in total -- 64 for Qwen3.5 at
+// n_seqs=4, i.e. two subgroups for the whole GPU, each serially grinding
+// n_tokens * S_v^2 scalar FLOPs against global memory with no reuse. That is
+// the same shape the CUDA port measured at 3.7 s per launch and 99% of
+// training wall-clock before it was reparallelised the same way.
+//
+// grad_q/grad_k can be shared by several v-heads under GQA broadcast, so those
+// two outputs use atomicAdd; every other output is unique per (head, seq) and
+// written directly. The caller zeroes `dst` before dispatch.
+//
+// Memory note: like the CPU/CUDA references, each unit keeps the full per-token
+// state trajectory (n_tokens * S_v * S_v floats) live in the scratch buffer at
+// once.
 
-layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// The nine per-token vectors below live in shared memory, so S_v is capped at
+// compile time (GLSL has no dynamically sized shared storage, unlike CUDA's
+// extern __shared__). 256 covers every gated-delta-net head dim in use;
+// ggml_backend_vk_device_supports_op rejects anything wider so it falls back to
+// the CPU reference rather than reading out of bounds.
+#define GDN_S_V_MAX 256
+// Upper bound on gl_NumSubgroups: workgroup size / smallest subgroup we target.
+#define GDN_MAX_SUBGROUPS 64
 
 layout(push_constant) uniform Parameters {
     uint S_v, H, n_tokens, n_seqs, K;
@@ -39,13 +63,61 @@ layout(binding = 6) readonly  buffer GradBuf  { float data_grad[];  };
 layout(binding = 7)           buffer DstBuf   { float data_dst[];   };
 layout(binding = 8)           buffer Scratch  { float data_scratch[]; };
 
+shared float s_k[GDN_S_V_MAX];
+shared float s_v[GDN_S_V_MAX];
+shared float s_q[GDN_S_V_MAX];
+shared float s_do[GDN_S_V_MAX];
+shared float s_gexp[GDN_S_V_MAX];
+shared float s_pre[GDN_S_V_MAX];
+shared float s_delta[GDN_S_V_MAX];
+shared float s_dpre[GDN_S_V_MAX];
+shared float s_ddelta[GDN_S_V_MAX];
+shared float s_red[GDN_MAX_SUBGROUPS];
+
+// Sum `val` across the workgroup. The trailing barrier makes repeated calls
+// safe: it keeps a later call from overwriting s_red while earlier readers are
+// still using it.
+float block_reduce_sum(float val) {
+    val = subgroupAdd(val);
+    if (gl_SubgroupInvocationID == 0u) {
+        s_red[gl_SubgroupID] = val;
+    }
+    barrier();
+
+    float total = 0.0f;
+    for (uint i = 0u; i < gl_NumSubgroups; ++i) {
+        total += s_red[i];
+    }
+    barrier();
+    return total;
+}
+
+// OUT[j] = sum_i data_scratch[Moff + i + j*S_v] * s_k[i], one subgroup per
+// column so the reduced axis is the contiguous one and every read is coalesced
+// across the subgroup. `j` is uniform within a subgroup, so the subgroupAdd is
+// reached under uniform control flow.
+#define GDN_COL_DOT_K(Moff, OUT)                                                    \
+    for (uint j = gl_SubgroupID; j < S_v; j += gl_NumSubgroups) {                   \
+        float acc = 0.0f;                                                           \
+        for (uint i = gl_SubgroupInvocationID; i < S_v; i += gl_SubgroupSize) {     \
+            acc += data_scratch[(Moff) + i + j*S_v] * s_k[i];                       \
+        }                                                                           \
+        acc = subgroupAdd(acc);                                                     \
+        if (gl_SubgroupInvocationID == 0u) {                                        \
+            OUT[j] = acc;                                                           \
+        }                                                                           \
+    }
+
 void main() {
-    const uint tid = gl_GlobalInvocationID.x;
-    if (tid >= p.H * p.n_seqs) {
+    const uint iv1 = gl_WorkGroupID.x;   // head
+    const uint iv3 = gl_WorkGroupID.y;   // sequence
+    if (iv1 >= p.H || iv3 >= p.n_seqs) {
         return;
     }
-    const uint iv1 = tid % p.H;
-    const uint iv3 = tid / p.H;
+
+    const uint tid  = gl_LocalInvocationIndex;
+    const uint nthr = gl_WorkGroupSize.x;
+    const uint unit = iv3 * p.H + iv1;
 
     const uint iq1 = iv1 % p.neq1;
     const uint ik1 = iv1 % p.nek1;
@@ -72,25 +144,31 @@ void main() {
     const uint g_beta_off  = g_g_off + n_g;
     const uint g_state_off = g_beta_off + n_beta;
 
+    // The trajectory dominates; S1/Snew/dS/dS1 are the four working matrices.
+    // pre/delta/gexp/dpre/ddelta moved to shared memory.
     const uint traj_stride = p.n_tokens * SS;
-    const uint per_thread   = traj_stride + 4u*SS + 5u*S_v;
-    const uint base   = tid * per_thread;
-    const uint traj    = base;
-    const uint S1      = traj + traj_stride;
-    const uint Snew     = S1 + SS;
-    const uint dS       = Snew + SS;
-    const uint dS1      = dS + SS;
-    const uint pre      = dS1 + SS;
-    const uint delta    = pre + S_v;
-    const uint gexp     = delta + S_v;
-    const uint dpre     = gexp + S_v;
-    const uint ddelta   = dpre + S_v;
+    const uint per_unit    = traj_stride + 4u*SS;
+    const uint base = unit * per_unit;
+    const uint traj = base;
+    const uint S1   = traj + traj_stride;
+    const uint Snew = S1 + SS;
+    const uint dS   = Snew + SS;
+    const uint dS1  = dS + SS;
+
+    // Flat walk of an S_v*S_v matrix keeping (i, j) in step without a modulo in
+    // the inner loop. i_step is nthr % S_v, so it is always < S_v and a single
+    // correction per step suffices.
+    const uint i0     = tid % S_v;
+    const uint j0     = tid / S_v;
+    const uint i_step = nthr % S_v;
+    const uint j_step = nthr / S_v;
 
     // ---- forward recompute: fill the S_prev trajectory ----
     const uint s0 = iv3 * state_seq_stride + iv1 * SS;
-    for (uint n = 0u; n < SS; ++n) {
+    for (uint n = tid; n < SS; n += nthr) {
         data_scratch[traj + n] = data_state[s0 + n];
     }
+    barrier();
 
     for (uint t = 0u; t + 1u < p.n_tokens; ++t) {
         const uint k_off  = ik3*p.sk3 + t*p.sk2 + ik1*p.sk1;
@@ -100,33 +178,44 @@ void main() {
         const uint g_off = gb_off * (p.kda != 0u ? S_v : 1u);
 
         const uint S_prev = traj + t*SS;
-        const uint S_next = traj + (t+1u)*SS;
+        const uint S_next = traj + (t + 1u)*SS;
 
-        if (p.kda != 0u) {
-            for (uint i = 0u; i < S_v; ++i) { data_scratch[gexp+i] = exp(data_g[g_off+i]); }
-        } else {
-            const float gv = exp(data_g[g_off]);
-            for (uint i = 0u; i < S_v; ++i) { data_scratch[gexp+i] = gv; }
+        for (uint i = tid; i < S_v; i += nthr) {
+            s_k[i]    = data_k[k_off + i];
+            s_v[i]    = data_v[v_off + i];
+            s_gexp[i] = exp(data_g[g_off + (p.kda != 0u ? i : 0u)]);
         }
-        for (uint j = 0u; j < S_v; ++j) {
-            for (uint i = 0u; i < S_v; ++i) {
-                data_scratch[S1 + i + j*S_v] = data_scratch[S_prev + i + j*S_v] * data_scratch[gexp+i];
-            }
+        barrier();
+
+        for (uint n = tid, i = i0; n < SS; n += nthr) {
+            data_scratch[S1 + n] = data_scratch[S_prev + n] * s_gexp[i];
+            i += i_step;
+            if (i >= S_v) { i -= S_v; }
         }
-        for (uint j = 0u; j < S_v; ++j) {
-            float sum = 0.0;
-            for (uint i = 0u; i < S_v; ++i) { sum += data_scratch[S1+i+j*S_v] * data_k[k_off+i]; }
-            data_scratch[delta+j] = (data_v[v_off+j] - sum) * beta_val;
+        barrier();
+
+        GDN_COL_DOT_K(S1, s_pre)
+        barrier();
+
+        for (uint j = tid; j < S_v; j += nthr) {
+            s_delta[j] = (s_v[j] - s_pre[j]) * beta_val;
         }
-        for (uint j = 0u; j < S_v; ++j) {
-            for (uint i = 0u; i < S_v; ++i) {
-                data_scratch[S_next+i+j*S_v] = data_scratch[S1+i+j*S_v] + data_k[k_off+i]*data_scratch[delta+j];
-            }
+        barrier();
+
+        for (uint n = tid, i = i0, j = j0; n < SS; n += nthr) {
+            data_scratch[S_next + n] = data_scratch[S1 + n] + s_k[i]*s_delta[j];
+            i += i_step;
+            j += j_step;
+            if (i >= S_v) { i -= S_v; ++j; }
         }
+        barrier();
     }
 
     // ---- reverse scan ----
-    for (uint n = 0u; n < SS; ++n) { data_scratch[dS+n] = 0.0; }
+    for (uint n = tid; n < SS; n += nthr) {
+        data_scratch[dS + n] = 0.0f;
+    }
+    barrier();
 
     for (int ti = int(p.n_tokens) - 1; ti >= 0; --ti) {
         const uint t = uint(ti);
@@ -138,103 +227,139 @@ void main() {
         const uint g_off = gb_off * (p.kda != 0u ? S_v : 1u);
 
         const uint S_prev = traj + t*SS;
+        const uint d_out  = (iv3*p.n_tokens*p.H + t*p.H + iv1) * S_v;
 
-        if (p.kda != 0u) {
-            for (uint i = 0u; i < S_v; ++i) { data_scratch[gexp+i] = exp(data_g[g_off+i]); }
-        } else {
-            const float gv = exp(data_g[g_off]);
-            for (uint i = 0u; i < S_v; ++i) { data_scratch[gexp+i] = gv; }
+        for (uint i = tid; i < S_v; i += nthr) {
+            s_k[i]    = data_k[k_off + i];
+            s_v[i]    = data_v[v_off + i];
+            s_q[i]    = data_q[q_off + i];
+            s_do[i]   = data_grad[d_out + i];
+            s_gexp[i] = exp(data_g[g_off + (p.kda != 0u ? i : 0u)]);
         }
-        for (uint j = 0u; j < S_v; ++j) {
-            for (uint i = 0u; i < S_v; ++i) {
-                data_scratch[S1+i+j*S_v] = data_scratch[S_prev+i+j*S_v] * data_scratch[gexp+i];
-            }
-        }
-        for (uint j = 0u; j < S_v; ++j) {
-            float sum = 0.0;
-            for (uint i = 0u; i < S_v; ++i) { sum += data_scratch[S1+i+j*S_v] * data_k[k_off+i]; }
-            data_scratch[pre+j]   = sum;
-            data_scratch[delta+j] = (data_v[v_off+j] - sum) * beta_val;
-        }
-        for (uint j = 0u; j < S_v; ++j) {
-            for (uint i = 0u; i < S_v; ++i) {
-                data_scratch[Snew+i+j*S_v] = data_scratch[S1+i+j*S_v] + data_k[k_off+i]*data_scratch[delta+j];
-            }
-        }
+        barrier();
 
-        const uint d_out = (iv3*p.n_tokens*p.H + t*p.H + iv1) * S_v;
+        for (uint n = tid, i = i0; n < SS; n += nthr) {
+            data_scratch[S1 + n] = data_scratch[S_prev + n] * s_gexp[i];
+            i += i_step;
+            if (i >= S_v) { i -= S_v; }
+        }
+        barrier();
 
+        GDN_COL_DOT_K(S1, s_pre)
+        barrier();
+
+        for (uint j = tid; j < S_v; j += nthr) {
+            s_delta[j] = (s_v[j] - s_pre[j]) * beta_val;
+        }
+        barrier();
+
+        for (uint n = tid, i = i0, j = j0; n < SS; n += nthr) {
+            data_scratch[Snew + n] = data_scratch[S1 + n] + s_k[i]*s_delta[j];
+            i += i_step;
+            j += j_step;
+            if (i >= S_v) { i -= S_v; ++j; }
+        }
+        barrier();
+
+        // dS += scale * outer(q, d_out); grad_q = scale * Snew . d_out
         const uint gq_out = g_q_off + S_v*(iq1 + p.neq1*(t + p.n_tokens*iq3));
-        for (uint i = 0u; i < S_v; ++i) {
-            float dqi = 0.0;
+        for (uint i = tid; i < S_v; i += nthr) {
+            const float q_i = s_q[i];
+            float dqi = 0.0f;
             for (uint j = 0u; j < S_v; ++j) {
-                data_scratch[dS+i+j*S_v] += p.scale * data_grad[d_out+j] * data_q[q_off+i];
-                dqi += data_scratch[Snew+i+j*S_v] * data_grad[d_out+j];
+                data_scratch[dS + i + j*S_v] += p.scale * s_do[j] * q_i;
+                dqi += data_scratch[Snew + i + j*S_v] * s_do[j];
             }
-            atomicAdd(data_dst[gq_out+i], p.scale * dqi);
+            atomicAdd(data_dst[gq_out + i], p.scale * dqi);
         }
+        barrier();
 
         const uint target_slot = p.n_tokens - 1u - t;
         if (target_slot < p.K) {
-            const uint d_snap = attn_score_elems + target_slot*state_size_per_snap + (iv3*p.H+iv1)*SS;
-            for (uint n = 0u; n < SS; ++n) {
-                data_scratch[dS+n] += data_grad[d_snap+n];
+            const uint d_snap = attn_score_elems + target_slot*state_size_per_snap
+                    + (iv3*p.H + iv1)*SS;
+            for (uint n = tid; n < SS; n += nthr) {
+                data_scratch[dS + n] += data_grad[d_snap + n];
             }
+            barrier();
         }
 
         // step 3 backward: S_new = S1 + outer(k, delta)
-        for (uint n = 0u; n < SS; ++n) { data_scratch[dS1+n] = data_scratch[dS+n]; }
-        for (uint j = 0u; j < S_v; ++j) { data_scratch[ddelta+j] = 0.0; }
-        const uint gk_out = g_k_off + S_v*(ik1 + p.nek1*(t + p.n_tokens*ik3));
-        for (uint i = 0u; i < S_v; ++i) {
-            float dki = 0.0;
-            for (uint j = 0u; j < S_v; ++j) {
-                dki += data_scratch[dS+i+j*S_v] * data_scratch[delta+j];
-                data_scratch[ddelta+j] += data_scratch[dS+i+j*S_v] * data_k[k_off+i];
-            }
-            atomicAdd(data_dst[gk_out+i], dki);
+        for (uint n = tid; n < SS; n += nthr) {
+            data_scratch[dS1 + n] = data_scratch[dS + n];
         }
+        GDN_COL_DOT_K(dS, s_ddelta)
+        const uint gk_out = g_k_off + S_v*(ik1 + p.nek1*(t + p.n_tokens*ik3));
+        for (uint i = tid; i < S_v; i += nthr) {
+            float dki = 0.0f;
+            for (uint j = 0u; j < S_v; ++j) {
+                dki += data_scratch[dS + i + j*S_v] * s_delta[j];
+            }
+            atomicAdd(data_dst[gk_out + i], dki);
+        }
+        barrier();
 
         // step 2 backward: delta[j] = beta*(v[j] - pre[j])
-        float dbeta_t = 0.0;
-        for (uint j = 0u; j < S_v; ++j) { data_scratch[dpre+j] = -data_scratch[ddelta+j]*beta_val; }
-        for (uint j = 0u; j < S_v; ++j) {
-            dbeta_t += data_scratch[ddelta+j] * (data_v[v_off+j] - data_scratch[pre+j]);
-            data_dst[g_v_off + j + S_v*(iv1 + p.H*(t + p.n_tokens*iv3))] += data_scratch[ddelta+j]*beta_val;
+        float dbeta_partial = 0.0f;
+        for (uint j = tid; j < S_v; j += nthr) {
+            const float dd = s_ddelta[j];
+            s_dpre[j] = -dd * beta_val;
+            dbeta_partial += dd * (s_v[j] - s_pre[j]);
+            data_dst[g_v_off + j + S_v*(iv1 + p.H*(t + p.n_tokens*iv3))] += dd * beta_val;
         }
-        data_dst[g_beta_off + iv1 + p.H*(t + p.n_tokens*iv3)] += dbeta_t;
-        for (uint j = 0u; j < S_v; ++j) {
-            for (uint i = 0u; i < S_v; ++i) {
-                data_scratch[dS1+i+j*S_v] += data_scratch[dpre+j]*data_k[k_off+i];
+        const float dbeta_t = block_reduce_sum(dbeta_partial);
+        if (tid == 0u) {
+            data_dst[g_beta_off + iv1 + p.H*(t + p.n_tokens*iv3)] += dbeta_t;
+        }
+        barrier();
+
+        for (uint n = tid, i = i0, j = j0; n < SS; n += nthr) {
+            data_scratch[dS1 + n] += s_dpre[j] * s_k[i];
+            i += i_step;
+            j += j_step;
+            if (i >= S_v) { i -= S_v; ++j; }
+        }
+        barrier();
+
+        for (uint i = tid; i < S_v; i += nthr) {
+            float dki2 = 0.0f;
+            for (uint j = 0u; j < S_v; ++j) {
+                dki2 += s_dpre[j] * data_scratch[S1 + i + j*S_v];
             }
+            atomicAdd(data_dst[gk_out + i], dki2);
         }
-        for (uint i = 0u; i < S_v; ++i) {
-            float dki2 = 0.0;
-            for (uint j = 0u; j < S_v; ++j) { dki2 += data_scratch[dpre+j] * data_scratch[S1+i+j*S_v]; }
-            atomicAdd(data_dst[gk_out+i], dki2);
-        }
+        barrier();
 
         // step 1 backward: S1[i,j] = S_prev[i,j] * gexp[i]
         if (p.kda != 0u) {
             const uint gg_out = g_g_off + S_v*(iv1 + p.H*(t + p.n_tokens*iv3));
-            for (uint i = 0u; i < S_v; ++i) {
-                float dgexp_i = 0.0;
+            for (uint i = tid; i < S_v; i += nthr) {
+                const float ge = s_gexp[i];
+                float dgexp_i = 0.0f;
                 for (uint j = 0u; j < S_v; ++j) {
-                    dgexp_i += data_scratch[dS1+i+j*S_v] * data_scratch[S_prev+i+j*S_v];
-                    data_scratch[dS+i+j*S_v] = data_scratch[dS1+i+j*S_v] * data_scratch[gexp+i];
+                    const uint idx = i + j*S_v;
+                    dgexp_i += data_scratch[dS1 + idx] * data_scratch[S_prev + idx];
+                    data_scratch[dS + idx] = data_scratch[dS1 + idx] * ge;
                 }
-                data_dst[gg_out+i] += dgexp_i * data_scratch[gexp+i];
+                data_dst[gg_out + i] += dgexp_i * ge;
             }
         } else {
-            float dgexp_sum = 0.0;
-            for (uint n = 0u; n < SS; ++n) { dgexp_sum += data_scratch[dS1+n]*data_scratch[S_prev+n]; }
-            for (uint n = 0u; n < SS; ++n) { data_scratch[dS+n] = data_scratch[dS1+n]*data_scratch[gexp+0]; }
-            data_dst[g_g_off + iv1 + p.H*(t + p.n_tokens*iv3)] += dgexp_sum * data_scratch[gexp+0];
+            const float ge = s_gexp[0];
+            float dgexp_partial = 0.0f;
+            for (uint n = tid; n < SS; n += nthr) {
+                dgexp_partial += data_scratch[dS1 + n] * data_scratch[S_prev + n];
+                data_scratch[dS + n] = data_scratch[dS1 + n] * ge;
+            }
+            const float dgexp_sum = block_reduce_sum(dgexp_partial);
+            if (tid == 0u) {
+                data_dst[g_g_off + iv1 + p.H*(t + p.n_tokens*iv3)] += dgexp_sum * ge;
+            }
         }
+        barrier();
     }
 
     const uint gs_out = g_state_off + iv3*state_seq_stride + iv1*SS;
-    for (uint n = 0u; n < SS; ++n) {
-        data_dst[gs_out+n] += data_scratch[dS+n];
+    for (uint n = tid; n < SS; n += nthr) {
+        data_dst[gs_out + n] += data_scratch[dS + n];
     }
 }

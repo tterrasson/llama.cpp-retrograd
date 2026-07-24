@@ -2,16 +2,28 @@
 
 #include <cstdint>
 
-// retro delta: reference (materialized, per-query-row) Flash Attention backward.
-// Correctness-first: one thread computes the full gradient for a single query row
-// (batch ib, head ih, query iq), recomputing scores/softmax/O exactly as the fork
-// CPU reference does, then accumulating dQ/dK/dV. dQ rows are unique per thread
-// and written directly; dK/dV are shared across query rows and GQA head groups,
-// so they use atomicAdd into the zero-initialized result. This is not a
-// memory-optimal flash kernel; it is validated against the CPU oracle and can be
-// specialized later without changing the probe contract.
+// retro delta: streaming Flash Attention backward, one *warp* per query row
+// (batch ib, head ih, query iq). The warp recomputes scores/softmax/O exactly as
+// the fork CPU reference does, then accumulates dQ/dK/dV. dQ rows are unique per
+// warp and written directly; dK/dV are shared across query rows and GQA head
+// groups, so they use atomicAdd into the zero-initialized result.
+//
+// The head dimension is split across the 32 lanes (lane `l` owns d = l, l+32,
+// l+64, ...), which is what makes this affordable:
+//   - the per-row accumulators are 2*FA_BACK_REGS registers per lane instead of
+//     o_acc[128] + dq[128] = 1 KiB per thread, which spilled to local memory;
+//   - the q.k and dO.v dot products become warp shuffle reductions instead of
+//     128-iteration serial loops;
+//   - the dK/dV atomics are issued 32-wide to consecutive addresses (coalesced)
+//     instead of hsk+hsv = 256 of them serialized inside one thread.
+//
+// An earlier revision ran one *thread* per query row. On a 0.6B model at
+// nq=256/nkv=1024 that is ~5e8 serialized atomicAdds per launch on top of the
+// spill traffic: 25 ms per launch, 73% of training wall-clock.
 
 #define FA_BACK_MAX_D 128
+// Head-dimension elements owned by each lane (FA_BACK_MAX_D split over a warp).
+#define FA_BACK_REGS  (FA_BACK_MAX_D/32)
 
 static __device__ __forceinline__ float fab_load(const char * base, int64_t idx,
                                                   int64_t stride0, bool is_f16) {
@@ -37,8 +49,11 @@ static __global__ void flash_attn_back_kernel(
         const size_t off_k, const size_t off_v,
         const bool kv_f16, const bool has_mask,
         const float scale, const float softcap) {
-    const int64_t row = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    const int     lane   = threadIdx.x % WARP_SIZE;
+    const int64_t row    = (int64_t(blockIdx.x)*blockDim.x + threadIdx.x) / WARP_SIZE;
     const int64_t n_rows = nq*nhead*nbatch;
+    // Warp-uniform: a whole warp owns one query row, so the guard never splits
+    // a warp and every shuffle reduction below sees all 32 lanes.
     if (row >= n_rows) {
         return;
     }
@@ -57,10 +72,21 @@ static __global__ void flash_attn_back_kernel(
     float * dV = (float *) ((char *) dst + off_v);
     const int64_t qbase = ((ib*nhead + ih)*nq + iq)*hsk;
 
-    float o_acc[FA_BACK_MAX_D];
-    float dq[FA_BACK_MAX_D];
-    for (int64_t d = 0; d < hsv; ++d) { o_acc[d] = 0.0f; }
-    for (int64_t d = 0; d < hsk; ++d) { dq[d] = 0.0f; }
+    // Lane `lane` owns head-dim elements d = lane + r*WARP_SIZE. Consecutive
+    // lanes therefore hold consecutive d, so every global load/atomic below is
+    // coalesced across the warp.
+    float qv[FA_BACK_REGS];   // q[d], cached across both passes
+    float dov[FA_BACK_REGS];  // dO[d], cached across both passes
+    float o_acc[FA_BACK_REGS];
+    float dq[FA_BACK_REGS];
+#pragma unroll
+    for (int r = 0; r < FA_BACK_REGS; ++r) {
+        const int64_t d = lane + r*WARP_SIZE;
+        qv[r]    = d < hsk ? *(const float *) (q_row  + d*nbq0) : 0.0f;
+        dov[r]   = d < hsv ? *(const float *) (dO_row + d*nbd0) : 0.0f;
+        o_acc[r] = 0.0f;
+        dq[r]    = 0.0f;
+    }
 
     // Pass 1: online softmax over K, accumulating the prob-weighted output O.
     float m = -INFINITY;
@@ -68,13 +94,17 @@ static __global__ void flash_attn_back_kernel(
     for (int64_t ik = 0; ik < nkv; ++ik) {
         const char * k_row = k + ik*nbk1 + ikh*nbk2 + ib*nbk3;
         float dot = 0.0f;
-        for (int64_t d = 0; d < hsk; ++d) {
-            dot += (*(const float *) (q_row + d*nbq0)) * fab_load(k_row, d, nbk0, kv_f16);
+#pragma unroll
+        for (int r = 0; r < FA_BACK_REGS; ++r) {
+            const int64_t d = lane + r*WARP_SIZE;
+            if (d < hsk) { dot += qv[r] * fab_load(k_row, d, nbk0, kv_f16); }
         }
+        dot = warp_reduce_sum(dot);
         float score = softcap != 0.0f ? softcap*tanhf(dot*scale/softcap) : dot*scale;
         if (has_mask) {
             score += __half2float(*(const half *) (mask_row + ik*nbm0));
         }
+        // score is identical in every lane, so this is warp-uniform.
         if (score == -INFINITY) {
             continue;
         }
@@ -83,30 +113,48 @@ static __global__ void flash_attn_back_kernel(
         const float p = expf(score - m_new);
         l = l*corr + p;
         const char * v_row = v + ik*nbv1 + ikh*nbv2 + ib*nbv3;
-        for (int64_t d = 0; d < hsv; ++d) {
-            o_acc[d] = o_acc[d]*corr + p*fab_load(v_row, d, nbv0, kv_f16);
+#pragma unroll
+        for (int r = 0; r < FA_BACK_REGS; ++r) {
+            const int64_t d = lane + r*WARP_SIZE;
+            if (d < hsv) { o_acc[r] = o_acc[r]*corr + p*fab_load(v_row, d, nbv0, kv_f16); }
         }
         m = m_new;
     }
     if (l <= 0.0f) {
         // Fully masked row: zero gradients for dQ; dK/dV get no contribution.
-        for (int64_t d = 0; d < hsk; ++d) { dQ[qbase + d] = 0.0f; }
+#pragma unroll
+        for (int r = 0; r < FA_BACK_REGS; ++r) {
+            const int64_t d = lane + r*WARP_SIZE;
+            if (d < hsk) { dQ[qbase + d] = 0.0f; }
+        }
         return;
     }
     const float inv_l = 1.0f/l;
     float delta = 0.0f;
-    for (int64_t d = 0; d < hsv; ++d) {
-        o_acc[d] *= inv_l; // O[d]
-        delta += (*(const float *) (dO_row + d*nbd0)) * o_acc[d];
+#pragma unroll
+    for (int r = 0; r < FA_BACK_REGS; ++r) {
+        const int64_t d = lane + r*WARP_SIZE;
+        if (d < hsv) {
+            o_acc[r] *= inv_l; // O[d]
+            delta += dov[r] * o_acc[r];
+        }
     }
+    delta = warp_reduce_sum(delta);
 
     // Pass 2: gradients. prob[ik] = exp(score - m)/l (recomputed).
     for (int64_t ik = 0; ik < nkv; ++ik) {
         const char * k_row = k + ik*nbk1 + ikh*nbk2 + ib*nbk3;
-        float dot = 0.0f;
-        for (int64_t d = 0; d < hsk; ++d) {
-            dot += (*(const float *) (q_row + d*nbq0)) * fab_load(k_row, d, nbk0, kv_f16);
+        const char * v_row = v + ik*nbv1 + ikh*nbv2 + ib*nbv3;
+        float dot    = 0.0f;
+        float dot_dv = 0.0f;
+#pragma unroll
+        for (int r = 0; r < FA_BACK_REGS; ++r) {
+            const int64_t d = lane + r*WARP_SIZE;
+            if (d < hsk) { dot    += qv[r]  * fab_load(k_row, d, nbk0, kv_f16); }
+            if (d < hsv) { dot_dv += dov[r] * fab_load(v_row, d, nbv0, kv_f16); }
         }
+        dot    = warp_reduce_sum(dot);
+        dot_dv = warp_reduce_sum(dot_dv);
         float score = softcap != 0.0f ? softcap*tanhf(dot*scale/softcap) : dot*scale;
         if (has_mask) {
             score += __half2float(*(const half *) (mask_row + ik*nbm0));
@@ -115,11 +163,6 @@ static __global__ void flash_attn_back_kernel(
             continue;
         }
         const float prob = expf(score - m)*inv_l;
-        const char * v_row = v + ik*nbv1 + ikh*nbv2 + ib*nbv3;
-        float dot_dv = 0.0f;
-        for (int64_t d = 0; d < hsv; ++d) {
-            dot_dv += (*(const float *) (dO_row + d*nbd0)) * fab_load(v_row, d, nbv0, kv_f16);
-        }
         float deriv = scale;
         if (softcap != 0.0f) {
             const float t = tanhf(dot*scale/softcap);
@@ -128,17 +171,22 @@ static __global__ void flash_attn_back_kernel(
         const float ds = prob*(dot_dv - delta)*deriv;
         const int64_t kbase = ((ib*nheadk + ikh)*nkv + ik)*hsk;
         const int64_t vbase = ((ib*nheadk + ikh)*nkv + ik)*hsv;
-        for (int64_t d = 0; d < hsk; ++d) {
-            const float qd = *(const float *) (q_row + d*nbq0);
-            dq[d] += ds*fab_load(k_row, d, nbk0, kv_f16);
-            atomicAdd(&dK[kbase + d], ds*qd);
-        }
-        for (int64_t d = 0; d < hsv; ++d) {
-            atomicAdd(&dV[vbase + d], prob*(*(const float *) (dO_row + d*nbd0)));
+#pragma unroll
+        for (int r = 0; r < FA_BACK_REGS; ++r) {
+            const int64_t d = lane + r*WARP_SIZE;
+            if (d < hsk) {
+                dq[r] += ds*fab_load(k_row, d, nbk0, kv_f16);
+                atomicAdd(&dK[kbase + d], ds*qv[r]);
+            }
+            if (d < hsv) {
+                atomicAdd(&dV[vbase + d], prob*dov[r]);
+            }
         }
     }
-    for (int64_t d = 0; d < hsk; ++d) {
-        dQ[qbase + d] = dq[d];
+#pragma unroll
+    for (int r = 0; r < FA_BACK_REGS; ++r) {
+        const int64_t d = lane + r*WARP_SIZE;
+        if (d < hsk) { dQ[qbase + d] = dq[r]; }
     }
 }
 
@@ -189,8 +237,10 @@ void ggml_cuda_flash_attn_back(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     CUDA_CHECK(cudaMemsetAsync(dst_d, 0, ggml_nbytes(dst), stream));
 
     const int64_t n_rows = nq*nhead*nbatch;
-    const int block = 64;
-    const int grid = (int) ((n_rows + block - 1)/block);
+    // One warp per query row.
+    const int block = 256;
+    const int rows_per_block = block/WARP_SIZE;
+    const int grid = (int) ((n_rows + rows_per_block - 1)/rows_per_block);
     flash_attn_back_kernel<<<grid, block, 0, stream>>>(
         (const char *) q->data, (const char *) k->data, (const char *) v->data,
         mask ? (const char *) mask->data : nullptr,

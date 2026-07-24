@@ -1161,6 +1161,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_ssm_conv_back_f32;
+    vk_pipeline pipeline_conv_rs_gather_f32;
     vk_pipeline pipeline_ssm_scan_back_ckpt_f32;
     vk_pipeline pipeline_ssm_scan_back_grad_f32;
     vk_pipeline pipeline_ssm_conv_silu_f32;
@@ -2094,6 +2095,14 @@ struct vk_op_ssm_conv_back_push_constants {
     uint32_t nb10, nb11;
     uint32_t nb20, nb21, nb22;
     uint32_t n_sx;
+};
+
+// retro delta: recurrent-state rollback snapshot gather (conv_rs_gather.comp).
+struct vk_op_conv_rs_gather_push_constants {
+    uint32_t kernel_m1, n_channels, n_seqs, K;
+    uint32_t base;
+    uint32_t nb00, nb01, nb02;
+    uint32_t total;
 };
 
 // retro delta: fused sparse cross-entropy (docs/memory/GPUVOCAB.md).
@@ -6409,11 +6418,16 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_back_f32, "ssm_conv_back_f32", ssm_conv_back_f32_len, ssm_conv_back_f32_data, "main", 4, sizeof(vk_op_ssm_conv_back_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_conv_rs_gather_f32, "conv_rs_gather_f32", conv_rs_gather_f32_len, conv_rs_gather_f32_data, "main", 2, sizeof(vk_op_conv_rs_gather_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_back_ckpt_f32, "ssm_scan_back_ckpt_f32", ssm_scan_back_ckpt_f32_len, ssm_scan_back_ckpt_f32_data, "main", 9, sizeof(vk_op_ssm_scan_back_push_constants), {256, 1, 1}, {}, 1);
     if (device->buffer_float32_atomic_add) {
         ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_back_grad_f32, "ssm_scan_back_grad_f32", ssm_scan_back_grad_f32_len, ssm_scan_back_grad_f32_data, "main", 12, sizeof(vk_op_ssm_scan_back_push_constants), {256, 1, 1}, {}, 1);
         // retro delta: analytic backward for GATED_DELTA_NET; also needs buffer F32 atomic add (shared grad_q/grad_k scatter).
-        ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_back_f32, "gated_delta_net_back_f32", gated_delta_net_back_f32_len, gated_delta_net_back_f32_data, "main", 9, sizeof(vk_op_gated_delta_net_back_push_constants), {32, 1, 1}, {}, 1);
+        // One workgroup of 256 per (head, sequence); the in-workgroup reductions
+        // use subgroupAdd, so full subgroups are required.
+        if (device->subgroup_basic && device->subgroup_arithmetic && device->subgroup_require_full_support) {
+            ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_back_f32, "gated_delta_net_back_f32", gated_delta_net_back_f32_len, gated_delta_net_back_f32_data, "main", 9, sizeof(vk_op_gated_delta_net_back_push_constants), {256, 1, 1}, {}, 1, false, true);
+        }
     }
 
     // retro delta: fused sparse cross-entropy (docs/memory/GPUVOCAB.md). One
@@ -12480,6 +12494,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_ssm_conv_back_f32;
         }
         return nullptr;
+    case GGML_OP_CONV_RS_GATHER:
+        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_conv_rs_gather_f32;
+        }
+        return nullptr;
     case GGML_OP_SSM_SCAN_BACK:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_ssm_scan_back_grad_f32;
@@ -13140,9 +13159,10 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             elements = { nr, n_t, n_s };
         }
         break;
+    case GGML_OP_CONV_RS_GATHER:
     case GGML_OP_SSM_CONV_BACK:
         {
-            // one thread per packed-output element ([grad_sx | grad_c])
+            // one thread per output element
             const uint32_t total = (uint32_t)ggml_nelements(dst);
             if (total > 262144) {
                 elements = { 512, 512, CEIL_DIV(total, 262144) };
@@ -13720,9 +13740,10 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
 }
 
 // retro delta: analytic backward for GATED_DELTA_NET (gated_delta_net_back.comp).
-// Correctness-first, single dispatch: one invocation per (head, sequence) unit
-// recomputes the trajectory into a scratch buffer (ctx->prealloc_x), then
-// reverse-scans it. See the shader's header comment for the memory tradeoff.
+// Single dispatch: one workgroup of 256 per (head, sequence) unit recomputes the
+// trajectory into a scratch buffer (ctx->prealloc_x), then reverse-scans it, with
+// each O(S_v^2) step of the sequential token scan spread across the workgroup.
+// See the shader's header comment for the parallelisation and memory tradeoffs.
 static void ggml_vk_gated_delta_net_back(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     const ggml_tensor * src_q     = dst->src[0];
     const ggml_tensor * src_k     = dst->src[1];
@@ -13780,10 +13801,12 @@ static void ggml_vk_gated_delta_net_back(ggml_backend_vk_context * ctx, vk_conte
         src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i]);
     }
 
+    // The trajectory dominates; S1/Snew/dS/dS1 are the four working matrices.
+    // pre/delta/gexp/dpre/ddelta live in the shader's shared memory.
     const uint64_t SS          = (uint64_t)S_v * S_v;
-    const uint64_t per_thread  = (uint64_t)n_tokens * SS + 4ull*SS + 5ull*S_v;
-    const uint64_t n_threads   = (uint64_t)H * n_seqs;
-    const size_t   scratch_bytes = (size_t)(per_thread * n_threads) * sizeof(float);
+    const uint64_t per_unit    = (uint64_t)n_tokens * SS + 4ull*SS;
+    const uint64_t n_units     = (uint64_t)H * n_seqs;
+    const size_t   scratch_bytes = (size_t)(per_unit * n_units) * sizeof(float);
 
     if (ctx->prealloc_size_x < scratch_bytes) {
         ctx->prealloc_size_x = scratch_bytes;
@@ -13794,9 +13817,11 @@ static void ggml_vk_gated_delta_net_back(ggml_backend_vk_context * ctx, vk_conte
     ggml_vk_buffer_memset_async(subctx, dst_buf.buffer, dst_buf.offset, 0, dst_buf.size);
     ggml_vk_sync_buffers(ctx, subctx);
 
+    // One workgroup of 256 per (head, sequence): wg_denoms is {256,1,1}, so the
+    // x element count is H*256 and the shader reads the unit off gl_WorkGroupID.
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], src_buf[6], dst_buf, scratch_buf},
-        pc, { H * n_seqs, 1, 1 });
+        pc, { H * 256, n_seqs, 1 });
 
     ctx->prealloc_x_need_sync = true;
 }
@@ -13977,6 +14002,23 @@ static void ggml_vk_ssm_conv_back(ggml_backend_vk_context * ctx, vk_context& sub
         (uint32_t)(src1->nb[0] / sizeof(float)), (uint32_t)(src1->nb[1] / sizeof(float)),
         (uint32_t)(src2->nb[0] / sizeof(float)), (uint32_t)(src2->nb[1] / sizeof(float)), (uint32_t)(src2->nb[2] / sizeof(float)),
         n_sx,
+    });
+}
+
+// retro delta: recurrent-state rollback snapshot gather (conv_rs_gather.comp).
+// One thread per output element; see the shader header for the slot layout.
+static void ggml_vk_conv_rs_gather(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
+    const uint32_t kernel_m1  = (uint32_t)ggml_get_op_params_i32(dst, 0);
+    const uint32_t K          = (uint32_t)ggml_get_op_params_i32(dst, 1);
+    const uint32_t n_channels = (uint32_t)src0->ne[1];
+    const uint32_t n_seqs     = (uint32_t)src0->ne[2];
+    const uint32_t base       = (uint32_t)(src0->ne[0] - (int64_t)kernel_m1);
+
+    ggml_vk_op_f32<vk_op_conv_rs_gather_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_CONV_RS_GATHER, {
+        kernel_m1, n_channels, n_seqs, K,
+        base,
+        (uint32_t)(src0->nb[0] / sizeof(float)), (uint32_t)(src0->nb[1] / sizeof(float)), (uint32_t)(src0->nb[2] / sizeof(float)),
+        (uint32_t)ggml_nelements(dst),
     });
 }
 
@@ -17237,6 +17279,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
     case GGML_OP_SSM_CONV_BACK:
         ggml_vk_ssm_conv_back(ctx, compute_ctx, src0, src1, src2, node);
+
+        break;
+
+    case GGML_OP_CONV_RS_GATHER:
+        ggml_vk_conv_rs_gather(ctx, compute_ctx, src0, node);
 
         break;
 
@@ -20568,9 +20615,17 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_GATED_DELTA_NET_BACK:
             {
-                // retro delta: reference kernel (gated_delta_net_back.comp).
-                // Needs buffer F32 atomic add for the shared grad_q/grad_k scatter.
-                if (!device->buffer_float32_atomic_add) {
+                // retro delta: gated_delta_net_back.comp. Needs buffer F32 atomic
+                // add for the shared grad_q/grad_k scatter, and full subgroups for
+                // the in-workgroup reductions.
+                if (!device->buffer_float32_atomic_add ||
+                    !device->subgroup_basic || !device->subgroup_arithmetic ||
+                    !device->subgroup_require_full_support) {
+                    return false;
+                }
+                // The shader's nine per-token vectors are shared memory, sized at
+                // compile time by GDN_S_V_MAX. Wider heads fall back to the CPU.
+                if (op->src[2] == nullptr || op->src[2]->ne[0] > 256) {
                     return false;
                 }
                 for (int i = 0; i < 7; i++) {
@@ -20629,6 +20684,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 && op->src[0]->type == GGML_TYPE_F32
                 && op->src[1]->type == GGML_TYPE_F32
                 && op->src[2]->type == GGML_TYPE_F32;
+        case GGML_OP_CONV_RS_GATHER:
+            // retro delta: recurrent-state rollback snapshot gather.
+            return op->type == GGML_TYPE_F32
+                && op->src[0]->type == GGML_TYPE_F32
+                && ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_SSM_SCAN_BACK:
             {
                 // needs buffer F32 atomic add for the gradient scatter

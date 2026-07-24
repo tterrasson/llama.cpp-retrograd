@@ -11491,6 +11491,59 @@ void ggml_compute_forward_gated_delta_net(
     }
 }
 
+// ggml_compute_forward_conv_rs_gather
+//
+// retro delta: single-launch replacement for the K-iteration host loop in
+// build_conv_state's rollback branch (delta-net-base.cpp, [TAG_RECURRENT_ROLLBACK_SPLITS]).
+// Gathers the K overlapping causal-conv snapshot windows from conv_input into
+// one contiguous [row_count, n_seqs, K] tensor; the caller then does a single
+// ggml_cpy into the recurrent-state cache instead of K separate cpy nodes.
+// Reproduces the original per-slot formula exactly: slot 0 is the window
+// ending at the last token, slot s reads s tokens further back, clamped to
+// the start of conv_input's new-token region when n_seq_tokens < K.
+void ggml_compute_forward_conv_rs_gather(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const struct ggml_tensor * conv_input = dst->src[0];
+    GGML_ASSERT(conv_input->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int64_t kernel_m1 = ggml_get_op_params_i32(dst, 0);
+    const int64_t K         = ggml_get_op_params_i32(dst, 1);
+
+    const int64_t n_channels = conv_input->ne[1];
+    const int64_t n_seqs     = conv_input->ne[2];
+    const int64_t base       = conv_input->ne[0] - kernel_m1; // n_seq_tokens
+
+    const size_t nb0_in = conv_input->nb[0];
+    const size_t nb1_in = conv_input->nb[1];
+    const size_t nb2_in = conv_input->nb[2];
+
+    const int64_t row_count = kernel_m1 * n_channels;
+
+    const char * src_base = (const char *) conv_input->data;
+    float       * dst_data = (float *) dst->data;
+
+    for (int64_t slot = 0; slot < K; ++slot) {
+        const int64_t s_idx = std::max<int64_t>(0, base - slot);
+        float * dst_slot = dst_data + slot * row_count * n_seqs;
+        for (int64_t s = 0; s < n_seqs; ++s) {
+            float * dst_seq = dst_slot + s * row_count;
+            for (int64_t c = 0; c < n_channels; ++c) {
+                const char * src_col = src_base + (size_t) s * nb2_in + (size_t) c * nb1_in
+                        + (size_t) s_idx * nb0_in;
+                float * dst_col = dst_seq + c * kernel_m1;
+                for (int64_t k = 0; k < kernel_m1; ++k) {
+                    dst_col[k] = *(const float *)(src_col + (size_t) k * nb0_in);
+                }
+            }
+        }
+    }
+}
 
 // ggml_compute_forward_gated_delta_net_back
 //

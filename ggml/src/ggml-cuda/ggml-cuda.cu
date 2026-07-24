@@ -64,6 +64,7 @@
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/gated-delta-net-back.cuh"
+#include "ggml-cuda/conv_rs_gather.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
@@ -2400,6 +2401,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_GATED_DELTA_NET_BACK:
             ggml_cuda_op_gated_delta_net_back(ctx, dst);
+            break;
+        case GGML_OP_CONV_RS_GATHER:
+            ggml_cuda_op_conv_rs_gather(ctx, dst);
             break;
         case GGML_OP_DSV4_HC_COMB:
             ggml_cuda_op_dsv4_hc_comb(ctx, dst);
@@ -5536,6 +5540,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                    op->src[5]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[5]) &&
                    op->src[6]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[6]);
 #endif // GGML_USE_MUSA
+        case GGML_OP_CONV_RS_GATHER:
+            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_DSV4_HC_COMB:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
