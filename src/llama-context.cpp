@@ -3635,6 +3635,44 @@ static size_t llama_opt_metadata_size(
     return result;
 }
 
+// retro delta: see llama_opt_memory. Cheap enough to call a few times per ubatch
+// (a driver budget query, no synchronization), and it must be called from inside
+// the step: the peak is transient and a host-side sampler between steps misses it.
+void llama_context::opt_memory_sample() {
+    size_t scratch = 0;
+    ggml_backend_dev_t device = nullptr;
+    for (const ggml_backend_ptr & backend : backends) {
+        if (backend.get() == backend_cpu) {
+            continue;
+        }
+        scratch += ggml_backend_scratch_bytes(backend.get());
+        if (!device) {
+            // The first non-CPU backend owns the budget being reported. Multi-GPU
+            // would need one row per device; that is out of scope here and the
+            // n_samples/total pair makes a single-device reading self-describing.
+            device = ggml_backend_get_device(backend.get());
+        }
+    }
+    if (!device) {
+        return;
+    }
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    ggml_backend_dev_memory(device, &free_bytes, &total_bytes);
+    if (total_bytes == 0) {
+        // A backend that cannot report its budget answers 0/0. That is not a
+        // measurement, so it must not be folded in as "zero used".
+        return;
+    }
+    const size_t used = total_bytes - std::min(free_bytes, total_bytes);
+    opt_memory.device_used_bytes      = used;
+    opt_memory.device_total_bytes     = total_bytes;
+    opt_memory.device_peak_used_bytes = std::max(opt_memory.device_peak_used_bytes, used);
+    opt_memory.scratch_bytes          = scratch;
+    opt_memory.scratch_peak_bytes     = std::max(opt_memory.scratch_peak_bytes, scratch);
+    opt_memory.n_samples++;
+}
+
 void llama_context::opt_init(struct llama_model * model, struct llama_opt_params lopt_params) {
     GGML_ASSERT(!opt_ctx);
     model->hparams.n_ctx_train = lopt_params.n_ctx_train > 0 ? lopt_params.n_ctx_train : n_ctx();
@@ -3700,6 +3738,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     opt_gradient_checkpointing = lopt_params.gradient_checkpointing;
     opt_checkpoint_every_n_layers = lopt_params.checkpoint_every_n_layers > 0
             ? lopt_params.checkpoint_every_n_layers : 1;
+    opt_checkpoint_type = lopt_params.checkpoint_type;
     const enum ggml_opt_loss_type loss_type = opt_fused_ce
             ? GGML_OPT_LOSS_TYPE_EXTERNAL
             : GGML_OPT_LOSS_TYPE_CROSS_ENTROPY;
@@ -3885,6 +3924,7 @@ int32_t llama_context::opt_preflight(llama_opt_preflight_cb callback, void * use
         if (!gradient_checkpoints.empty()) {
             ggml_opt_set_gradient_checkpoints(opt_ctx, gradient_checkpoints.data(),
                     (int) gradient_checkpoints.size());
+            ggml_opt_set_gradient_checkpoint_type(opt_ctx, opt_checkpoint_type); // retro delta
         }
         ggml_opt_alloc(opt_ctx, /*backward =*/ true);
 
@@ -4068,6 +4108,7 @@ void llama_context::opt_epoch_iter(
             ggml_opt_alloc(opt_ctx, train);
             opt_timing.allocation_seconds += std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - allocation_started).count();
+            opt_memory_sample(); // retro delta
 
             res->set_inputs(&ubatch);
             if (opt_fused_ce) {
@@ -4138,6 +4179,7 @@ void llama_context::opt_epoch_iter(
             ggml_opt_eval(opt_ctx, result);
             opt_timing.execution_seconds += std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - execution_started).count();
+            opt_memory_sample(); // retro delta
             if (callback) {
                 callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_ubatch + 1, ndata_in_loop, t_loop_start);
             }
@@ -4325,11 +4367,13 @@ bool llama_context::opt_step_packed_sequences(
             if (!gradient_checkpoints.empty()) {
                 ggml_opt_set_gradient_checkpoints(opt_ctx, gradient_checkpoints.data(),
                         (int) gradient_checkpoints.size());
+                ggml_opt_set_gradient_checkpoint_type(opt_ctx, opt_checkpoint_type); // retro delta
             }
             ggml_opt_alloc(opt_ctx, /*backward =*/ true);
             ggml_opt_set_graph_cache(opt_ctx, true);
             opt_timing.allocation_seconds += std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - allocation_started).count();
+            opt_memory_sample(); // retro delta
         } else {
             // Token scoring and generation share this scheduler. They may have
             // replaced its allocation since the previous optimizer step; the
@@ -4339,6 +4383,7 @@ bool llama_context::opt_step_packed_sequences(
             ggml_opt_alloc(opt_ctx, /*backward =*/ true);
             opt_timing.allocation_seconds += std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - allocation_started).count();
+            opt_memory_sample(); // retro delta
         }
         res->set_inputs(&ubatch);
 
@@ -4408,6 +4453,7 @@ bool llama_context::opt_step_packed_sequences(
         ggml_opt_eval(opt_ctx, result);
         opt_timing.execution_seconds += std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - execution_started).count();
+        opt_memory_sample(); // retro delta
         if (callback) {
             callback(true, opt_ctx, dataset, result, 1, 1, ggml_time_us());
         }
@@ -5302,6 +5348,16 @@ void llama_opt_get_timing(
         return;
     }
     *out_timing = ctx->opt_timing_get();
+}
+
+// retro delta
+void llama_opt_get_memory(
+        const struct llama_context * ctx,
+        struct llama_opt_memory * out_memory) {
+    if (!ctx || !out_memory) {
+        return;
+    }
+    *out_memory = ctx->opt_memory_get();
 }
 
 //

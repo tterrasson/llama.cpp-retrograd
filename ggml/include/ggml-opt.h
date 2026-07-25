@@ -253,6 +253,14 @@ extern "C" {
         struct ggml_tensor ** checkpoints,
         int                   n_checkpoints);
 
+    // retro delta: type the retained checkpoints are held in across the backward.
+    // GGML_TYPE_F16 halves that term at the cost of recompute bit-parity, since
+    // the recomputed activations then start from a rounded checkpoint.
+    // GGML_TYPE_COUNT (the default) or GGML_TYPE_F32 keeps them unchanged.
+    GGML_API void ggml_opt_set_gradient_checkpoint_type(
+        ggml_opt_context_t opt_ctx,
+        enum ggml_type     type);
+
     // allocate the next graph for evaluation, either forward or forward + backward
     // must be called exactly once prior to calling ggml_opt_eval
     GGML_API void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward);

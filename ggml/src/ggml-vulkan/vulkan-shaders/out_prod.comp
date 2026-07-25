@@ -1,6 +1,7 @@
 #version 450
 
 #extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : enable
 
 layout (push_constant) uniform parameter
 {
@@ -16,56 +17,114 @@ layout (binding = 0) readonly buffer A {float data_a[];};
 layout (binding = 1) readonly buffer B {float data_b[];};
 layout (binding = 2) writeonly buffer D {float data_d[];};
 
-uint get_idx() {
-    return gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
-}
-
 uint get_aoffset() { return p.misalign_offsets >> 16; }
 uint get_boffset() { return (p.misalign_offsets >> 8) & 0xFF; }
 uint get_doffset() { return p.misalign_offsets & 0xFF; }
 
+// retro delta: dst[i0,i1,i2,i3] = Sum_k src0[i0,k,a_i2,a_i3] * src1[i1,k,i2,i3],
+// as a tiled GEMM over the reduction axis ne01.
+//
+// The previous shape was one dst element per thread with the reduction advanced one
+// k at a time, which cost two barrier() per k -- for a 12B ffn_up (K = 15360) about
+// 30000 group synchronizations per workgroup, leaving the reduction serialized on
+// barrier latency. It also loaded only 32 of 256 threads' worth of operands per
+// step, yielded one FMA per pair of shared-memory reads, and left half the tile's
+// columns idle whenever ne21 < 16 -- the nominal training case, since ne21 is the
+// token count and n_ubatch is small.
+//
+// Tiling addresses all four: one barrier pair per BK-slice rather than per element
+// (BK times fewer), every thread participating in both cooperative loads, and TM
+// outputs per thread so each B value read from shared memory feeds TM fused
+// multiply-adds instead of one.
+//
+// BM grows to 64 while BN stays 16 on purpose: dst is ne00 x n_tokens, so it is tall
+// and thin in this regime, and a square tile would spend most of itself on columns
+// that do not exist.
+//
+// The accumulation order is deliberately unchanged -- k ascends within a slice and
+// the slices ascend, so every dst element sums the same terms in the same sequence
+// as before. This rewrite is therefore bit-exact against both the previous shader
+// and the CPU reference, and the existing probes must pass without any tolerance
+// being widened.
+#define BM 64u
+#define BN 16u
+#define BK 16u
+#define TM 4u
+#define WG_SIZE 256u
+
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
-shared float tile_a[16];
-shared float tile_b[16];
+shared float tile_a[BK * BM];
+shared float tile_b[BK * BN];
 
 void main() {
-    const uint lx = gl_LocalInvocationIndex & 15u;
-    const uint ly = gl_LocalInvocationIndex >> 4u;
-    const uint i0 = gl_WorkGroupID.x * 16u + lx;
-    const uint i1 = gl_WorkGroupID.y * 16u + ly;
+    const uint tid = gl_LocalInvocationIndex;
+    // tn varies fastest, so a subgroup reads consecutive tile_b entries and its TM
+    // tile_a reads collapse onto few distinct addresses.
+    const uint tn = tid % BN;
+    const uint tm = tid / BN;
+
+    const uint m0 = gl_WorkGroupID.x * BM;
+    const uint n0 = gl_WorkGroupID.y * BN;
     const uint i2 = gl_WorkGroupID.z % p.ne22;
     const uint i3 = gl_WorkGroupID.z / p.ne22;
-    const bool valid = i0 < p.ne20 && i1 < p.ne21 && i3 < p.ne23;
+    // Uniform across the workgroup, so returning here cannot strand a barrier.
+    if (i3 >= p.ne23) {
+        return;
+    }
 
-    uint a_i0 = i0 % p.ne00;
-    uint a_i2 = i2 / (p.ne22 / p.ne02);
-    uint a_i3 = i3 / (p.ne23 / p.ne03);
+    // src0 rows broadcast over the batch dims (dps2/dps3 style).
+    const uint a_i2 = i2 / (p.ne22 / p.ne02);
+    const uint a_i3 = i3 / (p.ne23 / p.ne03);
+    const uint a_base = get_aoffset() + a_i3 * p.nb03 + a_i2 * p.nb02;
+    const uint b_base = get_boffset() + i3 * p.nb13 + i2 * p.nb12;
 
-    uint b_i0 = i1 % p.ne10;
-    uint b_i2 = i2;
-    uint b_i3 = i3;
+    float acc[TM];
+    [[unroll]] for (uint r = 0u; r < TM; ++r) {
+        acc[r] = 0.0f;
+    }
 
-    float sum = 0.0f;
-    uint K = p.ne01;
-    for (uint k = 0; k < K; k++) {
-        if (ly == 0u) {
-            uint aoff = get_aoffset() + a_i3*p.nb03 + a_i2*p.nb02 + k*p.nb01 + a_i0*p.nb00;
-            tile_a[lx] = i0 < p.ne20 ? data_a[aoff] : 0.0f;
+    const uint K = p.ne01;
+    for (uint k0 = 0u; k0 < K; k0 += BK) {
+        // Out-of-range lanes store zero instead of skipping, so the inner product
+        // needs no per-element predicate and the padding contributes nothing.
+        [[unroll]] for (uint l = tid; l < BK * BM; l += WG_SIZE) {
+            const uint kk = l / BM;
+            const uint mm = l % BM;
+            const uint m = m0 + mm;
+            const uint k = k0 + kk;
+            float v = 0.0f;
+            if (m < p.ne20 && k < K) {
+                v = data_a[a_base + k * p.nb01 + (m % p.ne00) * p.nb00];
+            }
+            tile_a[kk * BM + mm] = v;
         }
-        if (lx == 0u) {
-            uint boff = get_boffset() + b_i3*p.nb13 + b_i2*p.nb12 + k*p.nb11 + b_i0*p.nb10;
-            tile_b[ly] = i1 < p.ne21 ? data_b[boff] : 0.0f;
+        [[unroll]] for (uint l = tid; l < BK * BN; l += WG_SIZE) {
+            const uint kk = l / BN;
+            const uint nn = l % BN;
+            const uint n = n0 + nn;
+            const uint k = k0 + kk;
+            float v = 0.0f;
+            if (n < p.ne21 && k < K) {
+                v = data_b[b_base + k * p.nb11 + (n % p.ne10) * p.nb10];
+            }
+            tile_b[kk * BN + nn] = v;
         }
         barrier();
-        if (valid) {
-            sum += tile_a[lx] * tile_b[ly];
+        [[unroll]] for (uint kk = 0u; kk < BK; ++kk) {
+            const float bv = tile_b[kk * BN + tn];
+            [[unroll]] for (uint r = 0u; r < TM; ++r) {
+                acc[r] += tile_a[kk * BM + tm * TM + r] * bv;
+            }
         }
         barrier();
     }
 
-    if (valid) {
-        uint doff = get_doffset() + i3*p.nb23 + i2*p.nb22 + i1*p.nb21 + i0*p.nb20;
-        data_d[doff] = sum;
+    const uint n = n0 + tn;
+    [[unroll]] for (uint r = 0u; r < TM; ++r) {
+        const uint m = m0 + tm * TM + r;
+        if (m < p.ne20 && n < p.ne21) {
+            data_d[get_doffset() + i3 * p.nb23 + i2 * p.nb22 + n * p.nb21 + m * p.nb20] = acc[r];
+        }
     }
 }

@@ -431,6 +431,8 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
 
     ggml_cuda_buffer buffer_pool[MAX_BUFFERS] = {};
     size_t pool_size = 0;
+    // retro delta: see ggml_cuda_pool::reserved_bytes.
+    size_t pool_size_max = 0;
 
     explicit ggml_cuda_pool_leg(int device) :
         device(device) {
@@ -512,6 +514,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         CUDA_CHECK(err);
         *actual_size = look_ahead_size;
         pool_size += look_ahead_size;
+        pool_size_max = std::max(pool_size_max, pool_size);
 #ifdef DEBUG_CUDA_MALLOC
         GGML_LOG_INFO("%s[%d]: %d buffers, max_size = %u MB, pool_size = %u MB, requested %u MB\n", __func__, device, nnz,
                            (uint32_t)(max_size / 1024 / 1024), (uint32_t)(pool_size / 1024 / 1024), (uint32_t)(size / 1024 / 1024));
@@ -532,6 +535,11 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(ptr));
         pool_size -= size;
+    }
+
+    // retro delta
+    size_t reserved_bytes() const override {
+        return pool_size_max;
     }
 };
 
@@ -682,6 +690,12 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 
         // all deallocations must be in reverse order of the allocations
         GGML_ASSERT(ptr == (void *) ((char *)(pool_addr) + pool_used));
+    }
+
+    // retro delta: physical memory mapped into the reservation. It only ever grows
+    // (nothing unmaps before the destructor), so the live value *is* the high-water.
+    size_t reserved_bytes() const override {
+        return pool_size;
     }
 };
 #endif // defined(GGML_USE_VMM)
@@ -4530,6 +4544,15 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
     }
 }
 
+// retro delta: the CUDA pool is where every transient training scratch lives
+// (dequantization slices, out_prod staging, split-k accumulators) and it never
+// returns memory to the driver, so its high-water is the missing term between the
+// summed ggml_backend_buffer sizes and what the device actually holds.
+static size_t ggml_backend_cuda_get_scratch_bytes(ggml_backend_t backend) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    return cuda_ctx->pool_reserved_bytes();
+}
+
 static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
@@ -4815,6 +4838,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .event_record            = */ ggml_backend_cuda_event_record,
     /* .event_wait              = */ ggml_backend_cuda_event_wait,
     /* .graph_optimize          = */ ggml_backend_cuda_graph_optimize,
+    /* .get_scratch_bytes       = */ ggml_backend_cuda_get_scratch_bytes, // retro delta
 };
 
 static ggml_guid_t ggml_backend_cuda_guid() {

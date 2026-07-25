@@ -1655,6 +1655,11 @@ extern "C" {
         // backward pass, retaining every Nth layer output as a checkpoint.
         bool    gradient_checkpointing;
         uint32_t checkpoint_every_n_layers;
+        // retro delta: type the retained checkpoints are held in across the
+        // backward. GGML_TYPE_F16 halves that term; GGML_TYPE_COUNT or
+        // GGML_TYPE_F32 keeps the bit-exact default. Ignored without
+        // gradient_checkpointing.
+        enum ggml_type checkpoint_type;
     };
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
@@ -1719,6 +1724,34 @@ extern "C" {
     LLAMA_API void llama_opt_get_timing(
             const struct llama_context * lctx,
             struct llama_opt_timing * out_timing);
+
+    // retro delta: device-memory high-water of the optimizer path.
+    //
+    // Summing ggml_backend_buffer sizes misses the term that decides whether a
+    // long-context step fits: the backends' own scratch (CUDA pool, Vulkan
+    // prealloc_*) plus whatever the graph allocator holds transiently. Sampling
+    // that from the host between steps cannot work either — the peak lives inside
+    // a single ggml_opt_eval. So the runtime samples it at the two points where it
+    // occurs, right after graph allocation and right after evaluation, and keeps
+    // the maximum here.
+    //
+    // `device_*` come from ggml_backend_dev_memory and are therefore device-wide:
+    // other processes are included, so compare deltas rather than reading the
+    // absolute value as "this run's VRAM". `scratch_bytes` is per-backend and
+    // attributable. All fields are zero when no non-CPU device is active, and
+    // `n_samples` says whether a zero means "unavailable" or "measured zero".
+    typedef struct llama_opt_memory {
+        size_t   device_used_bytes;       // most recent total - free
+        size_t   device_total_bytes;      // device budget
+        size_t   device_peak_used_bytes;  // high-water of device_used_bytes
+        size_t   scratch_bytes;           // backend-owned scratch, most recent
+        size_t   scratch_peak_bytes;      // high-water of scratch_bytes
+        uint64_t n_samples;
+    } llama_opt_memory;
+
+    LLAMA_API void llama_opt_get_memory(
+            const struct llama_context * lctx,
+            struct llama_opt_memory * out_memory);
 
     // retro delta: training-graph preflight. Requires llama_opt_init.
     enum llama_opt_preflight_check {

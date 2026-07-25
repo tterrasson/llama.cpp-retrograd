@@ -59,6 +59,20 @@ static void ggml_cuda_out_prod_gemm(
         float beta) {
     cudaStream_t   stream = ctx.stream();
     cublasHandle_t handle = ctx.cublas_handle();
+    // retro delta: OUT_PROD is a *gradient* (dW for a LoRA factor, dX through a
+    // frozen projection), so it runs in true F32 rather than the TF32 mode
+    // common.cuh installs on every handle for inference mul_mat. Two reasons, and
+    // the second is why this is not merely a nicety:
+    //   - TF32 keeps 10 mantissa bits, i.e. ~1e-3 relative. A gradient that wrong
+    //     does not fail a loss test, it slowly degrades training.
+    //   - cuBLAS picks TF32 tensor-core kernels per shape, so with TF32 on, the
+    //     result depends on `k` -- and `k` is the reduction slice width chosen from
+    //     a scratch budget below. That made a pure regrouping of the k-sum move the
+    //     result by 1.3e-3 (measured, RTX 4090) and would make the budget, a memory
+    //     knob, silently change numerics.
+    // Same set/restore idiom as solve_tri.cu, which needs it for the same reason.
+    CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH));
+
     const float alpha = 1.0f;
 
     if (dps2 == 1 && ne2 > 1) {
@@ -109,6 +123,9 @@ static void ggml_cuda_out_prod_gemm(
                             src1_d, ldb,
                     &beta,  dst_d,  ldc));
     }
+
+    // revert to standard mode from common.cuh
+    CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH));
 }
 
 void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

@@ -6355,9 +6355,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_col2im_1d_f16,  "col2im_1d_f16",  col2im_1d_f16_len,  col2im_1d_f16_data,  "main", 2, sizeof(vk_op_col2im_1d_push_constants), {256, 1, 1}, {}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_col2im_1d_bf16, "col2im_1d_bf16", col2im_1d_bf16_len, col2im_1d_bf16_data, "main", 2, sizeof(vk_op_col2im_1d_push_constants), {256, 1, 1}, {}, 1, true);
 
-    ggml_vk_create_pipeline(device, device->pipeline_out_prod_f32, "out_prod_f32", out_prod_f32_len, out_prod_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {16, 16, 1}, {}, 1);
+    // retro delta: the out_prod shaders compute a BM=64 x BN=16 dst tile per
+    // workgroup (see out_prod.comp), so the workgroup denominators must match the
+    // tile, not the 256-thread local size.
+    ggml_vk_create_pipeline(device, device->pipeline_out_prod_f32, "out_prod_f32", out_prod_f32_len, out_prod_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {64, 16, 1}, {}, 1);
 #define CREATE_OUT_PROD_QUANT(TYPE, NAMELC) \
-    ggml_vk_create_pipeline(device, device->pipeline_out_prod_quant_f32[TYPE], "out_prod_" #NAMELC "_f32", out_prod_ ## NAMELC ## _f32_len, out_prod_ ## NAMELC ## _f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {16, 16, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_out_prod_quant_f32[TYPE], "out_prod_" #NAMELC "_f32", out_prod_ ## NAMELC ## _f32_len, out_prod_ ## NAMELC ## _f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {64, 16, 1}, {}, 1);
     CREATE_OUT_PROD_QUANT(GGML_TYPE_Q4_0, q4_0)
     CREATE_OUT_PROD_QUANT(GGML_TYPE_Q4_1, q4_1)
     CREATE_OUT_PROD_QUANT(GGML_TYPE_Q5_0, q5_0)
@@ -12963,8 +12966,9 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             }
         } break;
     case GGML_OP_OUT_PROD:
-        // One 16x16 output tile per workgroup; shader local_size_x remains 256
-        // and maps its linear local id to (tile column, tile row).
+        // retro delta: one BM=64 x BN=16 output tile per workgroup; local_size_x
+        // remains 256 and each thread accumulates TM=4 dst rows. The tile is tall
+        // and thin because dst is ne00 x n_tokens and n_tokens is the ubatch.
         elements = {
             (uint32_t)dst->ne[0],
             (uint32_t)dst->ne[1],
@@ -19416,6 +19420,25 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     UNUSED(backend);
 }
 
+// retro delta: the prealloc_* buffers are the Vulkan equivalent of the CUDA pool —
+// per-context scratch for dequantization, split-k accumulation and the training
+// kernels' staging, owned by the backend and absent from every
+// ggml_backend_buffer. They are only ever reallocated larger (see
+// ggml_vk_preallocate_buffers), so the live sizes are already the high-water mark.
+// sync_staging is deliberately excluded: it is host-visible transfer memory, not
+// part of the device budget this reports on.
+static size_t ggml_backend_vk_get_scratch_bytes(ggml_backend_t backend) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    size_t total = 0;
+    for (const vk_buffer & buffer : { ctx->prealloc_x, ctx->prealloc_y,
+                                      ctx->prealloc_split_k, ctx->prealloc_add_rms_partials }) {
+        if (buffer != nullptr) {
+            total += buffer->size;
+        }
+    }
+    return total;
+}
+
 // Sort the graph for improved parallelism.
 static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, struct ggml_backend_graph_optimize_params * params)
 {
@@ -19872,6 +19895,7 @@ static ggml_backend_i ggml_backend_vk_interface = {
     /* .event_record            = */ ggml_backend_vk_event_record,
     /* .event_wait              = */ ggml_backend_vk_event_wait,
     /* .graph_optimize          = */ ggml_vk_graph_optimize,
+    /* .get_scratch_bytes       = */ ggml_backend_vk_get_scratch_bytes, // retro delta
 };
 
 static ggml_guid_t ggml_backend_vk_guid() {

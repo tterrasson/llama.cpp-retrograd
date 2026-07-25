@@ -8286,6 +8286,7 @@ struct ggml_cgraph * ggml_build_backward_gradient_checkpointing(
         struct ggml_tensor ** grad_accs,
         struct ggml_tensor ** checkpoints,
         int                   n_checkpoints,
+        enum ggml_type        checkpoint_type,
         void (*on_recompute)(struct ggml_tensor *, struct ggml_tensor *, void *),
         void * userdata) {
     GGML_ASSERT(n_checkpoints > 0);
@@ -8296,6 +8297,51 @@ struct ggml_cgraph * ggml_build_backward_gradient_checkpointing(
     struct ggml_cgraph * gb_tmp = ggml_graph_dup(ctx, gf, /*force_grads =*/ true);
     ggml_build_backward_expand(ctx, gb_tmp, grad_accs);
 
+    // retro delta: optionally hold each checkpoint in a narrower type while the
+    // backward runs. Two casts per checkpoint: a `store` into checkpoint_type,
+    // appended below so it is the checkpoint's last forward consumer, and a `fetch`
+    // back to the original type, which the first recompute that reads the
+    // checkpoint pulls into the backward.
+    //
+    // What this does and does not save. The store is appended *after* the forward
+    // rather than spliced in right after its checkpoint, which keeps this change to
+    // graph append operations instead of a reordering of the forward node array.
+    // The consequence is exact and worth stating: across the backward — where the
+    // peak of a checkpointed step sits, since gradients, recompute and checkpoints
+    // are all live — only the narrow copies are held, so that phase drops by the
+    // difference. Across the forward the original activations are still pinned to
+    // the end, and at the forward/backward boundary both exist at once. Splicing
+    // the stores into forward order would remove that boundary overlap too; it
+    // costs a rebuild of the node array and is not worth it while checkpoints are
+    // small (they scale with n_ubatch, so revisit alongside a large-ubatch regime).
+    //
+    // Gradients do not flow through either cast. Only *value* reads of a
+    // checkpoint are redirected to the fetch; the gradient chain lives in
+    // gb->grads, whose tensors are absent from gf's hash set and are therefore
+    // returned unchanged by ggml_recompute_graph_node. Narrowing the type is still
+    // not numerically inert: the recomputed activations start from a rounded
+    // checkpoint, so bit-parity with a full-precision recompute is lost by design.
+    const bool narrow_checkpoints = checkpoint_type != GGML_TYPE_COUNT;
+    struct ggml_tensor ** stores  = NULL;
+    struct ggml_tensor ** fetches = NULL;
+    if (narrow_checkpoints) {
+        stores  = GGML_MALLOC(n_checkpoints*sizeof(struct ggml_tensor *));
+        fetches = GGML_MALLOC(n_checkpoints*sizeof(struct ggml_tensor *));
+        for (int i = 0; i < n_checkpoints; ++i) {
+            stores[i]  = ggml_cast(ctx, checkpoints[i], checkpoint_type);
+            fetches[i] = ggml_cast(ctx, stores[i], checkpoints[i]->type);
+            ggml_format_name(stores[i],  "%s (ckpt store)", ggml_get_name(checkpoints[i]));
+            ggml_format_name(fetches[i], "%s (ckpt fetch)", ggml_get_name(checkpoints[i]));
+            // Pin both to the checkpoint's backend, exactly as recompute clones
+            // are: left to the scheduler they could land on another backend and
+            // turn every checkpoint read into a cross-backend copy.
+            if (on_recompute) {
+                on_recompute(checkpoints[i], stores[i],  userdata);
+                on_recompute(checkpoints[i], fetches[i], userdata);
+            }
+        }
+    }
+
     struct hash_map * replacements = ggml_new_hash_map(
             (size_t) gf->n_nodes + (size_t) gf->n_leafs + (size_t) n_checkpoints);
     for (int i = 0; i < n_checkpoints; ++i) {
@@ -8305,16 +8351,29 @@ struct ggml_cgraph * ggml_build_backward_gradient_checkpointing(
         if (!ggml_bitset_get(replacements->set.used, k)) {
             ggml_bitset_set(replacements->set.used, k);
             replacements->set.keys[k] = checkpoints[i];
-            replacements->vals[k] = checkpoints[i];
+            // Recompute stops here either way; the only question is what a
+            // recomputed node reads when it reads this checkpoint.
+            replacements->vals[k] = narrow_checkpoints ? fetches[i] : checkpoints[i];
         }
     }
 
     // The result contains the original forward, the ordinary backward nodes,
-    // and at most one recompute clone per original forward node.
-    const size_t checkpoint_graph_size = (size_t) gb_tmp->size + (size_t) gf->n_nodes;
+    // at most one recompute clone per original forward node, and the two casts
+    // per checkpoint when they are narrowed.
+    const size_t checkpoint_graph_size = (size_t) gb_tmp->size + (size_t) gf->n_nodes
+            + (narrow_checkpoints ? 2*(size_t) n_checkpoints : 0);
     struct ggml_cgraph * gb = ggml_new_graph_custom(
             ctx, checkpoint_graph_size, /*grads =*/ true);
     ggml_graph_cpy(gf, gb);
+
+    // retro delta: append the stores through the ordinary graph builder so the
+    // hash set and the use counts stay consistent — an under-counted use would let
+    // a backend fuse away a node that is still read.
+    if (narrow_checkpoints) {
+        for (int i = 0; i < n_checkpoints; ++i) {
+            ggml_build_forward_expand(gb, stores[i]);
+        }
+    }
 
     const int n_nodes_f = gf->n_nodes;
     for (int i = n_nodes_f; i < gb_tmp->n_nodes; ++i) {
@@ -8344,6 +8403,8 @@ struct ggml_cgraph * ggml_build_backward_gradient_checkpointing(
     }
 
     ggml_hash_map_free(replacements);
+    GGML_FREE(stores);  // retro delta: NULL unless the checkpoints were narrowed
+    GGML_FREE(fetches);
     return gb;
 }
 

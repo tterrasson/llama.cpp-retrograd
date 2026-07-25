@@ -73,6 +73,9 @@ struct ggml_opt_context {
     // Forward tensors retained across the backward pass. Empty preserves the
     // ordinary graph exactly; dynamic callers refresh this list per build.
     std::vector<struct ggml_tensor *> gradient_checkpoints;
+    // retro delta: type the checkpoints are held in across the backward.
+    // GGML_TYPE_COUNT keeps them as built, which is the bit-exact default.
+    enum ggml_type                    gradient_checkpoint_type = GGML_TYPE_COUNT;
     // retro delta: compacted, name-keyed view of the momenta above. This is
     // the pairing both the optimizer step and checkpointing use; grad_m/grad_v
     // stay as the allocation-time storage, indexed by forward-graph node
@@ -625,6 +628,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
                 opt_ctx->grad_accs.data(),
                 opt_ctx->gradient_checkpoints.data(),
                 (int) opt_ctx->gradient_checkpoints.size(),
+                opt_ctx->gradient_checkpoint_type,
                 ggml_opt_copy_recompute_backend,
                 opt_ctx->backend_sched);
     }
@@ -1053,6 +1057,18 @@ void ggml_opt_set_gradient_checkpoints(
     if (n_checkpoints > 0) {
         opt_ctx->gradient_checkpoints.assign(checkpoints, checkpoints + n_checkpoints);
     }
+}
+
+// retro delta
+void ggml_opt_set_gradient_checkpoint_type(
+        ggml_opt_context_t opt_ctx,
+        enum ggml_type     type) {
+    // Only a plain float narrowing is meaningful: the casts are ggml_cast, and a
+    // quantized checkpoint would round far more coarsely than the activations it
+    // stands in for.
+    GGML_ASSERT(type == GGML_TYPE_COUNT || type == GGML_TYPE_F32 ||
+                type == GGML_TYPE_F16   || type == GGML_TYPE_BF16);
+    opt_ctx->gradient_checkpoint_type = type;
 }
 
 void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {

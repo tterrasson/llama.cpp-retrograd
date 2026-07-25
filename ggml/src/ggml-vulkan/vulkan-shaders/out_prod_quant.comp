@@ -6,82 +6,120 @@
 #include "generic_binary_head.glsl"
 #include "dequant_funcs.glsl"
 
-// out_prod with a quantized src0 (weight-gradient / activation-gradient case
-// dx = out_prod(W, dy) where W is a quantized model weight). One thread per dst
-// element: dst[i0,i1,i2,i3] = Sum_k dequant(src0)[i0,k,a_i2,a_i3] * src1[i1,k,i2,i3].
+// out_prod with a quantized src0 (the activation-gradient case
+// dx = out_prod(W, dy) where W is a quantized model weight):
+// dst[i0,i1,i2,i3] = Sum_k dequant(src0)[i0,k,a_i2,a_i3] * src1[i1,k,i2,i3].
+//
+// retro delta: tiled over the reduction axis ne01, for the reasons spelled out in
+// out_prod.comp. This variant is on the critical path of every Vulkan backward --
+// it computes the input gradient of each quantized projection the gradient passes
+// through, roughly seven nodes per layer -- and it carried the same two barriers per
+// k as the F32 shader plus a dequantize()/get_dm() pair re-read on every k by every
+// lane of a tile row.
+//
+// The accumulation order is unchanged, so this stays bit-exact against the previous
+// shader and against the CPU reference for all quantization types.
+//
 // src0 element i0 within a row lives in block i0/QUANT_K; the two-element
 // dequantize()/get_dm() contract from dequant_funcs.glsl is the same one
-// get_rows_quant relies on, so element (iqs,sel) is picked to match its layout.
+// get_rows_quant relies on, so element (iqs,sel) is picked to match its layout. That
+// selection now happens per loaded tile element rather than once per thread, because
+// a thread no longer owns a single dst row.
+#define BM 64u
+#define BN 16u
+#define BK 16u
+#define TM 4u
+#define WG_SIZE 256u
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
-shared float tile_a[16];
-shared float tile_b[16];
+shared float tile_a[BK * BM];
+shared float tile_b[BK * BN];
 
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
     init_iq_shmem(gl_WorkGroupSize);
 #endif
 
-    const uint lx = gl_LocalInvocationIndex & 15u;
-    const uint ly = gl_LocalInvocationIndex >> 4u;
-    const uint i0 = gl_WorkGroupID.x * 16u + lx;
-    const uint i1 = gl_WorkGroupID.y * 16u + ly;
+    const uint tid = gl_LocalInvocationIndex;
+    const uint tn = tid % BN;
+    const uint tm = tid / BN;
+
+    const uint m0 = gl_WorkGroupID.x * BM;
+    const uint n0 = gl_WorkGroupID.y * BN;
     const uint i2 = gl_WorkGroupID.z % p.ne22;
     const uint i3 = gl_WorkGroupID.z / p.ne22;
-    const bool valid = i0 < p.ne20 && i1 < p.ne21 && i3 < p.ne23;
+    // Uniform across the workgroup, so returning here cannot strand a barrier.
+    if (i3 >= p.ne23) {
+        return;
+    }
 
-    // src0 rows broadcast over the batch dims (dps2/dps3 style)
+    // src0 rows broadcast over the batch dims (dps2/dps3 style).
     const uint a_i2 = i2 / (p.ne22 / p.ne02);
     const uint a_i3 = i3 / (p.ne23 / p.ne03);
-
-    const uint b_i0 = i1 % p.ne10;
-    const uint b_i2 = i2;
-    const uint b_i3 = i3;
-
-    // which packed element of the block (and which half of the dequantize() pair)
-    const uint rem        = i0 % QUANT_K;
-    const uint blk_in_row = i0 / QUANT_K;
-#if QUANT_R == 1
-    const uint sel = rem & 1u;
-    const uint iqs = rem - sel;
-#else
-    const uint half_k = QUANT_K / 2u;
-    const uint sel = rem >= half_k ? 1u : 0u;
-    const uint iqs = rem - sel * half_k;
-#endif
-
     // nb0x for a quantized src0 are in block units (byte stride / block size).
-    const uint a_row_base = a_i3 * p.nb03 + a_i2 * p.nb02 + blk_in_row;
-    const uint boff_base  = get_boffset() + b_i3 * p.nb13 + b_i2 * p.nb12 + b_i0 * p.nb10;
+    const uint a_base = a_i3 * p.nb03 + a_i2 * p.nb02;
+    const uint b_base = get_boffset() + i3 * p.nb13 + i2 * p.nb12;
 
-    float sum = 0.0f;
+    float acc[TM];
+    [[unroll]] for (uint r = 0u; r < TM; ++r) {
+        acc[r] = 0.0f;
+    }
+
     const uint K = p.ne01;
-    for (uint k = 0; k < K; ++k) {
-        if (ly == 0u) {
-            if (i0 < p.ne20) {
-                const uint ib = a_row_base + k * p.nb01;
-                vec2 v = dequantize(ib, iqs, 0);
+    for (uint k0 = 0u; k0 < K; k0 += BK) {
+        [[unroll]] for (uint l = tid; l < BK * BM; l += WG_SIZE) {
+            const uint kk = l / BM;
+            const uint mm = l % BM;
+            const uint m = m0 + mm;
+            const uint k = k0 + kk;
+            float v = 0.0f;
+            if (m < p.ne20 && k < K) {
+                const uint rem        = m % QUANT_K;
+                const uint blk_in_row = m / QUANT_K;
+#if QUANT_R == 1
+                const uint sel = rem & 1u;
+                const uint iqs = rem - sel;
+#else
+                const uint half_k = QUANT_K / 2u;
+                const uint sel = rem >= half_k ? 1u : 0u;
+                const uint iqs = rem - sel * half_k;
+#endif
+                const uint ib = a_base + blk_in_row + k * p.nb01;
+                vec2 q = dequantize(ib, iqs, 0);
                 const vec2 dm = get_dm(ib, 0);
-                v = v * dm.x + dm.y;
-                tile_a[lx] = sel == 0u ? v.x : v.y;
-            } else {
-                tile_a[lx] = 0.0f;
+                q = q * dm.x + dm.y;
+                v = sel == 0u ? q.x : q.y;
             }
+            tile_a[kk * BM + mm] = v;
         }
-        if (lx == 0u) {
-            tile_b[ly] = i1 < p.ne21
-                    ? float(data_b[boff_base + k * p.nb11]) : 0.0f;
+        [[unroll]] for (uint l = tid; l < BK * BN; l += WG_SIZE) {
+            const uint kk = l / BN;
+            const uint nn = l % BN;
+            const uint n = n0 + nn;
+            const uint k = k0 + kk;
+            float v = 0.0f;
+            if (n < p.ne21 && k < K) {
+                v = float(data_b[b_base + k * p.nb11 + (n % p.ne10) * p.nb10]);
+            }
+            tile_b[kk * BN + nn] = v;
         }
         barrier();
-        if (valid) {
-            sum += tile_a[lx] * tile_b[ly];
+        [[unroll]] for (uint kk = 0u; kk < BK; ++kk) {
+            const float bv = tile_b[kk * BN + tn];
+            [[unroll]] for (uint r = 0u; r < TM; ++r) {
+                acc[r] += tile_a[kk * BM + tm * TM + r] * bv;
+            }
         }
         barrier();
     }
 
-    if (valid) {
-        const uint doff = get_doffset() + i3 * p.nb23 + i2 * p.nb22 + i1 * p.nb21 + i0 * p.nb20;
-        data_d[doff] = D_TYPE(sum);
+    const uint n = n0 + tn;
+    [[unroll]] for (uint r = 0u; r < TM; ++r) {
+        const uint m = m0 + tm * TM + r;
+        if (m < p.ne20 && n < p.ne21) {
+            const uint doff = get_doffset() + i3 * p.nb23 + i2 * p.nb22 + n * p.nb21 + m * p.nb20;
+            data_d[doff] = D_TYPE(acc[r]);
+        }
     }
 }

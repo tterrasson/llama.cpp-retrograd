@@ -3110,12 +3110,19 @@ extern "C" {
     // checkpoints, allowing the allocator to release other forward
     // activations before the backward pass. The returned graph is owned by
     // `ctx`; `gf` and the checkpoint tensors must remain alive while it runs.
+    //
+    // retro delta: `checkpoint_type` narrows the type the checkpoints are held in
+    // across the backward (GGML_TYPE_F16 halves that term). Pass GGML_TYPE_COUNT,
+    // or GGML_TYPE_F32, to keep them as they are, which is bit-exact with a
+    // non-checkpointed backward; narrowing is not, since the recompute then starts
+    // from a rounded activation.
     GGML_API struct ggml_cgraph * ggml_build_backward_gradient_checkpointing(
         struct ggml_context *  ctx,
         struct ggml_cgraph  *  gf,
         struct ggml_tensor  ** grad_accs,
         struct ggml_tensor  ** checkpoints,
         int                    n_checkpoints,
+        enum   ggml_type       checkpoint_type,
         void (*on_recompute)(struct ggml_tensor * original,
                              struct ggml_tensor * clone,
                              void * userdata),
