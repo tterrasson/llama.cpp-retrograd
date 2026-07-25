@@ -5209,11 +5209,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_OUT_PROD:
             // retro delta: quantized src0 is dequantized to F32 in ggml_cuda_out_prod
             // (contiguous packed layout required), so any quant type with a to_fp32
-            // kernel is accepted in addition to F32.
+            // kernel is accepted in addition to F32. The dequantization runs on
+            // slices of whole src0 columns, so a column must be a whole number of
+            // quantization blocks -- true of every GGUF weight, and required here so
+            // an exotic shape falls back to another backend instead of aborting.
             return op->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                    (op->src[0]->type == GGML_TYPE_F32 ||
                     (ggml_is_quantized(op->src[0]->type) && ggml_is_contiguous(op->src[0]) &&
-                     op->src[0]->nb[0] == ggml_type_size(op->src[0]->type)));
+                     op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
+                     op->src[0]->ne[0] % ggml_blck_size(op->src[0]->type) == 0));
         case GGML_OP_GET_ROWS:
             {
                 switch (op->src[0]->type) {
@@ -5557,7 +5561,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_FLASH_ATTN_BACK: {
             // retro delta: reference FA backward (flash-attn-back.cu). q/dO/dst F32,
-            // K/V F16 or F32 (same type), optional F16 mask, no sinks, head dims <= 128.
+            // K/V F16 or F32 (same type), optional F16 mask, no sinks, head dims
+            // <= FA_BACK_MAX_D (the kernel's widest per-lane register bucket).
             const ggml_tensor * q = op->src[0];
             const ggml_tensor * k = op->src[1];
             const ggml_tensor * v = op->src[2];
@@ -5578,7 +5583,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             if (mask && mask->type != GGML_TYPE_F16) {
                 return false;
             }
-            if (q->ne[0] > 128 || v->ne[0] > 128) {
+            if (q->ne[0] > FA_BACK_MAX_D || v->ne[0] > FA_BACK_MAX_D) {
+                return false;
+            }
+            // KV gradient window: contiguous I32 row indices, one per window row
+            // and stream (see ggml_flash_attn_ext_set_grad_window).
+            const ggml_tensor * kv_idxs = op->src[9];
+            if (kv_idxs && (kv_idxs->type != GGML_TYPE_I32 || !ggml_is_contiguous(kv_idxs))) {
                 return false;
             }
             return q->ne[2] % k->ne[2] == 0;

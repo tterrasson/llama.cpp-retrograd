@@ -1,5 +1,320 @@
 #include "common.h"
 #include "dequantize.h" // retro delta: quantized training kernels
+// retro delta: streaming Flash Attention backward, ported line for line from the
+// Vulkan shaders (flash_attn_back_{q,kv}.comp) and mirroring the CUDA kernels
+// (flash-attn-back.cu). This is what makes an F16 KV cache differentiable
+// (`kv_dtype = "f16"`), so it must agree with the analytic reference in
+// retro_probe.cpp to the same tolerance the other two backends hold.
+//
+// Two passes over one threadgroup of 32 threads == one SIMD group, so every
+// cross-thread reduction is a plain simd_sum:
+//
+//   pass q  -- one threadgroup per (query row, head, batch). Recomputes the row
+//              logsumexp and delta = dot(dO, O) into the statistics segment of
+//              the packed result, then accumulates dQ.
+//   pass kv -- one threadgroup per (gradient-window row, kv head, batch). Reads
+//              the statistics the q pass wrote and accumulates dK/dV.
+//
+// The q pass therefore always runs, even when dQ itself is not requested: the kv
+// pass depends on its statistics. The caller inserts a memory barrier between
+// the two dispatches.
+//
+// NSLOT is the per-thread head-dim accumulator depth: 32*NSLOT must cover both
+// head dimensions, so 4 -> <= 128 and 8 -> <= 256. Only registers scale with the
+// head dimension; narrow-head models keep the shallow variant. Mirrors the CUDA
+// and Vulkan bucket dispatch.
+//
+// KVT is the cache element type. Both F16 and F32 are instantiated (like CUDA, and
+// unlike Vulkan): `kv_dtype = "f16"` is only reached *through* the F32 capability
+// probe in retro_backend.cpp, which builds the op with F32 K/V, so an F16-only
+// kernel leaves the whole path dark.
+
+// Bits 2..4 carry ggml_flash_attn_back_grad shifted left by 2.
+#define RETRO_FA_BACK_FLAG_MASK   1
+#define RETRO_FA_BACK_FLAG_SINKS  2
+#define RETRO_FA_BACK_FLAG_GRAD_Q 4
+#define RETRO_FA_BACK_FLAG_GRAD_K 8
+#define RETRO_FA_BACK_FLAG_GRAD_V 16
+#define RETRO_FA_BACK_FLAG_WINDOW 32
+
+static inline float retro_fa_back_alibi_slope(
+        constant ggml_metal_kargs_flash_attn_back & args,
+        uint head) {
+    if (args.max_bias <= 0.0f) {
+        return 1.0f;
+    }
+    const uint n = 1u << uint(floor(log2(float(args.n_head))));
+    const float base = head < n
+        ? pow(2.0f, -args.max_bias / float(n))
+        : pow(2.0f, -args.max_bias / (2.0f * float(n)));
+    const int exponent = head < n ? int(head + 1u) : int(2u * (head - n) + 1u);
+    return pow(base, float(exponent));
+}
+
+static inline float retro_fa_back_mask_value(
+        constant ggml_metal_kargs_flash_attn_back & args,
+        device const half * data_mask,
+        uint key, uint row, uint head, uint batch) {
+    if ((args.flags & RETRO_FA_BACK_FLAG_MASK) == 0) {
+        return 0.0f;
+    }
+    const uint mh = head  % (uint) args.mask_ne2;
+    const uint mb = batch % (uint) args.mask_ne3;
+    const uint index = key + (uint) args.KV*(row + (uint) args.mask_ne1*(mh + (uint) args.mask_ne2*mb));
+    return (float) data_mask[index];
+}
+
+static inline float retro_fa_back_score_from_dot(
+        constant ggml_metal_kargs_flash_attn_back & args,
+        device const half * data_mask,
+        float dot, uint key, uint row, uint head, uint batch) {
+    const float score = args.logit_softcap != 0.0f
+        ? args.logit_softcap * precise::tanh(dot * args.scale / args.logit_softcap)
+        : dot * args.scale;
+    return score + retro_fa_back_alibi_slope(args, head)
+        * retro_fa_back_mask_value(args, data_mask, key, row, head, batch);
+}
+
+static inline float retro_fa_back_score_derivative(
+        constant ggml_metal_kargs_flash_attn_back & args,
+        float dot) {
+    if (args.logit_softcap == 0.0f) {
+        return args.scale;
+    }
+    const float t = precise::tanh(dot * args.scale / args.logit_softcap);
+    return args.scale * (1.0f - t * t);
+}
+
+template<typename KVT, short NSLOT>
+kernel void kernel_flash_attn_back_q_impl(
+        constant ggml_metal_kargs_flash_attn_back & args,
+        device const float * data_q     [[buffer(1)]],
+        device const KVT   * data_k     [[buffer(2)]],
+        device const KVT   * data_v     [[buffer(3)]],
+        device const half  * data_mask  [[buffer(4)]],
+        device const float * data_out   [[buffer(5)]],
+        device const float * data_dout  [[buffer(6)]],
+        device const float * data_sinks [[buffer(7)]],
+        device       float * data_grad  [[buffer(8)]],
+        device const int   * data_kvidx [[buffer(9)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]]) {
+    const uint lid   = tiisg;
+    const uint row   = tgpig.x;
+    const uint head  = tgpig.y;
+    const uint batch = tgpig.z;
+    if (row >= (uint) args.N || head >= (uint) args.n_head || batch >= (uint) args.n_batch) {
+        return;
+    }
+
+    const uint HSK = (uint) args.HSK;
+    const uint HSV = (uint) args.HSV;
+    const uint KV  = (uint) args.KV;
+    const uint N   = (uint) args.N;
+
+    const uint kv_head = head / ((uint) args.n_head / (uint) args.n_head_kv);
+    const uint q_base  = batch*(uint) args.q_nb3 + head*(uint) args.q_nb2 + row*(uint) args.q_nb1;
+    const uint k_head_base = (batch*(uint) args.n_head_kv + kv_head)*KV*HSK;
+    const uint v_head_base = (batch*(uint) args.n_head_kv + kv_head)*KV*HSV;
+    const uint out_base   = ((batch*N + row)*(uint) args.n_head + head)*HSV;
+    const uint stat_index = (batch*(uint) args.n_head + head)*N + row;
+
+    float delta_part = 0.0f;
+    for (uint id = lid; id < HSV; id += 32) {
+        delta_part += data_dout[out_base + id] * data_out[out_base + id];
+    }
+    const float delta = simd_sum(delta_part);
+
+    float row_max = -3.402823466e+38f;
+    float row_sum = 0.0f;
+    for (uint key = 0; key < KV; ++key) {
+        float part = 0.0f;
+        for (uint id = lid; id < HSK; id += 32) {
+            part += data_q[q_base + id] * (float) data_k[k_head_base + key*HSK + id];
+        }
+        const float dot   = simd_sum(part);
+        const float score = retro_fa_back_score_from_dot(args, data_mask, dot, key, row, head, batch);
+        const float new_max = max(row_max, score);
+        row_sum = row_sum * exp(row_max - new_max) + exp(score - new_max);
+        row_max = new_max;
+    }
+    if ((args.flags & RETRO_FA_BACK_FLAG_SINKS) != 0) {
+        const float score = data_sinks[head];
+        const float new_max = max(row_max, score);
+        row_sum = row_sum * exp(row_max - new_max) + exp(score - new_max);
+        row_max = new_max;
+    }
+
+    const float lse = row_max + log(row_sum);
+    if (lid == 0) {
+        data_grad[args.off_stats + stat_index] = lse;
+        data_grad[args.off_stats + N*(uint) args.n_head*(uint) args.n_batch + stat_index] = delta;
+    }
+
+    // The dK/dV pass consumes the statistics written above, so they are produced
+    // unconditionally; the dQ accumulation below is the expensive part and is
+    // skipped when the packed result has no dQ segment. The branch is uniform
+    // across the threadgroup (kernel argument), so the simd_sum reductions inside
+    // the loop stay well formed.
+    if ((args.flags & RETRO_FA_BACK_FLAG_GRAD_Q) == 0) {
+        return;
+    }
+
+    float dq[NSLOT];
+    for (short slot = 0; slot < NSLOT; ++slot) {
+        dq[slot] = 0.0f;
+    }
+    for (uint key = 0; key < KV; ++key) {
+        float qk_part = 0.0f;
+        for (uint id = lid; id < HSK; id += 32) {
+            qk_part += data_q[q_base + id] * (float) data_k[k_head_base + key*HSK + id];
+        }
+        const float dot_qk = simd_sum(qk_part);
+
+        float dv_part = 0.0f;
+        for (uint id = lid; id < HSV; id += 32) {
+            dv_part += data_dout[out_base + id] * (float) data_v[v_head_base + key*HSV + id];
+        }
+        const float dot_dv = simd_sum(dv_part);
+
+        const float probability = exp(retro_fa_back_score_from_dot(args, data_mask, dot_qk, key, row, head, batch) - lse);
+        const float ds = probability * (dot_dv - delta) * retro_fa_back_score_derivative(args, dot_qk);
+        for (short slot = 0; slot < NSLOT; ++slot) {
+            const uint id = lid + 32*slot;
+            if (id < HSK) {
+                dq[slot] += ds * (float) data_k[k_head_base + key*HSK + id];
+            }
+        }
+    }
+
+    for (short slot = 0; slot < NSLOT; ++slot) {
+        const uint id = lid + 32*slot;
+        if (id < HSK) {
+            data_grad[args.off_q + (((batch*(uint) args.n_head + head)*N + row)*HSK + id)] = dq[slot];
+        }
+    }
+}
+
+typedef decltype(kernel_flash_attn_back_q_impl<half,  4>) kernel_flash_attn_back_q_f16_t;
+typedef decltype(kernel_flash_attn_back_q_impl<float, 4>) kernel_flash_attn_back_q_f32_t;
+
+template [[host_name("kernel_flash_attn_back_q_f32_f16_d128")]] kernel kernel_flash_attn_back_q_f16_t kernel_flash_attn_back_q_impl<half,  4>;
+template [[host_name("kernel_flash_attn_back_q_f32_f16_d256")]] kernel kernel_flash_attn_back_q_f16_t kernel_flash_attn_back_q_impl<half,  8>;
+template [[host_name("kernel_flash_attn_back_q_f32_f32_d128")]] kernel kernel_flash_attn_back_q_f32_t kernel_flash_attn_back_q_impl<float, 4>;
+template [[host_name("kernel_flash_attn_back_q_f32_f32_d256")]] kernel kernel_flash_attn_back_q_f32_t kernel_flash_attn_back_q_impl<float, 8>;
+
+template<typename KVT, short NSLOT>
+kernel void kernel_flash_attn_back_kv_impl(
+        constant ggml_metal_kargs_flash_attn_back & args,
+        device const float * data_q     [[buffer(1)]],
+        device const KVT   * data_k     [[buffer(2)]],
+        device const KVT   * data_v     [[buffer(3)]],
+        device const half  * data_mask  [[buffer(4)]],
+        device const float * data_out   [[buffer(5)]],
+        device const float * data_dout  [[buffer(6)]],
+        device const float * data_sinks [[buffer(7)]],
+        device       float * data_grad  [[buffer(8)]],
+        device const int   * data_kvidx [[buffer(9)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]]) {
+    const uint lid     = tiisg;
+    const uint win_row = tgpig.x;
+    const uint kv_head = tgpig.y;
+    const uint batch   = tgpig.z;
+    if (win_row >= (uint) args.KV_GRAD || kv_head >= (uint) args.n_head_kv || batch >= (uint) args.n_batch) {
+        return;
+    }
+
+    const uint HSK = (uint) args.HSK;
+    const uint HSV = (uint) args.HSV;
+    const uint KV  = (uint) args.KV;
+    const uint N   = (uint) args.N;
+    const uint KVG = (uint) args.KV_GRAD;
+
+    // retro delta: one threadgroup per *gradient window* row rather than per
+    // cache key. Keys outside the window were written by earlier steps and are
+    // constants; without a window KV_GRAD == KV and this is the dense case.
+    uint key = win_row;
+    bool in_cache = true;
+    if ((args.flags & RETRO_FA_BACK_FLAG_WINDOW) != 0) {
+        const int idx = data_kvidx[batch*KVG + win_row] - args.kv_stride*(args.kv_stream0 + (int) batch);
+        in_cache = idx >= 0 && (uint) idx < KV;
+        key = in_cache ? (uint) idx : 0;
+    }
+
+    const uint ratio = (uint) args.n_head / (uint) args.n_head_kv;
+    // Read the cache at `key`, write the gradient at `win_row`.
+    const uint k_base  = ((batch*(uint) args.n_head_kv + kv_head)*KV  + key)*HSK;
+    const uint v_base  = ((batch*(uint) args.n_head_kv + kv_head)*KV  + key)*HSV;
+    const uint dk_base = ((batch*(uint) args.n_head_kv + kv_head)*KVG + win_row)*HSK;
+    const uint dv_base = ((batch*(uint) args.n_head_kv + kv_head)*KVG + win_row)*HSV;
+    const uint n_stats = N*(uint) args.n_head*(uint) args.n_batch;
+
+    float dk[NSLOT];
+    float dv[NSLOT];
+    for (short slot = 0; slot < NSLOT; ++slot) {
+        dk[slot] = 0.0f;
+        dv[slot] = 0.0f;
+    }
+
+    // A window row pointing outside the cache view carries no gradient, but its
+    // slot in the packed result still has to be defined: fall through with zero
+    // accumulators instead of returning early.
+    for (uint rhead = 0; in_cache && rhead < ratio; ++rhead) {
+        const uint head = kv_head*ratio + rhead;
+        for (uint row = 0; row < N; ++row) {
+            const uint q_base     = batch*(uint) args.q_nb3 + head*(uint) args.q_nb2 + row*(uint) args.q_nb1;
+            const uint out_base   = ((batch*N + row)*(uint) args.n_head + head)*HSV;
+            const uint stat_index = (batch*(uint) args.n_head + head)*N + row;
+
+            float qk_part = 0.0f;
+            for (uint id = lid; id < HSK; id += 32) {
+                qk_part += data_q[q_base + id] * (float) data_k[k_base + id];
+            }
+            const float dot_qk = simd_sum(qk_part);
+
+            float dv_part = 0.0f;
+            for (uint id = lid; id < HSV; id += 32) {
+                dv_part += data_dout[out_base + id] * (float) data_v[v_base + id];
+            }
+            const float dot_dv = simd_sum(dv_part);
+
+            const float lse   = data_grad[args.off_stats + stat_index];
+            const float delta = data_grad[args.off_stats + n_stats + stat_index];
+            const float probability = exp(retro_fa_back_score_from_dot(args, data_mask, dot_qk, key, row, head, batch) - lse);
+            const float ds = probability * (dot_dv - delta) * retro_fa_back_score_derivative(args, dot_qk);
+            for (short slot = 0; slot < NSLOT; ++slot) {
+                const uint id = lid + 32*slot;
+                if (id < HSK) {
+                    dk[slot] += ds * data_q[q_base + id];
+                }
+                if (id < HSV) {
+                    dv[slot] += probability * data_dout[out_base + id];
+                }
+            }
+        }
+    }
+
+    for (short slot = 0; slot < NSLOT; ++slot) {
+        const uint id = lid + 32*slot;
+        if ((args.flags & RETRO_FA_BACK_FLAG_GRAD_K) != 0 && id < HSK) {
+            data_grad[args.off_k + dk_base + id] = dk[slot];
+        }
+        if ((args.flags & RETRO_FA_BACK_FLAG_GRAD_V) != 0 && id < HSV) {
+            data_grad[args.off_v + dv_base + id] = dv[slot];
+        }
+    }
+}
+
+typedef decltype(kernel_flash_attn_back_kv_impl<half,  4>) kernel_flash_attn_back_kv_f16_t;
+typedef decltype(kernel_flash_attn_back_kv_impl<float, 4>) kernel_flash_attn_back_kv_f32_t;
+
+template [[host_name("kernel_flash_attn_back_kv_f32_f16_d128")]] kernel kernel_flash_attn_back_kv_f16_t kernel_flash_attn_back_kv_impl<half,  4>;
+template [[host_name("kernel_flash_attn_back_kv_f32_f16_d256")]] kernel kernel_flash_attn_back_kv_f16_t kernel_flash_attn_back_kv_impl<half,  8>;
+template [[host_name("kernel_flash_attn_back_kv_f32_f32_d128")]] kernel kernel_flash_attn_back_kv_f32_t kernel_flash_attn_back_kv_impl<float, 4>;
+template [[host_name("kernel_flash_attn_back_kv_f32_f32_d256")]] kernel kernel_flash_attn_back_kv_f32_t kernel_flash_attn_back_kv_impl<float, 8>;
+
+
 Warning: truncated output (original token count: 100321)
 Total output lines: 8949
 

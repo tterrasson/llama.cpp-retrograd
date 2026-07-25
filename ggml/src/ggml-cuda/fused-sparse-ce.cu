@@ -114,35 +114,93 @@ static __global__ void fused_sparse_ce_make_probs(
     logits[offset] = active ? coef*expf(logits[offset] - maxima[t])/sums[t] : 0.0f;
 }
 
+// Subtracts the target row from one token chunk's accumulated grad_h. `out` is the
+// chunk's [n_embd, nt] output. `gathered` selects where the target row comes from:
+// a [n_embd, nt] capture indexed by the chunk-local token (quantized head, see
+// fused_sparse_ce_capture_target_rows), or the F32 head itself indexed by target
+// row (F32 head, unchanged behaviour). Either way this is per-element the same
+// arithmetic on the same fully accumulated value as before.
+template <bool gathered>
 static __global__ void fused_sparse_ce_subtract_target(
-        const float * grad, const float * w, const int32_t * targets,
-        const float * weights, const int32_t * n_active, float * dst,
-        int64_t n_embd, int64_t n_tokens, int64_t n_vocab) {
+        const float * grad, const float * rows, const int32_t * targets,
+        const float * weights, const int32_t * n_active, float * out,
+        int64_t n_embd, int64_t t0, int64_t nt, int64_t n_vocab) {
     const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
-    if (i >= n_embd*n_tokens) {
+    if (i >= n_embd*nt) {
         return;
     }
-    const int64_t t = i/n_embd;
-    const int64_t e = i - t*n_embd;
+    const int64_t lt = i/n_embd;
+    const int64_t e  = i - lt*n_embd;
+    const int64_t t  = t0 + lt;
     const int32_t target = targets[t];
     if (target >= 0 && target < n_vocab && weights[t] != 0.0f && *n_active > 0) {
         const float coef = *grad*weights[t]/(float) *n_active;
-        dst[i] -= coef*w[int64_t(target)*n_embd + e];
+        out[i] -= coef*rows[(gathered ? lt : int64_t(target))*n_embd + e];
     }
 }
 
-static const float * fused_sparse_ce_head_f32(
-        const ggml_tensor * w, ggml_cuda_pool_alloc<float> & scratch, cudaStream_t stream) {
-    if (w->type == GGML_TYPE_F32) {
-        return (const float *) w->data;
+// retro delta: with a quantized head the target subtraction can no longer index an
+// F32 copy of the whole head. Each token's target row is captured here, out of the
+// one vocab tile that contains it, into the chunk's [n_embd, nt] F32 buffer, so the
+// subtraction keeps operating on a plain F32 row. Bounded by the token chunk like
+// every other intermediate of this operator.
+static __global__ void fused_sparse_ce_capture_target_rows(
+        const float * w_tile, const int32_t * targets, float * target_rows,
+        int64_t n_embd, int64_t t0, int64_t nt, int64_t v0, int64_t nv) {
+    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i >= n_embd*nt) {
+        return;
     }
-    const int64_t n = ggml_nelements(w);
-    scratch.alloc(n);
-    to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(w->type);
-    GGML_ASSERT(to_fp32 != nullptr);
-    to_fp32(w->data, scratch.get(), n, stream);
-    return scratch.get();
+    const int64_t lt = i/n_embd;
+    const int64_t e  = i - lt*n_embd;
+    const int64_t target = targets[t0 + lt];
+    if (target < v0 || target >= v0 + nv) {
+        return;
+    }
+    target_rows[lt*n_embd + e] = w_tile[(target - v0)*n_embd + e];
 }
+
+// retro delta: bounded per-tile F32 view of a possibly quantized output head.
+// Dequantizing the whole head up front costs n_embd*n_vocab*4 bytes of pool --
+// 3.75 GiB for a 262k-vocab, 3840-wide head, more than the 4-bit model itself --
+// while every consumer below already walks the head one vocab tile at a time. A
+// tile of whole vocab rows is a contiguous, block-aligned run of the packed
+// weight, so one dequant call per tile suffices and the scratch is bounded by the
+// op's own tile capacity. An F32 head is handed out in place: that path allocates
+// nothing and keeps its previous behaviour exactly.
+struct fused_sparse_ce_head {
+    const ggml_tensor * w;
+    const int64_t n_embd;
+    to_fp32_cuda_t to_fp32 = nullptr;
+    ggml_cuda_pool_alloc<float> tile;
+
+    fused_sparse_ce_head(
+            ggml_cuda_pool & pool, const ggml_tensor * head, int64_t n_embd, int64_t tile_capacity)
+            : w(head), n_embd(n_embd), tile(pool) {
+        if (w->type == GGML_TYPE_F32) {
+            return;
+        }
+        // The dequant kernels consume a contiguous run of quantized blocks, and a
+        // vocab row spans a whole number of them, so a tile boundary is always a
+        // block boundary.
+        GGML_ASSERT(w->nb[0] == ggml_type_size(w->type));
+        GGML_ASSERT(n_embd % ggml_blck_size(w->type) == 0);
+        to_fp32 = ggml_get_to_fp32_cuda(w->type);
+        GGML_ASSERT(to_fp32 != nullptr);
+        tile.alloc(n_embd*tile_capacity);
+    }
+
+    // [n_embd, nv] F32 view of vocab rows [v0, v0+nv). Valid until the next call:
+    // consumers must finish with a tile before asking for the following one.
+    const float * rows(int64_t v0, int64_t nv, cudaStream_t stream) {
+        if (!to_fp32) {
+            return (const float *) w->data + v0*n_embd;
+        }
+        to_fp32((const char *) w->data + v0*w->nb[1], tile.get(), nv*n_embd, stream);
+        CUDA_CHECK(cudaGetLastError());
+        return tile.get();
+    }
+};
 
 struct fused_sparse_ce_work {
     ggml_cuda_pool_alloc<int32_t> n_active;
@@ -187,7 +245,7 @@ static int64_t fused_sparse_ce_seq_chunk(const ggml_tensor * dst, int64_t n_toke
 // (offset to the chunk here). maxima/sums/target_logits are the global per-token
 // state, indexed by the absolute token id inside the kernels.
 static void fused_sparse_ce_lse(
-        ggml_backend_cuda_context & ctx, const float * h, const float * w,
+        ggml_backend_cuda_context & ctx, const float * h, fused_sparse_ce_head & head,
         const ggml_tensor * targets, const float * bias, int64_t n_embd,
         int64_t t0, int64_t nt, int64_t n_vocab, int64_t tile_capacity,
         float * logits, fused_sparse_ce_work & work) {
@@ -198,8 +256,9 @@ static void fused_sparse_ce_lse(
     const int threads = 256;
     for (int64_t v0 = 0; v0 < n_vocab; v0 += tile_capacity) {
         const int64_t nv = std::min(tile_capacity, n_vocab - v0);
+        const float * w_tile = head.rows(v0, nv, stream);
         CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-            nv, nt, n_embd, &alpha, w + v0*n_embd, n_embd,
+            nv, nt, n_embd, &alpha, w_tile, n_embd,
             h + t0*n_embd, n_embd, &beta, logits, tile_capacity));
         if (bias) {
             const int64_t n_bias = nv*nt;
@@ -226,17 +285,16 @@ void ggml_cuda_fused_sparse_ce(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t stream = ctx.stream();
-    ggml_cuda_pool_alloc<float> w_scratch(pool);
-    const float * w_f32 = fused_sparse_ce_head_f32(w, w_scratch, stream);
     const float * bias_f32 = bias ? (const float *) bias->data : nullptr;
     fused_sparse_ce_work work(pool, n_tokens);
     fused_sparse_ce_prepare(stream, targets, weights, n_vocab, work);
     const int64_t tile  = fused_sparse_ce_tile_size(dst, n_vocab);
     const int64_t chunk = fused_sparse_ce_seq_chunk(dst, n_tokens);
+    fused_sparse_ce_head head(pool, w, n_embd, tile);
     ggml_cuda_pool_alloc<float> logits(pool, tile*chunk);
     for (int64_t t0 = 0; t0 < n_tokens; t0 += chunk) {
         const int64_t nt = std::min(chunk, n_tokens - t0);
-        fused_sparse_ce_lse(ctx, (const float *) h->data, w_f32, targets, bias_f32,
+        fused_sparse_ce_lse(ctx, (const float *) h->data, head, targets, bias_f32,
             n_embd, t0, nt, n_vocab, tile, logits.get(), work);
     }
 
@@ -260,14 +318,21 @@ void ggml_cuda_fused_sparse_ce_back(ggml_backend_cuda_context & ctx, ggml_tensor
 
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t stream = ctx.stream();
-    ggml_cuda_pool_alloc<float> w_scratch(pool);
-    const float * w_f32 = fused_sparse_ce_head_f32(w, w_scratch, stream);
     const float * bias_f32 = bias ? (const float *) bias->data : nullptr;
     fused_sparse_ce_work work(pool, n_tokens);
     fused_sparse_ce_prepare(stream, targets, weights, n_vocab, work);
     const int64_t tile  = fused_sparse_ce_tile_size(dst, n_vocab);
     const int64_t chunk = fused_sparse_ce_seq_chunk(dst, n_tokens);
+    fused_sparse_ce_head head(pool, w, n_embd, tile);
     ggml_cuda_pool_alloc<float> logits(pool, tile*chunk);
+
+    // A quantized head is only ever materialized one vocab tile at a time, so the
+    // rows the target subtraction needs are captured while their tile is live.
+    const bool gather_targets = w->type != GGML_TYPE_F32;
+    ggml_cuda_pool_alloc<float> target_rows(pool);
+    if (gather_targets) {
+        target_rows.alloc(n_embd*chunk);
+    }
 
     // retro delta (plan rl/OPTIMIZE feature 3): with offload_h the graph allocator
     // gives grad_h the buffer of `h`, so writing a column would destroy the hidden
@@ -289,15 +354,28 @@ void ggml_cuda_fused_sparse_ce_back(ggml_backend_cuda_context & ctx, ggml_tensor
     for (int64_t t0 = 0; t0 < n_tokens; t0 += chunk) {
         const int64_t nt = std::min(chunk, n_tokens - t0);
         float * out = inplace ? grad_stage.get() : (float *) dst->data + t0*n_embd;
+        if (gather_targets) {
+            // A masked token (target < 0) is captured by no tile, and CUDA scratch
+            // -- unlike host memory -- does not come zeroed.
+            CUDA_CHECK(cudaMemsetAsync(target_rows.get(), 0, n_embd*nt*sizeof(float), stream));
+        }
         // Recompute this chunk's online log-sum-exp (checkpointing over the
         // sequence axis), then accumulate grad_h tile by tile.
-        fused_sparse_ce_lse(ctx, (const float *) h->data, w_f32, targets, bias_f32,
+        fused_sparse_ce_lse(ctx, (const float *) h->data, head, targets, bias_f32,
             n_embd, t0, nt, n_vocab, tile, logits.get(), work);
         bool first = true;
         for (int64_t v0 = 0; v0 < n_vocab; v0 += tile) {
             const int64_t nv = std::min(tile, n_vocab - v0);
+            const float * w_tile = head.rows(v0, nv, stream);
+            if (gather_targets) {
+                const int64_t n_rows = n_embd*nt;
+                fused_sparse_ce_capture_target_rows<<<(n_rows + threads - 1)/threads, threads, 0, stream>>>(
+                    w_tile, (const int32_t *) targets->data, target_rows.get(),
+                    n_embd, t0, nt, v0, nv);
+                CUDA_CHECK(cudaGetLastError());
+            }
             CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                nv, nt, n_embd, &alpha, w_f32 + v0*n_embd, n_embd,
+                nv, nt, n_embd, &alpha, w_tile, n_embd,
                 (const float *) h->data + t0*n_embd, n_embd, &beta0, logits.get(), tile));
             if (bias_f32) {
                 const int64_t n_bias = nv*nt;
@@ -313,19 +391,30 @@ void ggml_cuda_fused_sparse_ce_back(ggml_backend_cuda_context & ctx, ggml_tensor
             CUDA_CHECK(cudaGetLastError());
             const float * beta = first ? &beta0 : &beta1;
             CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                n_embd, nt, nv, &alpha, w_f32 + v0*n_embd, n_embd,
+                n_embd, nt, nv, &alpha, w_tile, n_embd,
                 logits.get(), tile, beta, out, n_embd));
             first = false;
         }
+        // grad_h for this chunk is fully accumulated over the vocabulary, so the
+        // target row can be subtracted now -- on `out`, before the in-place
+        // eviction below, and while the chunk's captured rows are still valid.
+        const int64_t n_sub = n_embd*nt;
+        const int64_t sub_blocks = (n_sub + threads - 1)/threads;
+        if (gather_targets) {
+            fused_sparse_ce_subtract_target<true><<<sub_blocks, threads, 0, stream>>>(
+                (const float *) grad->data, target_rows.get(), (const int32_t *) targets->data,
+                (const float *) weights->data, work.n_active.get(), out,
+                n_embd, t0, nt, n_vocab);
+        } else {
+            fused_sparse_ce_subtract_target<false><<<sub_blocks, threads, 0, stream>>>(
+                (const float *) grad->data, (const float *) w->data, (const int32_t *) targets->data,
+                (const float *) weights->data, work.n_active.get(), out,
+                n_embd, t0, nt, n_vocab);
+        }
+        CUDA_CHECK(cudaGetLastError());
         if (inplace) {
             CUDA_CHECK(cudaMemcpyAsync((float *) dst->data + t0*n_embd, out,
                 n_embd*nt*sizeof(float), cudaMemcpyDeviceToDevice, stream));
         }
     }
-    const int64_t n_out = n_embd*n_tokens;
-    fused_sparse_ce_subtract_target<<<(n_out + threads - 1)/threads, threads, 0, stream>>>(
-        (const float *) grad->data, w_f32, (const int32_t *) targets->data,
-        (const float *) weights->data, work.n_active.get(), (float *) dst->data,
-        n_embd, n_tokens, n_vocab);
-    CUDA_CHECK(cudaGetLastError());
 }

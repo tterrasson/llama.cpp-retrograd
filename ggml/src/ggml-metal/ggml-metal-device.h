@@ -11,6 +11,14 @@ struct ggml_metal_buffer_id {
     size_t offs;
 };
 
+// retro delta: largest head dimension the Flash Attention backward kernels cover
+// (kernel_flash_attn_back_{q,kv}_f32_f16_d128/_d256 in ggml-metal.metal). The
+// supports check gates on this. Only raise it alongside a new kernel variant
+// *and* a gradient-parity test at that head dimension -- an untested variant
+// would report support and produce silently wrong gradients rather than fail.
+// Mirrors VK_FA_BACK_MAX_D / FA_BACK_MAX_D.
+#define GGML_METAL_FA_BACK_MAX_D 256
+
 typedef struct ggml_metal_device * ggml_metal_device_t;
 
 //
@@ -138,6 +146,8 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan_
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rwkv              (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net   (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net_back(ggml_metal_library_t lib, const struct ggml_tensor * op); // retro delta
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_back_q  (ggml_metal_library_t lib, const struct ggml_tensor * op); // retro delta
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_back_kv (ggml_metal_library_t lib, const struct ggml_tensor * op); // retro delta
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri         (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext        (ggml_metal_library_t lib, const struct ggml_tensor * op, int nsg, int nxpsg, int r1ptg);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm            (ggml_metal_library_t lib, const struct ggml_tensor * op);

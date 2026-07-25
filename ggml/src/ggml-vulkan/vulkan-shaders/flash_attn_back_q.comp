@@ -6,6 +6,26 @@
 
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
+// retro delta: head-dim elements owned by each invocation, one variant per
+// bucket (4 -> head dim <= 128, 8 -> <= 256, 16 -> <= 512, 18 would be <= 576).
+// Only registers scale with the head dimension here, so wide-head models cost a
+// deeper accumulator and nothing else; narrow models keep the shallow variant. Mirrors the CUDA
+// bucket dispatch in ggml-cuda/flash-attn-back.cu.
+#ifndef FA_BACK_SLOTS
+#define FA_BACK_SLOTS 4
+#endif
+
+// retro delta: KV cache element type. Both F16 and F32 are built, and F32 is not
+// optional: `cap_flash_attn_back` is probed with an F32 cache
+// (retro_backend.cpp) and clearing that gate is the precondition for the F16
+// probe -- and therefore for `kv_dtype = "f16"` -- ever running. Mirrors the CUDA
+// and Metal ports.
+#ifdef KV_F32
+#define KV_TYPE float
+#else
+#define KV_TYPE float16_t
+#endif
+
 layout(push_constant) uniform parameter {
     uint N; uint KV; uint HSK; uint HSV;
     uint n_head; uint n_head_kv; uint n_batch;
@@ -14,19 +34,23 @@ layout(push_constant) uniform parameter {
     float scale; float max_bias; float logit_softcap;
     uint mask_ne1; uint mask_ne2; uint mask_ne3;
     uint flags;
+    uint KV_GRAD; uint kv_stride; uint kv_stream0;
 } p;
 
-layout(binding = 0) readonly buffer Q     { float     q[]; };
-layout(binding = 1) readonly buffer K     { float16_t k[]; };
-layout(binding = 2) readonly buffer V     { float16_t v[]; };
-layout(binding = 3) readonly buffer Mask  { float16_t mask[]; };
-layout(binding = 4) readonly buffer Out   { float     out_data[]; };
-layout(binding = 5) readonly buffer DOut  { float     dout[]; };
-layout(binding = 6) readonly buffer Sinks { float     sinks[]; };
-layout(binding = 7) buffer Grad           { float     grad[]; };
+layout(binding = 0) readonly buffer Q      { float     q[]; };
+layout(binding = 1) readonly buffer K      { KV_TYPE   k[]; };
+layout(binding = 2) readonly buffer V      { KV_TYPE   v[]; };
+layout(binding = 3) readonly buffer Mask   { float16_t mask[]; };
+layout(binding = 4) readonly buffer Out    { float     out_data[]; };
+layout(binding = 5) readonly buffer DOut   { float     dout[]; };
+layout(binding = 6) readonly buffer Sinks  { float     sinks[]; };
+layout(binding = 7) buffer Grad            { float     grad[]; };
+layout(binding = 8) readonly buffer KvIdxs { int       kv_idxs[]; };
 
-const uint FLAG_MASK  = 1u;
-const uint FLAG_SINKS = 2u;
+// Bits 2..4 carry ggml_flash_attn_back_grad shifted left by 2.
+const uint FLAG_MASK   = 1u;
+const uint FLAG_SINKS  = 2u;
+const uint FLAG_GRAD_Q = 4u;
 
 float alibi_slope(uint head) {
     if (p.max_bias <= 0.0f) {
@@ -113,7 +137,19 @@ void main() {
         grad[p.off_stats + p.N * p.n_head * p.n_batch + stat_index] = delta;
     }
 
-    float dq[4] = float[4](0.0f, 0.0f, 0.0f, 0.0f);
+    // The dK/dV pass consumes the statistics written above, so they are produced
+    // unconditionally; the dQ accumulation below is the expensive part and is
+    // skipped when the packed result has no dQ segment. The branch is uniform
+    // across the workgroup (push constant), so the subgroup reductions inside
+    // the loop stay well formed.
+    if ((p.flags & FLAG_GRAD_Q) == 0u) {
+        return;
+    }
+
+    float dq[FA_BACK_SLOTS];
+    for (uint slot = 0u; slot < FA_BACK_SLOTS; ++slot) {
+        dq[slot] = 0.0f;
+    }
     for (uint key = 0u; key < p.KV; ++key) {
         float qk_part = 0.0f;
         for (uint id = lid; id < p.HSK; id += 32u) {
@@ -128,7 +164,7 @@ void main() {
         float dot_dv = subgroupAdd(dv_part);
         float probability = exp(score_from_dot(dot_qk, key, row, head, batch) - lse);
         float ds = probability * (dot_dv - delta) * score_derivative(dot_qk);
-        for (uint slot = 0u; slot < 4u; ++slot) {
+        for (uint slot = 0u; slot < FA_BACK_SLOTS; ++slot) {
             uint id = lid + 32u * slot;
             if (id < p.HSK) {
                 dq[slot] += ds * float(k[k_head_base + key * p.HSK + id]);
@@ -136,7 +172,7 @@ void main() {
         }
     }
 
-    for (uint slot = 0u; slot < 4u; ++slot) {
+    for (uint slot = 0u; slot < FA_BACK_SLOTS; ++slot) {
         uint id = lid + 32u * slot;
         if (id < p.HSK) {
             uint gq = p.off_q + (((batch * p.n_head + head) * p.N + row) * p.HSK + id);

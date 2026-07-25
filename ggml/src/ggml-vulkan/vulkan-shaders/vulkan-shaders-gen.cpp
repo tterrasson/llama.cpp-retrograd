@@ -673,8 +673,22 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
 }
 
 void process_shaders() {
-    string_to_spv("flash_attn_back_q_f32_f16",  "flash_attn_back_q.comp",  {});
-    string_to_spv("flash_attn_back_kv_f32_f16", "flash_attn_back_kv.comp", {});
+    // retro delta: one variant per head-dim bucket (see flash_attn_back_q.comp)
+    // and per KV cache element type (F32 is what the capability probe builds, F16
+    // is what `kv_dtype = "f16"` stores). The `d` suffix is the largest head
+    // dimension the variant covers.
+    static const char * fa_back_buckets[][2] = {{"128", "4"}, {"256", "8"}, {"512", "16"}};
+    for (const auto & bucket : fa_back_buckets) {
+        for (const char * kv : {"f16", "f32"}) {
+            std::map<std::string, std::string> defines = {{"FA_BACK_SLOTS", bucket[1]}};
+            if (std::string(kv) == "f32") {
+                defines["KV_F32"] = "1";
+            }
+            const std::string suffix = std::string("_f32_") + kv + "_d" + bucket[0];
+            string_to_spv("flash_attn_back_q"  + suffix, "flash_attn_back_q.comp",  defines);
+            string_to_spv("flash_attn_back_kv" + suffix, "flash_attn_back_kv.comp", defines);
+        }
+    }
 
     // matmul
     for (const MatMulIdType& matmul_id_type : {MatMulIdType::NONE, MatMulIdType::DEFAULT, MatMulIdType::SUBGROUP}) {

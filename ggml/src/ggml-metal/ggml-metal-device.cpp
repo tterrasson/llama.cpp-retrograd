@@ -681,6 +681,57 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net_
     return res;
 }
 
+// retro delta: streaming Flash Attention backward. Variant name is
+// kernel_flash_attn_back_<pass>_f32_<kv type>_d<head-dim bucket>. Both passes must
+// resolve the *same* variant -- the dK/dV pass consumes the per-query LSE/delta
+// the dQ pass wrote -- so they share this builder.
+//
+// Metal stops at the 256 bucket: CUDA and Vulkan carry a 512 variant for
+// Gemma-4's global-attention layers, but adding one here without running
+// tests/metal_ops.rs on real hardware is exactly the "report support, produce
+// wrong gradients" failure the cap exists to prevent. Such models fall back to
+// the materialized F32 attention graph on Metal.
+static_assert(GGML_METAL_FA_BACK_MAX_D <= GGML_FLASH_ATTN_BACK_MAX_HEAD_DIM,
+              "advertised head-dim cap exceeds what the probe harness can exercise");
+
+static void ggml_metal_fa_back_pipeline_name(char * name, size_t len, const ggml_tensor * op, const char * pass) {
+    GGML_ASSERT(op->op == GGML_OP_FLASH_ATTN_BACK);
+
+    const int64_t hs_max = std::max(op->src[0]->ne[0], op->src[2]->ne[0]);
+    GGML_ASSERT(hs_max <= GGML_METAL_FA_BACK_MAX_D);
+
+    const ggml_type kv_type = op->src[1]->type;
+    GGML_ASSERT(kv_type == op->src[2]->type);
+    GGML_ASSERT(kv_type == GGML_TYPE_F16 || kv_type == GGML_TYPE_F32);
+
+    snprintf(name, len, "kernel_flash_attn_back_%s_f32_%s_d%d",
+            pass, ggml_type_name(kv_type), hs_max <= 128 ? 128 : 256);
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_back_q(
+        ggml_metal_library_t lib, const ggml_tensor * op) {
+    char name[256];
+    ggml_metal_fa_back_pipeline_name(name, sizeof(name), op, "q");
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_back_kv(
+        ggml_metal_library_t lib, const ggml_tensor * op) {
+    char name[256];
+    ggml_metal_fa_back_pipeline_name(name, sizeof(name), op, "kv");
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rwkv(ggml_metal_library_t lib, const ggml_tensor * op) {
     char base[256];
     char name[256];

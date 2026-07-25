@@ -547,6 +547,50 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
     return vk_device_architecture::OTHER;
 }
 
+// retro delta: head-dim buckets for the differentiable Flash Attention backward
+// shaders (flash_attn_back_{q,kv}.comp). Each bucket is a separate shader
+// variant whose per-invocation accumulator depth covers head dims up to the
+// listed maximum; dispatch picks the smallest one that fits so narrow-head
+// models keep the shallow variant. Mirrors ggml-cuda/flash-attn-back.cu.
+enum vk_fa_back_bucket {
+    FA_BACK_BUCKET_128,
+    FA_BACK_BUCKET_256,
+    FA_BACK_BUCKET_512,
+    FA_BACK_BUCKETS,
+};
+
+static const uint32_t vk_fa_back_bucket_max_d[FA_BACK_BUCKETS] = { 128, 256, 512 };
+
+// KV cache element type axis, orthogonal to the bucket. F32 is not optional:
+// `cap_flash_attn_back` is probed with an F32 cache (retro_backend.cpp) and
+// clearing that gate is what lets the F16 probe -- and therefore
+// `kv_dtype = "f16"` -- run at all. Mirrors the CUDA and Metal ports.
+enum vk_fa_back_kv {
+    FA_BACK_KV_F16,
+    FA_BACK_KV_F32,
+    FA_BACK_KV_TYPES,
+};
+
+// Largest head dimension any variant covers; the supports check gates on this.
+// Only raise it alongside a new shader variant *and* a gradient-parity test at
+// that head dimension -- an untested variant would report support and produce
+// silently wrong gradients rather than fail. Bounded by
+// GGML_FLASH_ATTN_BACK_MAX_HEAD_DIM, the ceiling the probe harness covers.
+#define VK_FA_BACK_MAX_D 512
+
+static_assert(VK_FA_BACK_MAX_D <= GGML_FLASH_ATTN_BACK_MAX_HEAD_DIM,
+              "advertised head-dim cap exceeds what the probe harness can exercise");
+
+static vk_fa_back_bucket ggml_vk_fa_back_select_bucket(uint32_t hsk, uint32_t hsv) {
+    const uint32_t hs_max = std::max(hsk, hsv);
+    for (int i = 0; i < FA_BACK_BUCKETS; ++i) {
+        if (hs_max <= vk_fa_back_bucket_max_d[i]) {
+            return (vk_fa_back_bucket) i;
+        }
+    }
+    GGML_ABORT("flash attn back: head dim %u exceeds VK_FA_BACK_MAX_D", hs_max);
+}
+
 enum vk_conv_shapes {
     CONV_SHAPE_128x128,
     CONV_SHAPE_64x32,
@@ -1185,8 +1229,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_conv2d_dw_cwhn_f32, pipeline_conv2d_dw_cwhn_f16_f32;
 
     std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16;
-    vk_pipeline pipeline_flash_attn_back_q_f32_f16;
-    vk_pipeline pipeline_flash_attn_back_kv_f32_f16;
+    vk_pipeline pipeline_flash_attn_back_q[FA_BACK_KV_TYPES][FA_BACK_BUCKETS];
+    vk_pipeline pipeline_flash_attn_back_kv[FA_BACK_KV_TYPES][FA_BACK_BUCKETS];
 
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
 
@@ -1503,6 +1547,9 @@ struct vk_flash_attn_back_push_constants {
     float scale, max_bias, logit_softcap;
     uint32_t mask_ne1, mask_ne2, mask_ne3;
     uint32_t flags;
+    // KV gradient window (ggml_flash_attn_ext_set_grad_window). Without one,
+    // KV_GRAD == KV and FLAG_WINDOW is clear.
+    uint32_t KV_GRAD, kv_stride, kv_stream0;
 };
 static_assert(sizeof(vk_flash_attn_back_push_constants) <= 128,
         "sizeof(vk_flash_attn_back_push_constants) must be <= 128");
@@ -5873,14 +5920,23 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_matmul_split_k_reduce, "split_k_reduce", split_k_reduce_len, split_k_reduce_data, "main", 2, 2 * sizeof(uint32_t), {256 * 4, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_flash_attn_split_k_reduce, "fa_split_k_reduce", fa_split_k_reduce_len, fa_split_k_reduce_data, "main", 3, sizeof(vk_op_flash_attn_split_k_reduce_push_constants), {1, device->subgroup_size, 1}, {device->subgroup_size}, 1, true);
-    ggml_vk_create_pipeline(device, device->pipeline_flash_attn_back_q_f32_f16,
-            "flash_attn_back_q_f32_f16", flash_attn_back_q_f32_f16_len,
-            flash_attn_back_q_f32_f16_data, "main", 8,
-            sizeof(vk_flash_attn_back_push_constants), {32, 1, 1}, {}, 1, true, true, 32);
-    ggml_vk_create_pipeline(device, device->pipeline_flash_attn_back_kv_f32_f16,
-            "flash_attn_back_kv_f32_f16", flash_attn_back_kv_f32_f16_len,
-            flash_attn_back_kv_f32_f16_data, "main", 8,
-            sizeof(vk_flash_attn_back_push_constants), {32, 1, 1}, {}, 1, true, true, 32);
+#define CREATE_FA_BACK_PIPELINES(KVIDX, KV, BUCKET, D)                                          \
+    ggml_vk_create_pipeline(device, device->pipeline_flash_attn_back_q[KVIDX][BUCKET],           \
+            "flash_attn_back_q_f32_" #KV "_d" #D, flash_attn_back_q_f32_##KV##_d##D##_len,       \
+            flash_attn_back_q_f32_##KV##_d##D##_data, "main", 9,                                 \
+            sizeof(vk_flash_attn_back_push_constants), {32, 1, 1}, {}, 1, true, true, 32);       \
+    ggml_vk_create_pipeline(device, device->pipeline_flash_attn_back_kv[KVIDX][BUCKET],          \
+            "flash_attn_back_kv_f32_" #KV "_d" #D, flash_attn_back_kv_f32_##KV##_d##D##_len,     \
+            flash_attn_back_kv_f32_##KV##_d##D##_data, "main", 9,                                \
+            sizeof(vk_flash_attn_back_push_constants), {32, 1, 1}, {}, 1, true, true, 32)
+
+    CREATE_FA_BACK_PIPELINES(FA_BACK_KV_F16, f16, FA_BACK_BUCKET_128, 128);
+    CREATE_FA_BACK_PIPELINES(FA_BACK_KV_F16, f16, FA_BACK_BUCKET_256, 256);
+    CREATE_FA_BACK_PIPELINES(FA_BACK_KV_F16, f16, FA_BACK_BUCKET_512, 512);
+    CREATE_FA_BACK_PIPELINES(FA_BACK_KV_F32, f32, FA_BACK_BUCKET_128, 128);
+    CREATE_FA_BACK_PIPELINES(FA_BACK_KV_F32, f32, FA_BACK_BUCKET_256, 256);
+    CREATE_FA_BACK_PIPELINES(FA_BACK_KV_F32, f32, FA_BACK_BUCKET_512, 512);
+#undef CREATE_FA_BACK_PIPELINES
 
     for (auto &it : device->pipeline_fa_mask_opt) {
         auto BrBc = it.first;
@@ -11818,18 +11874,33 @@ static void ggml_vk_flash_attn_back(
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * out   = dst->src[4];
-    const ggml_tensor * dout  = dst->src[5];
-    const ggml_tensor * sinks = dst->src[6];
+    const ggml_tensor * dout    = dst->src[5];
+    const ggml_tensor * sinks   = dst->src[6];
+    const ggml_tensor * kv_idxs = dst->src[9];
 
     GGML_ASSERT(q->type == GGML_TYPE_F32);
-    GGML_ASSERT(k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16);
+    GGML_ASSERT(k->type == v->type);
+    GGML_ASSERT(k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_F32);
     GGML_ASSERT(out->type == GGML_TYPE_F32 && dout->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(q->ne[0] <= 128 && v->ne[0] <= 128);
+    GGML_ASSERT(q->ne[0] <= VK_FA_BACK_MAX_D && v->ne[0] <= VK_FA_BACK_MAX_D);
+    GGML_ASSERT(!kv_idxs || (kv_idxs->type == GGML_TYPE_I32 && ggml_is_contiguous(kv_idxs)));
 
-    const size_t size_q = GGML_PAD(ggml_nelements(q) * sizeof(float), GGML_MEM_ALIGN);
-    const size_t size_k = GGML_PAD(ggml_nelements(k) * sizeof(float), GGML_MEM_ALIGN);
-    const size_t size_v = GGML_PAD(ggml_nelements(v) * sizeof(float), GGML_MEM_ALIGN);
+    // Both passes must run the same variant: the dK/dV shader consumes the
+    // per-query LSE/delta the dQ shader wrote.
+    const vk_fa_back_bucket bucket =
+        ggml_vk_fa_back_select_bucket((uint32_t) q->ne[0], (uint32_t) v->ne[0]);
+    const vk_fa_back_kv kv_variant = k->type == GGML_TYPE_F16 ? FA_BACK_KV_F16 : FA_BACK_KV_F32;
+
+    // KV gradient window: dK/dV cover the rows written at this step, not the
+    // whole cache. Without one this is k->ne[1] and the dispatch is unchanged.
+    const uint32_t n_kv_grad = (uint32_t) ggml_flash_attn_back_grad_k(dst)->ne[1];
+
+    size_t off_q = 0;
+    size_t off_k = 0;
+    size_t off_v = 0;
+    size_t off_s = 0;
+    ggml_flash_attn_back_offsets(dst, &off_q, &off_k, &off_v, &off_s);
 
     float scale;
     float max_bias;
@@ -11838,7 +11909,10 @@ static void ggml_vk_flash_attn_back(
     memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
-    const uint32_t flags = (mask ? 1u : 0u) | (sinks ? 2u : 0u);
+    const int32_t grad_mask = ggml_get_op_params_i32(dst, 3);
+
+    const uint32_t flags = (mask ? 1u : 0u) | (sinks ? 2u : 0u) |
+        ((uint32_t) grad_mask << 2) | (kv_idxs ? 32u : 0u);
     const vk_flash_attn_back_push_constants pc = {
         (uint32_t) q->ne[1], (uint32_t) k->ne[1],
         (uint32_t) q->ne[0], (uint32_t) v->ne[0],
@@ -11846,15 +11920,18 @@ static void ggml_vk_flash_attn_back(
         (uint32_t) (q->nb[1] / sizeof(float)),
         (uint32_t) (q->nb[2] / sizeof(float)),
         (uint32_t) (q->nb[3] / sizeof(float)),
-        0u,
-        (uint32_t) (size_q / sizeof(float)),
-        (uint32_t) ((size_q + size_k) / sizeof(float)),
-        (uint32_t) ((size_q + size_k + size_v) / sizeof(float)),
+        (uint32_t) (off_q / sizeof(float)),
+        (uint32_t) (off_k / sizeof(float)),
+        (uint32_t) (off_v / sizeof(float)),
+        (uint32_t) (off_s / sizeof(float)),
         scale, max_bias, logit_softcap,
         mask ? (uint32_t) mask->ne[1] : 1u,
         mask ? (uint32_t) mask->ne[2] : 1u,
         mask ? (uint32_t) mask->ne[3] : 1u,
         flags,
+        n_kv_grad,
+        (uint32_t) ggml_get_op_params_i32(dst, 4),
+        (uint32_t) ggml_get_op_params_i32(dst, 5),
     };
 
     const vk_subbuffer q_buf     = ggml_vk_tensor_subbuffer(ctx, q);
@@ -11865,21 +11942,24 @@ static void ggml_vk_flash_attn_back(
     const vk_subbuffer dst_buf   = ggml_vk_tensor_subbuffer(ctx, dst);
     const vk_subbuffer mask_buf  = mask  ? ggml_vk_tensor_subbuffer(ctx, mask)  : k_buf;
     const vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
+    const vk_subbuffer idxs_buf  = kv_idxs ? ggml_vk_tensor_subbuffer(ctx, kv_idxs) : q_buf;
 
-    ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_back_q_f32_f16, 1);
-    ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_back_kv_f32_f16, 1);
+    ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_back_q[kv_variant][bucket], 1);
+    ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_back_kv[kv_variant][bucket], 1);
 
-    ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_back_q_f32_f16,
-            { q_buf, k_buf, v_buf, mask_buf, out_buf, dout_buf, sinks_buf, dst_buf },
+    ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_back_q[kv_variant][bucket],
+            { q_buf, k_buf, v_buf, mask_buf, out_buf, dout_buf, sinks_buf, dst_buf, idxs_buf },
             pc, { (uint32_t) q->ne[1] * 32u, (uint32_t) q->ne[2], (uint32_t) q->ne[3] });
 
     // The dK/dV pass consumes the per-query LSE and delta written by the dQ
     // pass. Keep both dispatches on device and insert the normal Vulkan buffer
     // dependency used by the other multi-pass training kernels.
-    ggml_vk_sync_buffers(ctx, subctx);
-    ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_back_kv_f32_f16,
-            { q_buf, k_buf, v_buf, mask_buf, out_buf, dout_buf, sinks_buf, dst_buf },
-            pc, { (uint32_t) k->ne[1] * 32u, (uint32_t) k->ne[2], (uint32_t) k->ne[3] });
+    if (grad_mask & (GGML_FLASH_ATTN_BACK_GRAD_K | GGML_FLASH_ATTN_BACK_GRAD_V)) {
+        ggml_vk_sync_buffers(ctx, subctx);
+        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_back_kv[kv_variant][bucket],
+                { q_buf, k_buf, v_buf, mask_buf, out_buf, dout_buf, sinks_buf, dst_buf, idxs_buf },
+                pc, { n_kv_grad * 32u, (uint32_t) k->ne[2], (uint32_t) k->ne[3] });
+    }
 }
 
 static vk_conv_shapes ggml_vk_conv_select_shape(ggml_backend_vk_context * ctx, uint32_t K, uint32_t NPQ) {
@@ -20187,9 +20267,15 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (!q || !k || !v || !out || !dout) {
                     return false;
                 }
-                if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 ||
-                    v->type != GGML_TYPE_F16 || out->type != GGML_TYPE_F32 ||
+                if (q->type != GGML_TYPE_F32 || out->type != GGML_TYPE_F32 ||
                     dout->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                // One shader variant per KV element type, so K and V must agree.
+                // F32 is required, not merely nice to have: cap_flash_attn_back is
+                // probed with an F32 cache and that gate precedes the F16 one.
+                if (k->type != v->type ||
+                    (k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_F32)) {
                     return false;
                 }
                 if (mask && (mask->type != GGML_TYPE_F16 || !ggml_is_contiguous(mask))) {
@@ -20198,7 +20284,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (sinks && sinks->type != GGML_TYPE_F32) {
                     return false;
                 }
-                if (q->ne[0] > 128 || v->ne[0] > 128 || q->ne[0] != k->ne[0] ||
+                if (q->ne[0] > VK_FA_BACK_MAX_D || v->ne[0] > VK_FA_BACK_MAX_D ||
+                    q->ne[0] != k->ne[0] ||
                     k->ne[1] != v->ne[1] || q->ne[2] % k->ne[2] != 0 ||
                     k->ne[2] != v->ne[2] || q->ne[3] != k->ne[3] ||
                     q->ne[3] != v->ne[3]) {
@@ -20207,6 +20294,12 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (q->nb[0] != sizeof(float) || !ggml_is_contiguous(k) ||
                     !ggml_is_contiguous(v) || !ggml_is_contiguous(out) ||
                     !ggml_is_contiguous(dout) || !ggml_is_contiguous(op)) {
+                    return false;
+                }
+                // KV gradient window: contiguous I32 row indices, one per window
+                // row and stream (ggml_flash_attn_ext_set_grad_window).
+                const ggml_tensor * kv_idxs = op->src[9];
+                if (kv_idxs && (kv_idxs->type != GGML_TYPE_I32 || !ggml_is_contiguous(kv_idxs))) {
                     return false;
                 }
                 return true;

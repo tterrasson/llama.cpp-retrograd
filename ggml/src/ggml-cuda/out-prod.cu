@@ -1,7 +1,10 @@
 #include "out-prod.cuh"
 #include "convert.cuh"
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <limits>
 
 static __global__ void k_compute_out_prod_ptrs(
         const float * src0_d, const float * src1_d, float * dst_d,
@@ -25,85 +28,38 @@ static __global__ void k_compute_out_prod_ptrs(
     ptrs_c[idx] = dst_d  +  i3      *s3  +  i2      *s2;
 }
 
-void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * src0 = dst->src[0];
-    const ggml_tensor * src1 = dst->src[1];
+// retro delta: ceiling on the F32 scratch used to dequantize a quantized src0.
+// Dequantizing the whole weight at once costs ne00*ne01*ne02*ne03*4 bytes, which
+// the CUDA pool then holds at its high-water mark for the rest of the process --
+// about 225 MiB for a 12B `ffn_up`, paid on every LoRA backward. Slicing the
+// reduction axis keeps that scratch bounded. A budget that already covers the
+// whole weight produces exactly one slice, hence the same single GEMM and the
+// same arithmetic as an unsliced run: small weights are bit-identical either way.
+// GGML_CUDA_DEQUANT_BUDGET_MB overrides the default; 0 or less means "do not
+// slice". Read on every call rather than cached in a static: the value is only
+// consulted once per OUT_PROD node, which is negligible next to that node's GEMM,
+// and a cache would freeze on whatever the environment held when the first out
+// product of the process ran -- making the knob untestable from inside a suite.
+static int64_t ggml_cuda_dequant_budget_bytes() {
+    const char * env = getenv("GGML_CUDA_DEQUANT_BUDGET_MB");
+    const int64_t mb = env ? std::atoll(env) : 64;
+    return mb > 0 ? mb*1024*1024 : std::numeric_limits<int64_t>::max();
+}
 
-    GGML_TENSOR_BINARY_OP_LOCALS
-
-    // retro delta: OUT_PROD with a quantized src0 is the weight-gradient of a
-    // quantized (frozen base) projection during LoRA training. Upstream CUDA
-    // only handles F32 x F32; the CPU/Vulkan forks dequantize src0 and accumulate
-    // in F32. Here we dequantize src0 to a contiguous F32 scratch with ggml-cuda's
-    // existing per-type kernels (bit-identical to the CPU oracle's dequant) and
-    // then reuse the proven cuBLAS path, so every quant type with a to_fp32
-    // kernel is covered with F32 accumulation.
-    GGML_ASSERT(src0->type == GGML_TYPE_F32 || ggml_is_quantized(src0->type));
-    GGML_ASSERT(src1->type == GGML_TYPE_F32);
-    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
-
-    GGML_ASSERT(ne01 == ne11);
-    GGML_ASSERT(ne0 == ne00);
-    GGML_ASSERT(ne1 == ne10);
-
-    GGML_ASSERT(ne2 % src0->ne[2] == 0);
-    GGML_ASSERT(ne3 % src0->ne[3] == 0);
-
-    GGML_ASSERT(ne2 == src1->ne[2]);
-    GGML_ASSERT(ne3 == src1->ne[3]);
-
-    const float * src1_d = (const float *) src1->data;
-    float       *  dst_d = (float       *)  dst->data;
-
+// One reduction slice of the out product: dst = alpha*src0*src1^T + beta*dst over
+// `k` reduction elements. `beta` is 0 for the first slice (overwrite) and 1 for
+// every later one (accumulate), so slicing only changes how the k-sum is grouped.
+static void ggml_cuda_out_prod_gemm(
+        ggml_backend_cuda_context & ctx,
+        const float * src0_d, int64_t lda, size_t s02, size_t s03,
+        const float * src1_d, int64_t ldb, cublasOperation_t src1_op, size_t s12, size_t s13,
+        float * dst_d, int64_t ldc, size_t s2, size_t s3,
+        int64_t ne0, int64_t ne1, int64_t k,
+        int64_t ne2, int64_t ne3, int64_t dps2, int64_t dps3,
+        float beta) {
     cudaStream_t   stream = ctx.stream();
     cublasHandle_t handle = ctx.cublas_handle();
-
-    // src0 element strides (in floats). For a quantized src0 we dequantize into a
-    // fully contiguous F32 scratch, so the strides are the packed row layout.
-    int64_t lda, s02, s03;
-    const float * src0_d;
-    ggml_cuda_pool_alloc<float> src0_f32(ctx.pool());
-    if (ggml_is_quantized(src0->type)) {
-        // The dequant kernels consume a contiguous quantized block, matching the
-        // packed weight layout (nb00 == type size, rows tightly packed).
-        GGML_ASSERT(nb00 == ggml_type_size(src0->type));
-        GGML_ASSERT(ggml_is_contiguous(src0));
-        const int64_t n_src0 = ggml_nelements(src0);
-        src0_f32.alloc(n_src0);
-        to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(src0->type);
-        GGML_ASSERT(to_fp32 != nullptr);
-        to_fp32(src0->data, src0_f32.get(), n_src0, stream);
-        src0_d = src0_f32.get();
-        lda = ne00;
-        s02 = ne00*ne01;
-        s03 = ne00*ne01*ne02;
-    } else {
-        src0_d = (const float *) src0->data;
-        lda = nb01 / sizeof(float);
-        s02 = nb02 / sizeof(float);
-        s03 = nb03 / sizeof(float);
-    }
-
     const float alpha = 1.0f;
-    const float beta = 0.0f;
-
-    const int64_t ldc = nb1  / sizeof(float);
-
-    const bool src1_T = ggml_is_transposed(src1);
-    const cublasOperation_t src1_cublas_op =  src1_T ? CUBLAS_OP_N : CUBLAS_OP_T;
-    const int64_t           ldb            = (src1_T ?        nb10 :        nb11) /  sizeof(float);
-    GGML_ASSERT(                             (src1_T ?        nb11 :        nb10) == sizeof(float));
-
-    // data strides in dimensions 2/3 (s02/s03 for src0 were resolved above so the
-    // dequantized-scratch layout is used when src0 is quantized)
-    const size_t s12 = nb12 / sizeof(float);
-    const size_t s13 = nb13 / sizeof(float);
-    const size_t s2  = nb2  / sizeof(float);
-    const size_t s3  = nb3  / sizeof(float);
-
-    // dps == dst per src0, used for group query attention
-    const int64_t dps2 = ne2 / ne02;
-    const int64_t dps3 = ne3 / ne03;
 
     if (dps2 == 1 && ne2 > 1) {
         // src0 has uniform stride s02 along dim 2; batch the inner loop with a strided GEMM
@@ -111,8 +67,8 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         const int batch_count = (int) ne2;
         for (int64_t i3 = 0; i3 < ne3; ++i3) {
             CUBLAS_CHECK(
-                cublasSgemmStridedBatched(handle, CUBLAS_OP_N, src1_cublas_op,
-                        ne0, ne1, ne01,
+                cublasSgemmStridedBatched(handle, CUBLAS_OP_N, src1_op,
+                        ne0, ne1, k,
                         &alpha, src0_d + (i3/dps3)*s03, lda, s02,
                                 src1_d +  i3     *s13, ldb, s12,
                         &beta,  dst_d  +  i3     *s3,  ldc, s2,
@@ -138,8 +94,8 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         CUDA_CHECK(cudaGetLastError());
 
         CUBLAS_CHECK(
-            cublasSgemmBatched(handle, CUBLAS_OP_N, src1_cublas_op,
-                    ne0, ne1, ne01,
+            cublasSgemmBatched(handle, CUBLAS_OP_N, src1_op,
+                    ne0, ne1, k,
                     &alpha, ptrs_a.get(), lda,
                             ptrs_b.get(), ldb,
                     &beta,  ptrs_c.get(), ldc,
@@ -147,10 +103,120 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     } else {
         // ne2 == 1 && ne3 == 1: single GEMM
         CUBLAS_CHECK(
-            cublasSgemm(handle, CUBLAS_OP_N, src1_cublas_op,
-                    ne0, ne1, ne01,
+            cublasSgemm(handle, CUBLAS_OP_N, src1_op,
+                    ne0, ne1, k,
                     &alpha, src0_d, lda,
                             src1_d, ldb,
                     &beta,  dst_d,  ldc));
+    }
+}
+
+void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    // retro delta: OUT_PROD with a quantized src0 is the input-gradient of a
+    // quantized (frozen base) projection during LoRA training. Upstream CUDA
+    // only handles F32 x F32; the CPU/Vulkan forks dequantize src0 and accumulate
+    // in F32. Here src0 is dequantized with ggml-cuda's existing per-type kernels
+    // (bit-identical to the CPU oracle's dequant) and the proven cuBLAS path is
+    // reused, so every quant type with a to_fp32 kernel is covered with F32
+    // accumulation -- but in slices along the reduction axis, so the F32 scratch
+    // never scales with the whole weight (see ggml_cuda_dequant_budget_bytes).
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || ggml_is_quantized(src0->type));
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+
+    GGML_ASSERT(ne01 == ne11);
+    GGML_ASSERT(ne0 == ne00);
+    GGML_ASSERT(ne1 == ne10);
+
+    GGML_ASSERT(ne2 % src0->ne[2] == 0);
+    GGML_ASSERT(ne3 % src0->ne[3] == 0);
+
+    GGML_ASSERT(ne2 == src1->ne[2]);
+    GGML_ASSERT(ne3 == src1->ne[3]);
+
+    const float * src1_d = (const float *) src1->data;
+    float       *  dst_d = (float       *)  dst->data;
+
+    const int64_t ldc = nb1 / sizeof(float);
+
+    const bool src1_T = ggml_is_transposed(src1);
+    const cublasOperation_t src1_op = src1_T ? CUBLAS_OP_N : CUBLAS_OP_T;
+    const int64_t           ldb     = (src1_T ?        nb10 :        nb11) /  sizeof(float);
+    GGML_ASSERT(                      (src1_T ?        nb11 :        nb10) == sizeof(float));
+
+    // Distance in floats between two consecutive reduction elements of src1, used
+    // to offset a reduction slice: with CUBLAS_OP_N cuBLAS reads src1 as [k, ne1]
+    // so k advances by one element, with CUBLAS_OP_T it reads [ne1, k] so k
+    // advances by one leading dimension.
+    const int64_t src1_k_stride = src1_T ? 1 : ldb;
+
+    // data strides in dimensions 2/3
+    const size_t s12 = nb12 / sizeof(float);
+    const size_t s13 = nb13 / sizeof(float);
+    const size_t s2  = nb2  / sizeof(float);
+    const size_t s3  = nb3  / sizeof(float);
+
+    // dps == dst per src0, used for group query attention
+    const int64_t dps2 = ne2 / ne02;
+    const int64_t dps3 = ne3 / ne03;
+
+    if (!ggml_is_quantized(src0->type)) {
+        ggml_cuda_out_prod_gemm(ctx,
+            (const float *) src0->data, nb01 / sizeof(float), nb02 / sizeof(float), nb03 / sizeof(float),
+            src1_d, ldb, src1_op, s12, s13,
+            dst_d, ldc, s2, s3,
+            ne0, ne1, ne01, ne2, ne3, dps2, dps3,
+            /*beta =*/ 0.0f);
+        return;
+    }
+
+    // The dequant kernels consume a contiguous run of quantized blocks, matching
+    // the packed weight layout (nb00 == type size, rows tightly packed).
+    GGML_ASSERT(nb00 == ggml_type_size(src0->type));
+    GGML_ASSERT(ggml_is_contiguous(src0));
+
+    to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(src0->type);
+    GGML_ASSERT(to_fp32 != nullptr);
+
+    // A src0 column spans a whole number of quantization blocks, so any slice of
+    // whole columns starts and ends on a block boundary and can be handed to the
+    // dequant kernel as-is.
+    GGML_ASSERT(ne00 % ggml_blck_size(src0->type) == 0);
+
+    const int64_t n_planes = ne02*ne03;
+
+    // Columns of src0 per slice, from the scratch budget. At least one column per
+    // plane is always dequantized, even if that exceeds the budget: below that
+    // there is nothing left to slice.
+    const int64_t budget_cols = ggml_cuda_dequant_budget_bytes()/((int64_t) sizeof(float)*ne00*n_planes);
+    const int64_t slice_cols  = std::max<int64_t>(1, std::min<int64_t>(ne01, budget_cols));
+
+    ggml_cuda_pool_alloc<float> src0_f32(ctx.pool(), (size_t) ne00*slice_cols*n_planes);
+    cudaStream_t stream = ctx.stream();
+
+    for (int64_t j0 = 0; j0 < ne01; j0 += slice_cols) {
+        const int64_t nj = std::min(slice_cols, ne01 - j0);
+
+        // Dequantize columns [j0, j0+nj) of every src0 plane into a contiguous
+        // [ne00, nj, ne02, ne03] scratch, so the GEMM sees the packed row layout.
+        for (int64_t p = 0; p < n_planes; ++p) {
+            const int64_t i2 = p % ne02;
+            const int64_t i3 = p / ne02;
+            const char * q = (const char *) src0->data + i3*nb03 + i2*nb02 + j0*nb01;
+            to_fp32(q, src0_f32.get() + p*ne00*nj, ne00*nj, stream);
+        }
+        CUDA_CHECK(cudaGetLastError());
+
+        ggml_cuda_out_prod_gemm(ctx,
+            src0_f32.get(), ne00, (size_t) ne00*nj, (size_t) ne00*nj*ne02,
+            src1_d + j0*src1_k_stride, ldb, src1_op, s12, s13,
+            dst_d, ldc, s2, s3,
+            ne0, ne1, nj, ne2, ne3, dps2, dps3,
+            /*beta =*/ j0 == 0 ? 0.0f : 1.0f);
     }
 }

@@ -1822,9 +1822,72 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 ggml_is_contiguous_rows(op->src[1]) &&
                 ggml_is_contiguous_rows(op->src[2]) &&
                 ggml_is_contiguous_rows(op->src[3]);
-        case GGML_OP_SSM_SCAN:
-            return has_simdgroup_reduction;
+        case GGML_OP_FLASH_ATTN_BACK:
+            // retro delta: kernel_flash_attn_back_{q,kv}_f32_{f16,f32}_d{128,256}.
+            // This is what makes the KV cache differentiable (and `kv_dtype =
+            // "f16"` reachable), so keep the contract exactly as narrow as the
+            // kernels: any layout not listed here has to fall back to the
+            // materialized F32 attention graph rather than produce a silently
+            // wrong gradient. Mirrors the CUDA gate in ggml-cuda.cu, plus the
+            // stricter contiguity requirements these kernels actually need.
+            {
+                // Both passes reduce across a 32-wide SIMD group with simd_sum.
+                if (!has_simdgroup_reduction) {
+                    return false;
+                }
+
+                const struct ggml_tensor * q     = op->src[0];
+                const struct ggml_tensor * k     = op->src[1];
+                const struct ggml_tensor * v     = op->src[2];
+                const struct ggml_tensor * mask  = op->src[3];
+                const struct ggml_tensor * out   = op->src[4];
+                const struct ggml_tensor * dout  = op->src[5];
+                const struct ggml_tensor * sinks = op->src[6];
+                if (!q || !k || !v || !out || !dout) {
+                    return false;
+                }
+                // Attention sinks: the dQ kernel carries the code path but nothing
+                // exercises it (the probe never sets sinks), so it is refused here
+                // rather than shipped untested -- same call as CUDA.
+                if (sinks) {
+                    return false;
+                }
+                if (q->type != GGML_TYPE_F32 || out->type != GGML_TYPE_F32 ||
+                    dout->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                // One kernel variant per KV element type, so K and V must agree.
+                if (k->type != v->type ||
+                    (k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_F32)) {
+                    return false;
+                }
+                if (mask && (mask->type != GGML_TYPE_F16 || !ggml_is_contiguous(mask))) {
+                    return false;
+                }
+                if (q->ne[0] > GGML_METAL_FA_BACK_MAX_D || v->ne[0] > GGML_METAL_FA_BACK_MAX_D ||
+                    q->ne[0] != k->ne[0] ||
+                    k->ne[1] != v->ne[1] || q->ne[2] % k->ne[2] != 0 ||
+                    k->ne[2] != v->ne[2] || q->ne[3] != k->ne[3] ||
+                    q->ne[3] != v->ne[3]) {
+                    return false;
+                }
+                // Q is indexed by element strides, so only its rows must be
+                // packed; everything else is walked flat.
+                if (q->nb[0] != sizeof(float) || !ggml_is_contiguous(k) ||
+                    !ggml_is_contiguous(v) || !ggml_is_contiguous(out) ||
+                    !ggml_is_contiguous(dout) || !ggml_is_contiguous(op)) {
+                    return false;
+                }
+                // KV gradient window: contiguous I32 row indices, one per window
+                // row and stream (ggml_flash_attn_ext_set_grad_window).
+                const struct ggml_tensor * kv_idxs = op->src[9];
+                if (kv_idxs && (kv_idxs->type != GGML_TYPE_I32 || !ggml_is_contiguous(kv_idxs))) {
+                    return false;
+                }
+                return true;
+            }
         case GGML_OP_SSM_CONV:
+        case GGML_OP_SSM_SCAN:
             return has_simdgroup_reduction;
         // retro delta: dedicated F32 backward kernels. SSM_CONV_BACK writes
         // disjoint packed-output elements; SSM_SCAN_BACK zero-fills its packed

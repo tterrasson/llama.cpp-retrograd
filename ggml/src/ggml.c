@@ -5622,7 +5622,90 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
+void ggml_flash_attn_ext_set_grad_window(
+        struct ggml_tensor * a,
+        struct ggml_tensor * k_cur,
+        struct ggml_tensor * v_cur,
+        struct ggml_tensor * kv_idxs,
+        int32_t              kv_stride,
+        int32_t              kv_stream0) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(k_cur && v_cur && kv_idxs);
+    GGML_ASSERT(kv_idxs->type == GGML_TYPE_I32);
+
+    const struct ggml_tensor * k = a->src[1];
+    const struct ggml_tensor * v = a->src[2];
+
+    // Same layout as the cache views, only shorter along the KV axis.
+    GGML_ASSERT(k_cur->ne[0] == k->ne[0] && k_cur->ne[2] == k->ne[2] && k_cur->ne[3] == k->ne[3]);
+    GGML_ASSERT(v_cur->ne[0] == v->ne[0] && v_cur->ne[2] == v->ne[2] && v_cur->ne[3] == v->ne[3]);
+    GGML_ASSERT(k_cur->ne[1] == v_cur->ne[1]);
+    GGML_ASSERT(k_cur->ne[1] <= k->ne[1]);
+    // One index per window row and per stream, in stream-major order.
+    GGML_ASSERT(ggml_nelements(kv_idxs) == k_cur->ne[1]*k_cur->ne[3]);
+    GGML_ASSERT(kv_stride > 0);
+
+    a->src[5] = k_cur;
+    a->src[6] = v_cur;
+    a->src[7] = kv_idxs;
+
+    // retro delta: slot 4 is n_kv_max (ggml_flash_attn_ext_set_n_kv_max), which
+    // backends read to pick the sparse path, so the window starts at slot 5.
+    ggml_set_op_params_i32(a, 5, kv_stride);
+    ggml_set_op_params_i32(a, 6, kv_stream0);
+}
+
 // ggml_flash_attn_ext_back
+
+const struct ggml_tensor * ggml_flash_attn_back_grad_k(const struct ggml_tensor * dst) {
+    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_BACK);
+    return dst->src[7] ? dst->src[7] : dst->src[1];
+}
+
+const struct ggml_tensor * ggml_flash_attn_back_grad_v(const struct ggml_tensor * dst) {
+    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_BACK);
+    return dst->src[8] ? dst->src[8] : dst->src[2];
+}
+
+static void ggml_flash_attn_back_offsets_impl(
+        const struct ggml_tensor * q,
+        const struct ggml_tensor * gk,
+        const struct ggml_tensor * gv,
+        int32_t                    grad_mask,
+        size_t * off_q,
+        size_t * off_k,
+        size_t * off_v,
+        size_t * off_s) {
+    const size_t tsize = ggml_type_size(GGML_TYPE_F32);
+
+    const size_t size_q = (grad_mask & GGML_FLASH_ATTN_BACK_GRAD_Q)
+        ? GGML_PAD(ggml_nelements(q)*tsize, GGML_MEM_ALIGN) : 0;
+    const size_t size_k = (grad_mask & GGML_FLASH_ATTN_BACK_GRAD_K)
+        ? GGML_PAD(ggml_nelements(gk)*tsize, GGML_MEM_ALIGN) : 0;
+    const size_t size_v = (grad_mask & GGML_FLASH_ATTN_BACK_GRAD_V)
+        ? GGML_PAD(ggml_nelements(gv)*tsize, GGML_MEM_ALIGN) : 0;
+
+    if (off_q) { *off_q = 0; }
+    if (off_k) { *off_k = size_q; }
+    if (off_v) { *off_v = size_q + size_k; }
+    if (off_s) { *off_s = size_q + size_k + size_v; }
+}
+
+void ggml_flash_attn_back_offsets(
+        const struct ggml_tensor * dst,
+        size_t * off_q,
+        size_t * off_k,
+        size_t * off_v,
+        size_t * off_s) {
+    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_BACK);
+
+    ggml_flash_attn_back_offsets_impl(
+            dst->src[0],
+            ggml_flash_attn_back_grad_k(dst),
+            ggml_flash_attn_back_grad_v(dst),
+            ggml_get_op_params_i32(dst, 3),
+            off_q, off_k, off_v, off_s);
+}
 
 struct ggml_tensor * ggml_flash_attn_ext_back(
         struct ggml_context * ctx,
@@ -5633,6 +5716,12 @@ struct ggml_tensor * ggml_flash_attn_ext_back(
         struct ggml_tensor  * out,
         struct ggml_tensor  * d,
         struct ggml_tensor  * sinks,
+        struct ggml_tensor  * k_cur,
+        struct ggml_tensor  * v_cur,
+        struct ggml_tensor  * kv_idxs,
+        int32_t               kv_stride,
+        int32_t               kv_stream0,
+        int32_t               grad_mask,
         float                 scale,
         float                 max_bias,
         float                 logit_softcap) {
@@ -5649,31 +5738,32 @@ struct ggml_tensor * ggml_flash_attn_ext_back(
     GGML_ASSERT(ggml_are_same_shape(out, d));
     GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16);
     GGML_ASSERT(!sinks || sinks->type == GGML_TYPE_F32);
+    // The window is all-or-nothing: dK and dV share the row mapping.
+    GGML_ASSERT((k_cur != NULL) == (v_cur != NULL));
+    GGML_ASSERT((k_cur != NULL) == (kv_idxs != NULL));
+    GGML_ASSERT(!kv_idxs || kv_idxs->type == GGML_TYPE_I32);
+    GGML_ASSERT(grad_mask != 0);
 
     // Store continuous F32 dQ, dK and dV, followed by two scalars per query
     // row (logsumexp and dot(dO, O)). The latter let the Vulkan backward stream
-    // over K/V without ever materializing the O(N^2) probability matrix.
-    const int64_t elem_q = ggml_nelements(q);
-    const int64_t elem_k = ggml_nelements(k);
-    const int64_t elem_v = ggml_nelements(v);
+    // over K/V without ever materializing the O(N^2) probability matrix. dK/dV
+    // cover the gradient window when there is one, so their size is driven by
+    // the rows written at this step rather than by the whole KV cache.
+    size_t offs_s = 0;
+    ggml_flash_attn_back_offsets_impl(q, k_cur ? k_cur : k, v_cur ? v_cur : v, grad_mask,
+            NULL, NULL, NULL, &offs_s);
+
+    const size_t  tsize  = ggml_type_size(GGML_TYPE_F32);
     const int64_t n_rows = q->ne[1] * q->ne[2] * q->ne[3];
+    const size_t  end    = offs_s + 2 * n_rows * tsize;
 
-    enum ggml_type result_type = GGML_TYPE_F32;
-    GGML_ASSERT(ggml_blck_size(result_type) == 1);
-    const size_t tsize = ggml_type_size(result_type);
-
-    const size_t offs_q = 0;
-    const size_t offs_k = offs_q + GGML_PAD(elem_q * tsize, GGML_MEM_ALIGN);
-    const size_t offs_v = offs_k + GGML_PAD(elem_k * tsize, GGML_MEM_ALIGN);
-    const size_t offs_s = offs_v + GGML_PAD(elem_v * tsize, GGML_MEM_ALIGN);
-    const size_t end    = offs_s + 2 * n_rows * tsize;
-
-    const size_t nelements = (end + tsize - 1)/tsize;
-
-    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nelements);
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) ((end + tsize - 1)/tsize));
 
     const float params[] = { scale, max_bias, logit_softcap };
     ggml_set_op_params(result, params, sizeof(params));
+    ggml_set_op_params_i32(result, 3, grad_mask);
+    ggml_set_op_params_i32(result, 4, kv_stride);
+    ggml_set_op_params_i32(result, 5, kv_stream0);
 
     result->op     = GGML_OP_FLASH_ATTN_BACK;
     result->src[0] = q;
@@ -5683,6 +5773,9 @@ struct ggml_tensor * ggml_flash_attn_ext_back(
     result->src[4] = out;
     result->src[5] = d;
     result->src[6] = sinks;
+    result->src[7] = k_cur;
+    result->src[8] = v_cur;
+    result->src[9] = kv_idxs;
 
     return result;
 }
@@ -7049,8 +7142,19 @@ static void ggml_compute_backward(
     const size_t isrc1 = src1 ? ggml_hash_find(hash_set, src1) : (size_t) -1;
     const size_t isrc2 = src2 ? ggml_hash_find(hash_set, src2) : (size_t) -1;
     const bool src0_needs_grads = src0 && isrc0 != GGML_HASHSET_FULL && ggml_bitset_get(hash_set->used, isrc0) && grads_needed[isrc0];
-    const bool src1_needs_grads = src1 && isrc1 != GGML_HASHSET_FULL && ggml_bitset_get(hash_set->used, isrc1) && grads_needed[isrc1];
-    const bool src2_needs_grads = src2 && isrc2 != GGML_HASHSET_FULL && ggml_bitset_get(hash_set->used, isrc2) && grads_needed[isrc2];
+    bool src1_needs_grads = src1 && isrc1 != GGML_HASHSET_FULL && ggml_bitset_get(hash_set->used, isrc1) && grads_needed[isrc1];
+    bool src2_needs_grads = src2 && isrc2 != GGML_HASHSET_FULL && ggml_bitset_get(hash_set->used, isrc2) && grads_needed[isrc2];
+
+    // retro delta: a windowed FLASH_ATTN_EXT (src[5] set) routes K/V gradients
+    // through k_cur/v_cur, not the full cache views src[1]/src[2], which
+    // ggml_backward_ignored_srcs marks ignored. src[1]/src[2] are still
+    // param-reachable (built from k_cur via set_rows), so grads_needed marks
+    // them -- but this op produces no gradient for them. Clear the flags so the
+    // per-op backward and the tail shape-check agree with the ignore.
+    if (tensor->op == GGML_OP_FLASH_ATTN_EXT && tensor->src[5]) {
+        src1_needs_grads = false;
+        src2_needs_grads = false;
+    }
 
     switch (tensor->op) {
         case GGML_OP_DUP: {
@@ -7400,7 +7504,31 @@ static void ggml_compute_backward(
             GGML_ASSERT((!src1 || !src1_needs_grads) && "backward pass for softmax mask not implemented");
         } break;
         case GGML_OP_FLASH_ATTN_EXT: {
-            if (src0_needs_grads || src1_needs_grads || src2_needs_grads) {
+            // retro delta: with a KV gradient window (src[5..7], see
+            // ggml_flash_attn_ext_set_grad_window) the differentiable K/V are
+            // the rows written at this step, not the full cache views in
+            // src[1]/src[2] -- which then need no gradient at all.
+            struct ggml_tensor * k_cur   = tensor->src[5];
+            struct ggml_tensor * v_cur   = tensor->src[6];
+            struct ggml_tensor * kv_idxs = tensor->src[7];
+
+            const size_t isrck = k_cur ? ggml_hash_find(hash_set, k_cur) : (size_t) -1;
+            const size_t isrcv = v_cur ? ggml_hash_find(hash_set, v_cur) : (size_t) -1;
+
+            struct ggml_tensor * gsrc_k = k_cur ? k_cur : src1;
+            struct ggml_tensor * gsrc_v = v_cur ? v_cur : src2;
+
+            // On the windowed path the gradient targets are k_cur/v_cur, not the
+            // full cache views (src1/src2), which ggml_backward_ignored_srcs
+            // marks ignored so no gradient is routed to them here.
+            const bool grads_k = k_cur
+                ? (isrck != GGML_HASHSET_FULL && ggml_bitset_get(hash_set->used, isrck) && grads_needed[isrck])
+                : src1_needs_grads;
+            const bool grads_v = v_cur
+                ? (isrcv != GGML_HASHSET_FULL && ggml_bitset_get(hash_set->used, isrcv) && grads_needed[isrcv])
+                : src2_needs_grads;
+
+            if (src0_needs_grads || grads_k || grads_v) {
                 float scale;
                 float max_bias;
                 float logit_softcap;
@@ -7408,24 +7536,36 @@ static void ggml_compute_backward(
                 memcpy(&max_bias,      (const float *) tensor->op_params + 1, sizeof(float));
                 memcpy(&logit_softcap, (const float *) tensor->op_params + 2, sizeof(float));
 
+                // Only materialize the segments that are actually consumed:
+                // dK/dV are dead weight for a frozen K/V projection.
+                const int32_t grad_mask =
+                    (src0_needs_grads ? GGML_FLASH_ATTN_BACK_GRAD_Q : 0) |
+                    (grads_k          ? GGML_FLASH_ATTN_BACK_GRAD_K : 0) |
+                    (grads_v          ? GGML_FLASH_ATTN_BACK_GRAD_V : 0);
+
                 struct ggml_tensor * db = ggml_flash_attn_ext_back(
                         ctx, src0, src1, src2, tensor->src[3], tensor, grad,
-                        tensor->src[4], scale, max_bias, logit_softcap);
+                        tensor->src[4], k_cur, v_cur, kv_idxs,
+                        ggml_get_op_params_i32(tensor, 5), // see ggml_flash_attn_ext_set_grad_window
+                        ggml_get_op_params_i32(tensor, 6),
+                        grad_mask, scale, max_bias, logit_softcap);
 
-                const size_t size_q = GGML_PAD(ggml_nelements(src0) * sizeof(float), GGML_MEM_ALIGN);
-                const size_t size_k = GGML_PAD(ggml_nelements(src1) * sizeof(float), GGML_MEM_ALIGN);
+                size_t off_q = 0;
+                size_t off_k = 0;
+                size_t off_v = 0;
+                ggml_flash_attn_back_offsets(db, &off_q, &off_k, &off_v, NULL);
 
                 if (src0_needs_grads) {
-                    struct ggml_tensor * gq = ggml_view_1d(ctx, db, ggml_nelements(src0), 0);
+                    struct ggml_tensor * gq = ggml_view_1d(ctx, db, ggml_nelements(src0), off_q);
                     ggml_add_or_set(ctx, cgraph, isrc0, ggml_reshape(ctx, gq, src0));
                 }
-                if (src1_needs_grads) {
-                    struct ggml_tensor * gk = ggml_view_1d(ctx, db, ggml_nelements(src1), size_q);
-                    ggml_add_or_set(ctx, cgraph, isrc1, ggml_reshape(ctx, gk, src1));
+                if (grads_k) {
+                    struct ggml_tensor * gk = ggml_view_1d(ctx, db, ggml_nelements(gsrc_k), off_k);
+                    ggml_add_or_set(ctx, cgraph, k_cur ? isrck : isrc1, ggml_reshape(ctx, gk, gsrc_k));
                 }
-                if (src2_needs_grads) {
-                    struct ggml_tensor * gv = ggml_view_1d(ctx, db, ggml_nelements(src2), size_q + size_k);
-                    ggml_add_or_set(ctx, cgraph, isrc2, ggml_reshape(ctx, gv, src2));
+                if (grads_v) {
+                    struct ggml_tensor * gv = ggml_view_1d(ctx, db, ggml_nelements(gsrc_v), off_v);
+                    ggml_add_or_set(ctx, cgraph, k_cur ? isrcv : isrc2, ggml_reshape(ctx, gv, gsrc_v));
                 }
             }
         } break;
@@ -8020,6 +8160,13 @@ void ggml_build_backward_expand(
         if (node->op == GGML_OP_FLASH_ATTN_EXT) {
             ignore_src[3] = true; // attention mask is constant
             ignore_src[4] = true; // attention sinks are not trained here
+            ignore_src[7] = true; // KV gradient window: row indices not differentiable
+            if (node->src[5]) {
+                // KV gradient window: the full cache views are read-only, the
+                // gradient flows through k_cur/v_cur (src[5]/src[6]) instead.
+                ignore_src[1] = true;
+                ignore_src[2] = true;
+            }
         }
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
             if (!node->src[j] || ignore_src[j] || !grads_needed[ggml_hash_find(&cgraph->visited_hash_set, node->src[j])]) {
@@ -8230,6 +8377,11 @@ static void ggml_backward_ignored_srcs(const struct ggml_tensor * node, bool ign
         case GGML_OP_FLASH_ATTN_EXT:
             ignore_src[3] = true;
             ignore_src[4] = true;
+            ignore_src[7] = true;
+            if (node->src[5]) {
+                ignore_src[1] = true;
+                ignore_src[2] = true;
+            }
             break;
         default:
             break;

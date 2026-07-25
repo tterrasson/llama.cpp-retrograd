@@ -3643,14 +3643,9 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     GGML_ASSERT(model->hparams.n_ctx_train % n_batch  == 0);
     GGML_ASSERT(n_batch                    % n_ubatch == 0);
 
-    if (cparams.flash_attn) {
-        LLAMA_LOG_INFO("%s: disabling flash attention, FLASH_ATTN_EXT has no backward pass\n", __func__);
-        cparams.flash_attn = false;
-
-        // the graph changes without flash attention, need to reserve again
-        sched_need_reserve = true;
-        sched_reserve();
-    }
+    // retro delta: upstream turns flash attention off here because FLASH_ATTN_EXT
+    // had no backward pass. This fork gives it one (flash_attn_backward), and the
+    // differentiable KV cache goes through it, so the setting is kept as requested.
 
     // retro delta (plan 03): the fused sparse cross-entropy supplies its own
     // scalar loss node, so the optimizer uses GGML_OPT_LOSS_TYPE_EXTERNAL and

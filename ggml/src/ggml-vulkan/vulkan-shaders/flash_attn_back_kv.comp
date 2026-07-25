@@ -6,6 +6,23 @@
 
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
+// retro delta: see flash_attn_back_q.comp — same per-bucket head-dim split, and
+// the two shaders must always be dispatched from the same bucket.
+#ifndef FA_BACK_SLOTS
+#define FA_BACK_SLOTS 4
+#endif
+
+// retro delta: KV cache element type. Both F16 and F32 are built, and F32 is not
+// optional: `cap_flash_attn_back` is probed with an F32 cache
+// (retro_backend.cpp) and clearing that gate is the precondition for the F16
+// probe -- and therefore for `kv_dtype = "f16"` -- ever running. Mirrors the CUDA
+// and Metal ports.
+#ifdef KV_F32
+#define KV_TYPE float
+#else
+#define KV_TYPE float16_t
+#endif
+
 layout(push_constant) uniform parameter {
     uint N; uint KV; uint HSK; uint HSV;
     uint n_head; uint n_head_kv; uint n_batch;
@@ -14,18 +31,24 @@ layout(push_constant) uniform parameter {
     float scale; float max_bias; float logit_softcap;
     uint mask_ne1; uint mask_ne2; uint mask_ne3;
     uint flags;
+    uint KV_GRAD; uint kv_stride; uint kv_stream0;
 } p;
 
-layout(binding = 0) readonly buffer Q     { float     q[]; };
-layout(binding = 1) readonly buffer K     { float16_t k[]; };
-layout(binding = 2) readonly buffer V     { float16_t v[]; };
-layout(binding = 3) readonly buffer Mask  { float16_t mask[]; };
-layout(binding = 4) readonly buffer Out   { float     out_data[]; };
-layout(binding = 5) readonly buffer DOut  { float     dout[]; };
-layout(binding = 6) readonly buffer Sinks { float     sinks[]; };
-layout(binding = 7) buffer Grad           { float     grad[]; };
+layout(binding = 0) readonly buffer Q      { float     q[]; };
+layout(binding = 1) readonly buffer K      { KV_TYPE   k[]; };
+layout(binding = 2) readonly buffer V      { KV_TYPE   v[]; };
+layout(binding = 3) readonly buffer Mask   { float16_t mask[]; };
+layout(binding = 4) readonly buffer Out    { float     out_data[]; };
+layout(binding = 5) readonly buffer DOut   { float     dout[]; };
+layout(binding = 6) readonly buffer Sinks  { float     sinks[]; };
+layout(binding = 7) buffer Grad            { float     grad[]; };
+layout(binding = 8) readonly buffer KvIdxs { int       kv_idxs[]; };
 
-const uint FLAG_MASK = 1u;
+// Bits 2..4 carry ggml_flash_attn_back_grad shifted left by 2.
+const uint FLAG_MASK   = 1u;
+const uint FLAG_GRAD_K = 8u;
+const uint FLAG_GRAD_V = 16u;
+const uint FLAG_WINDOW = 32u;
 
 float alibi_slope(uint head) {
     if (p.max_bias <= 0.0f) {
@@ -66,21 +89,43 @@ float score_derivative(float dot) {
 
 void main() {
     const uint lid     = gl_LocalInvocationID.x;
-    const uint key     = gl_WorkGroupID.x;
+    const uint win_row = gl_WorkGroupID.x;
     const uint kv_head = gl_WorkGroupID.y;
     const uint batch   = gl_WorkGroupID.z;
-    if (key >= p.KV || kv_head >= p.n_head_kv || batch >= p.n_batch) {
+    if (win_row >= p.KV_GRAD || kv_head >= p.n_head_kv || batch >= p.n_batch) {
         return;
     }
 
-    const uint ratio = p.n_head / p.n_head_kv;
-    const uint k_base = ((batch * p.n_head_kv + kv_head) * p.KV + key) * p.HSK;
-    const uint v_base = ((batch * p.n_head_kv + kv_head) * p.KV + key) * p.HSV;
-    const uint n_stats = p.N * p.n_head * p.n_batch;
-    float dk[4] = float[4](0.0f, 0.0f, 0.0f, 0.0f);
-    float dv[4] = float[4](0.0f, 0.0f, 0.0f, 0.0f);
+    // retro delta: one workgroup per *gradient window* row rather than per cache
+    // key. Keys outside the window were written by earlier steps and are
+    // constants; without a window KV_GRAD == KV and this is the dense case.
+    uint key = win_row;
+    bool in_cache = true;
+    if ((p.flags & FLAG_WINDOW) != 0u) {
+        int idx = kv_idxs[batch * p.KV_GRAD + win_row] -
+                  int(p.kv_stride * (p.kv_stream0 + batch));
+        in_cache = idx >= 0 && uint(idx) < p.KV;
+        key = in_cache ? uint(idx) : 0u;
+    }
 
-    for (uint rhead = 0u; rhead < ratio; ++rhead) {
+    const uint ratio = p.n_head / p.n_head_kv;
+    // Read the cache at `key`, write the gradient at `win_row`.
+    const uint k_base  = ((batch * p.n_head_kv + kv_head) * p.KV + key) * p.HSK;
+    const uint v_base  = ((batch * p.n_head_kv + kv_head) * p.KV + key) * p.HSV;
+    const uint dk_base = ((batch * p.n_head_kv + kv_head) * p.KV_GRAD + win_row) * p.HSK;
+    const uint dv_base = ((batch * p.n_head_kv + kv_head) * p.KV_GRAD + win_row) * p.HSV;
+    const uint n_stats = p.N * p.n_head * p.n_batch;
+    float dk[FA_BACK_SLOTS];
+    float dv[FA_BACK_SLOTS];
+    for (uint slot = 0u; slot < FA_BACK_SLOTS; ++slot) {
+        dk[slot] = 0.0f;
+        dv[slot] = 0.0f;
+    }
+
+    // A window row pointing outside the cache view carries no gradient, but its
+    // slot in the packed result still has to be defined: fall through with zero
+    // accumulators instead of returning early.
+    for (uint rhead = 0u; in_cache && rhead < ratio; ++rhead) {
         const uint head = kv_head * ratio + rhead;
         for (uint row = 0u; row < p.N; ++row) {
             const uint q_base = batch * p.q_nb3 + head * p.q_nb2 + row * p.q_nb1;
@@ -103,7 +148,7 @@ void main() {
             float delta = grad[p.off_stats + n_stats + stat_index];
             float probability = exp(score_from_dot(dot_qk, key, row, head, batch) - lse);
             float ds = probability * (dot_dv - delta) * score_derivative(dot_qk);
-            for (uint slot = 0u; slot < 4u; ++slot) {
+            for (uint slot = 0u; slot < FA_BACK_SLOTS; ++slot) {
                 uint id = lid + 32u * slot;
                 if (id < p.HSK) {
                     dk[slot] += ds * q[q_base + id];
@@ -115,13 +160,13 @@ void main() {
         }
     }
 
-    for (uint slot = 0u; slot < 4u; ++slot) {
+    for (uint slot = 0u; slot < FA_BACK_SLOTS; ++slot) {
         uint id = lid + 32u * slot;
-        if (id < p.HSK) {
-            grad[p.off_k + k_base + id] = dk[slot];
+        if ((p.flags & FLAG_GRAD_K) != 0u && id < p.HSK) {
+            grad[p.off_k + dk_base + id] = dk[slot];
         }
-        if (id < p.HSV) {
-            grad[p.off_v + v_base + id] = dv[slot];
+        if ((p.flags & FLAG_GRAD_V) != 0u && id < p.HSV) {
+            grad[p.off_v + dv_base + id] = dv[slot];
         }
     }
 }

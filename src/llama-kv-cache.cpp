@@ -2765,6 +2765,14 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
 }
 
+int32_t llama_kv_cache_context::get_kv_stride() const {
+    return (int32_t) kv->get_size();
+}
+
+int32_t llama_kv_cache_context::get_kv_stream0() const {
+    return (int32_t) sinfos[i_cur].s0;
+}
+
 ggml_type llama_kv_cache_context::type_k() const {
     return kv->type_k();
 }

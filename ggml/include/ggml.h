@@ -2543,9 +2543,58 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // retro delta: KV gradient window.
+    //
+    // When attention reads a KV cache, `k`/`v` above are views over the *whole*
+    // cache (n_kv rows) while only the n_cur rows written at this step can carry
+    // a gradient -- the rest come from earlier steps and are constants. Left
+    // alone, autodiff still has to produce a gradient shaped like the full view,
+    // so the packed backward tensor is sized by n_kv instead of n_cur (a factor
+    // n_kv/n_cur of pure waste, ~750 MiB on a 32k context).
+    //
+    // This declares the window explicitly: `k_cur`/`v_cur` are the differentiable
+    // rows (same layout as `k`/`v` but with n_cur rows in dim 1), and `kv_idxs`
+    // maps window row j of stream s to its row in the cache, exactly as the
+    // ggml_set_rows() that stored it did:
+    //
+    //     cache_row(j, s) = kv_idxs[s*n_cur + j] - kv_stride*(kv_stream0 + s)
+    //
+    // The forward pass is unchanged and still reads `k`/`v`. The backward pass
+    // produces dK/dV shaped like `k_cur`/`v_cur` and wires them onto those
+    // tensors, so `k`/`v` need no gradient at all.
+    GGML_API void ggml_flash_attn_ext_set_grad_window(
+            struct ggml_tensor * a,
+            struct ggml_tensor * k_cur,
+            struct ggml_tensor * v_cur,
+            struct ggml_tensor * kv_idxs,
+            int32_t              kv_stride,
+            int32_t              kv_stream0);
+
+    // retro delta: largest attention head dimension any backend may advertise
+    // support for on GGML_OP_FLASH_ATTN_BACK. Each backend keeps its own cap
+    // (FA_BACK_MAX_D, VK_FA_BACK_MAX_D, GGML_METAL_FA_BACK_MAX_D) and
+    // static_asserts it against this one, and the backend-agnostic capability
+    // probe harness validates requested shapes against it: a backend may cover
+    // less than this, never more than the harness can exercise. Raising it is
+    // therefore the *first* step of widening a backend, not an afterthought.
+#define GGML_FLASH_ATTN_BACK_MAX_HEAD_DIM 512
+
+    // Which segments of the packed backward tensor are materialized.
+    enum ggml_flash_attn_back_grad {
+        GGML_FLASH_ATTN_BACK_GRAD_Q = 1 << 0,
+        GGML_FLASH_ATTN_BACK_GRAD_K = 1 << 1,
+        GGML_FLASH_ATTN_BACK_GRAD_V = 1 << 2,
+    };
+
     // Backward pass for ggml_flash_attn_ext(). The result is an internal packed
     // F32 tensor containing dQ, dK, dV and O(rows) streaming statistics. Use
     // the gradient graph rather than consuming this operator directly.
+    //
+    // `k_cur`/`v_cur`/`kv_idxs` are the gradient window (see
+    // ggml_flash_attn_ext_set_grad_window); pass NULL for the dense case, where
+    // dK/dV cover all of `k`/`v`. `grad_mask` is a bitset of
+    // ggml_flash_attn_back_grad: segments that are not requested are not
+    // allocated and not computed.
     GGML_API struct ggml_tensor * ggml_flash_attn_ext_back(
            struct ggml_context * ctx,
            struct ggml_tensor  * q,
@@ -2555,9 +2604,30 @@ extern "C" {
            struct ggml_tensor  * out,
            struct ggml_tensor  * d,
            struct ggml_tensor  * sinks,
+           struct ggml_tensor  * k_cur,
+           struct ggml_tensor  * v_cur,
+           struct ggml_tensor  * kv_idxs,
+           int32_t               kv_stride,
+           int32_t               kv_stream0,
+           int32_t               grad_mask,
            float                 scale,
            float                 max_bias,
            float                 logit_softcap);
+
+    // Byte offsets of the dQ / dK / dV / statistics segments inside the packed
+    // GGML_OP_FLASH_ATTN_BACK result. Every backend must derive its offsets from
+    // this, so the layout lives in exactly one place.
+    GGML_API void ggml_flash_attn_back_offsets(
+            const struct ggml_tensor * dst,
+            size_t * off_q,
+            size_t * off_k,
+            size_t * off_v,
+            size_t * off_s);
+
+    // Shapes of the dK / dV segments: the gradient window when one is declared,
+    // the full k / v otherwise.
+    GGML_API const struct ggml_tensor * ggml_flash_attn_back_grad_k(const struct ggml_tensor * dst);
+    GGML_API const struct ggml_tensor * ggml_flash_attn_back_grad_v(const struct ggml_tensor * dst);
 
     GGML_API struct ggml_tensor * ggml_ssm_conv(
             struct ggml_context * ctx,
