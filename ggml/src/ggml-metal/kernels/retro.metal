@@ -1,5 +1,41 @@
 #include "common.h"
 #include "dequantize.h" // retro delta: quantized training kernels
+// retro delta: repeat backward. dst is the smaller tensor; every element sums
+// the src0 elements that ggml_repeat would have copied onto it, i.e. src0 is
+// walked with a stride of the dst extent along each broadcast axis.
+// Emitted by the autodiff of ADD/MUL/REPEAT when one input is broadcast.
+//
+// The nesting order is the CPU op's (outermost axis first, ascending), so the
+// F32 reassociation matches the reference instead of merely being close to it.
+kernel void kernel_repeat_back_f32(
+        constant ggml_metal_kargs_repeat & args,
+        device const char * src0,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int i3 = tgpig.z;
+    const int i2 = tgpig.y;
+    const int i1 = tgpig.x;
+
+    device char * dst_ptr = dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1;
+
+    for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
+        float acc = 0.0f;
+        for (int k3 = i3; k3 < args.ne03; k3 += args.ne3) {
+            for (int k2 = i2; k2 < args.ne02; k2 += args.ne2) {
+                for (int k1 = i1; k1 < args.ne01; k1 += args.ne1) {
+                    for (int k0 = i0; k0 < args.ne00; k0 += args.ne0) {
+                        acc += *((device const float *)(src0 + k3*args.nb03 + k2*args.nb02 + k1*args.nb01 + k0*args.nb00));
+                    }
+                }
+            }
+        }
+        *((device float *)(dst_ptr + i0*args.nb0)) = acc;
+    }
+}
+
+
 // retro delta: streaming Flash Attention backward, ported line for line from the
 // Vulkan shaders (flash_attn_back_{q,kv}.comp) and mirroring the CUDA kernels
 // (flash-attn-back.cu). This is what makes an F16 KV cache differentiable
@@ -5346,223 +5382,220 @@ kernel void kernel_ssm_scan_back_grad_f32(
 
 // retro delta: out-prod (weight-gradient GEMM) for LoRA training.
 // dst[i0,i1,i2,i3] = Σ_k src0[i0,k,i02,i03] * src1[i1,k,i2,i3]
-// with GQA broadcast i02 = i2/dps2, i03 = i3/dps3. Correctness-first: one thread
-// per dst element, sequential reduction over the contraction dim.
-kernel void kernel_out_prod_f32(
-        constant ggml_metal_kargs_out_prod & args,
-        device const float * src0,
-        device const float * src1,
-        device       float * dst,
-        uint3 tgpig[[threadgroup_position_in_grid]],
-        uint3 tid[[thread_position_in_threadgroup]]) {
-    constexpr int TILE = 8;
-    threadgroup float tile0[TILE];
-    threadgroup float tile1[TILE];
-    const int64_t i0 = (int64_t) tgpig.x*TILE + tid.x;
-    const int64_t i1 = (int64_t) tgpig.y*TILE + tid.y;
-    const int64_t i2 = (int64_t) tgpig.z % args.ne2;
-    const int64_t i3 = (int64_t) tgpig.z / args.ne2;
-    const bool valid = i0 < args.ne0 && i1 < args.ne1 && i3 < args.ne3;
+// with GQA broadcast i02 = i2/dps2, i03 = i3/dps3.
+//
+// Tiled GEMM over the contraction axis ne01, ported from the Vulkan P2 shader
+// (docs/optims/VRAM_2.md 3.2, docs/backends/UNIFY.md 6.1). The previous
+// shape was one dst element per thread with the reduction advanced one k at a
+// time, which paid two threadgroup barriers per k, loaded 16 of 64 threads'
+// worth of operands per step, and yielded a single fused multiply-add per pair
+// of threadgroup reads. Its threadgroup was also 64 threads -- two SIMD groups,
+// under the occupancy Apple silicon needs.
+//
+// The tiling fixes all of it: one barrier pair per BK-slice instead of per k
+// (BK times fewer), every one of the 256 threads participating in both
+// cooperative loads, and OUT_PROD_TM dst rows per thread so each src1 value
+// read from threadgroup memory feeds TM FMAs rather than one.
+//
+// BM is 64 while BN stays 16 on purpose: dst is ne00 x n_tokens, tall and thin
+// in the training regime (ne1 is the token count, and n_ubatch is small), so a
+// square tile would spend most of itself on columns that do not exist.
+//
+// The accumulation order is deliberately unchanged -- k ascends within a slice
+// and the slices ascend -- so every dst element sums the same terms in the same
+// sequence, with the same operations, as the scalar kernel did: bit-exact
+// against it by construction. The probes in tests/metal_ops.rs consequently pass
+// at their original tolerances against the CPU oracle; widening one would mean
+// the arithmetic had changed.
+#define OUT_PROD_BM  64
+#define OUT_PROD_BN  16
+#define OUT_PROD_BK  16
+#define OUT_PROD_TM   4
+#define OUT_PROD_NTH 256
 
-    const int64_t i02 = i2 / args.dps2;
-    const int64_t i03 = i3 / args.dps3;
-
-    const int64_t off0 = i0 + i02*args.s02 + i03*args.s03;
-    const int64_t off1 = i1*args.s10 + i2*args.s12 + i3*args.s13;
-
-    float acc = 0.0f;
-    for (int64_t k = 0; k < args.ne01; ++k) {
-        if (tid.y == 0) {
-            tile0[tid.x] = i0 < args.ne0 ? src0[off0 + k*args.s01] : 0.0f;
+// The only part that differs per src0 type: filling one BK x BM slice of src0
+// into threadgroup memory, laid out [kk][mm]. F32 reads a float, the legacy
+// quants decode one element at a time, the K-quants decode 16 at a time and so
+// run one thread per 16-value chunk. Out-of-range lanes store zero rather than
+// skipping, so the inner product below needs no per-element predicate.
+//
+// `s01/s02/s03` are element strides for the F32 variant and byte strides for
+// the quantized ones (see ggml_metal_kargs_out_prod); each loader owns that
+// convention, which is why the base pointer is computed here and not by the
+// caller.
+struct out_prod_tile_f32 {
+    static void load(
+            threadgroup float * tile0,
+            device const char * src0,
+            constant ggml_metal_kargs_out_prod & args,
+            int64_t i02, int64_t i03, int64_t m0, int64_t k0, ushort tiitg) {
+        device const float * base0 = (device const float *) src0 + i02*args.s02 + i03*args.s03;
+        for (ushort l = tiitg; l < OUT_PROD_BK*OUT_PROD_BM; l += OUT_PROD_NTH) {
+            const int64_t m = m0 + (l % OUT_PROD_BM);
+            const int64_t k = k0 + (l / OUT_PROD_BM);
+            tile0[l] = (m < args.ne0 && k < args.ne01) ? base0[m + k*args.s01] : 0.0f;
         }
-        if (tid.x == 0) {
-            tile1[tid.y] = i1 < args.ne1 ? src1[off1 + k*args.s11] : 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (valid) {
-            acc += tile0[tid.x] * tile1[tid.y];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+};
 
-    if (valid) {
-        dst[i0 + i1*args.s1 + i2*args.s2 + i3*args.s3] = acc;
-    }
-}
-
-// retro delta: out-prod with a Q8_0-quantized src0 (the activation-gradient
-// dx = out_prod(W, dy) case, where W is a quantized model weight). Same flat
-// dispatch as kernel_out_prod_f32, but src0 strides s01/s02/s03 are in BYTES
-// and each element is dequantized in place: within row k, element i0 lives in
-// block i0/QK8_0 at lane i0%QK8_0, value d * qs.
-kernel void kernel_out_prod_q8_0(
-        constant ggml_metal_kargs_out_prod & args,
-        device const char  * src0,
-        device const float * src1,
-        device       float * dst,
-        uint3 tgpig[[threadgroup_position_in_grid]],
-        uint3 tid[[thread_position_in_threadgroup]]) {
-    constexpr int TILE = 8;
-    threadgroup float tile0[TILE];
-    threadgroup float tile1[TILE];
-    const int64_t i0 = (int64_t) tgpig.x*TILE + tid.x;
-    const int64_t i1 = (int64_t) tgpig.y*TILE + tid.y;
-    const int64_t i2 = (int64_t) tgpig.z % args.ne2;
-    const int64_t i3 = (int64_t) tgpig.z / args.ne2;
-    const bool valid = i0 < args.ne0 && i1 < args.ne1 && i3 < args.ne3;
-
-    const int64_t i02 = i2 / args.dps2;
-    const int64_t i03 = i3 / args.dps3;
-
-    const int64_t ib = i0 / QK8_0; // block index within a src0 row
-    const short   iq = i0 % QK8_0; // lane within the block
-
-    device const char * base0 = src0 + i02*args.s02 + i03*args.s03;
-    const int64_t off1 = i1*args.s10 + i2*args.s12 + i3*args.s13;
-
-    float acc = 0.0f;
-    for (int64_t k = 0; k < args.ne01; ++k) {
-        if (tid.y == 0) {
-            if (i0 < args.ne0) {
-                device const block_q8_0 * blk = (device const block_q8_0 *)(base0 + k*args.s01) + ib;
-                tile0[tid.x] = (float) blk->d * blk->qs[iq];
-            } else {
-                tile0[tid.x] = 0.0f;
+// Q8_0: 32 signed 8-bit values per block, one shared scale.
+struct out_prod_tile_q8_0 {
+    static void load(
+            threadgroup float * tile0,
+            device const char * src0,
+            constant ggml_metal_kargs_out_prod & args,
+            int64_t i02, int64_t i03, int64_t m0, int64_t k0, ushort tiitg) {
+        device const char * base0 = src0 + i02*args.s02 + i03*args.s03;
+        for (ushort l = tiitg; l < OUT_PROD_BK*OUT_PROD_BM; l += OUT_PROD_NTH) {
+            const int64_t m = m0 + (l % OUT_PROD_BM);
+            const int64_t k = k0 + (l / OUT_PROD_BM);
+            float v = 0.0f;
+            if (m < args.ne0 && k < args.ne01) {
+                device const block_q8_0 * blk =
+                    (device const block_q8_0 *)(base0 + k*args.s01) + m/QK8_0;
+                v = (float) blk->d * blk->qs[m % QK8_0];
             }
+            tile0[l] = v;
         }
-        if (tid.x == 0) {
-            tile1[tid.y] = i1 < args.ne1 ? src1[off1 + k*args.s11] : 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (valid) {
-            acc += tile0[tid.x] * tile1[tid.y];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+};
 
-    if (valid) {
-        dst[i0 + i1*args.s1 + i2*args.s2 + i3*args.s3] = acc;
-    }
-}
-
-// Same activation-gradient path for legacy Q5_0 model weights. Q5_0 stores
-// 32 signed five-bit values per block: low nibbles in qs and the fifth bits in
-// qh, with a -16 zero point.
-kernel void kernel_out_prod_q5_0(
-        constant ggml_metal_kargs_out_prod & args,
-        device const char  * src0,
-        device const float * src1,
-        device       float * dst,
-        uint3 tgpig[[threadgroup_position_in_grid]],
-        uint3 tid[[thread_position_in_threadgroup]]) {
-    constexpr int TILE = 8;
-    threadgroup float tile0[TILE];
-    threadgroup float tile1[TILE];
-    const int64_t i0 = (int64_t) tgpig.x*TILE + tid.x;
-    const int64_t i1 = (int64_t) tgpig.y*TILE + tid.y;
-    const int64_t i2 = (int64_t) tgpig.z % args.ne2;
-    const int64_t i3 = (int64_t) tgpig.z / args.ne2;
-    const bool valid = i0 < args.ne0 && i1 < args.ne1 && i3 < args.ne3;
-
-    const int64_t i02 = i2 / args.dps2;
-    const int64_t i03 = i3 / args.dps3;
-    const int64_t ib  = i0 / QK5_0;
-    const short   iq  = i0 % QK5_0;
-    const short   il  = iq & 15;
-
-    device const char * base0 = src0 + i02*args.s02 + i03*args.s03;
-    const int64_t off1 = i1*args.s10 + i2*args.s12 + i3*args.s13;
-
-    float acc = 0.0f;
-    for (int64_t k = 0; k < args.ne01; ++k) {
-        if (tid.y == 0) {
-            if (i0 < args.ne0) {
-                device const block_q5_0 * blk = (device const block_q5_0 *) (base0 + k*args.s01) + ib;
-                const uint qh = *((device const uint *) blk->qh);
-                const int low = iq < 16 ? (blk->qs[il] & 0x0f) : (blk->qs[il] >> 4);
-                const int q = low | (int) (((qh >> iq) & 1u) << 4);
-                tile0[tid.x] = (float) blk->d * (float) (q - 16);
-            } else {
-                tile0[tid.x] = 0.0f;
+// Q5_0: 32 five-bit values per block -- low nibbles in qs, fifth bits in qh,
+// zero point -16.
+struct out_prod_tile_q5_0 {
+    static void load(
+            threadgroup float * tile0,
+            device const char * src0,
+            constant ggml_metal_kargs_out_prod & args,
+            int64_t i02, int64_t i03, int64_t m0, int64_t k0, ushort tiitg) {
+        device const char * base0 = src0 + i02*args.s02 + i03*args.s03;
+        for (ushort l = tiitg; l < OUT_PROD_BK*OUT_PROD_BM; l += OUT_PROD_NTH) {
+            const int64_t m = m0 + (l % OUT_PROD_BM);
+            const int64_t k = k0 + (l / OUT_PROD_BM);
+            float v = 0.0f;
+            if (m < args.ne0 && k < args.ne01) {
+                device const block_q5_0 * blk =
+                    (device const block_q5_0 *)(base0 + k*args.s01) + m/QK5_0;
+                const short iq  = m % QK5_0;
+                const short il  = iq & 15;
+                const uint  qh  = *((device const uint *) blk->qh);
+                const int   low = iq < 16 ? (blk->qs[il] & 0x0f) : (blk->qs[il] >> 4);
+                const int   q   = low | (int) (((qh >> iq) & 1u) << 4);
+                v = (float) blk->d * (float) (q - 16);
             }
+            tile0[l] = v;
         }
-        if (tid.x == 0) {
-            tile1[tid.y] = i1 < args.ne1 ? src1[off1 + k*args.s11] : 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (valid) {
-            acc += tile0[tid.x] * tile1[tid.y];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+};
 
-    if (valid) {
-        dst[i0 + i1*args.s1 + i2*args.s2 + i3*args.s3] = acc;
-    }
-}
-
+// K-quants: the block decoders hand back 16 adjacent values at once, so one
+// thread owns one 16-value chunk of the tile row rather than one element. BM is
+// a multiple of 16 and the host asserts ne0 is too, so a chunk never straddles
+// the end of the tensor and never crosses a QK_K block.
 template<typename block_q, void (*dequantize_func)(device const block_q *, short, thread float4x4 &)>
-kernel void kernel_out_prod_k(
+struct out_prod_tile_k {
+    static void load(
+            threadgroup float * tile0,
+            device const char * src0,
+            constant ggml_metal_kargs_out_prod & args,
+            int64_t i02, int64_t i03, int64_t m0, int64_t k0, ushort tiitg) {
+        constexpr ushort n_chunks = OUT_PROD_BM / 16;
+        device const char * base0 = src0 + i02*args.s02 + i03*args.s03;
+        for (ushort l = tiitg; l < OUT_PROD_BK*n_chunks; l += OUT_PROD_NTH) {
+            const ushort kk = l / n_chunks;
+            const ushort cc = l % n_chunks;
+            const int64_t m = m0 + cc*16;
+            const int64_t k = k0 + kk;
+            float4x4 values(0.0f);
+            if (m < args.ne0 && k < args.ne01) {
+                dequantize_func(
+                        (device const block_q *)(base0 + k*args.s01) + m/QK_K,
+                        (short) ((m % QK_K) / 16), values);
+            }
+            threadgroup float * out = tile0 + kk*OUT_PROD_BM + cc*16;
+            for (ushort j = 0; j < 16; ++j) {
+                out[j] = values[j/4][j%4];
+            }
+        }
+    }
+};
+
+template<typename loader>
+kernel void kernel_out_prod_impl(
         constant ggml_metal_kargs_out_prod & args,
         device const char  * src0,
         device const float * src1,
         device       float * dst,
-        uint3 tgpig[[threadgroup_position_in_grid]],
-        uint3 tid[[thread_position_in_threadgroup]]) {
-    constexpr int TILE = 8;
-    threadgroup float4x4 tile0[TILE];
-    threadgroup float tile1[TILE];
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]]) {
+    threadgroup float tile0[OUT_PROD_BK*OUT_PROD_BM];
+    threadgroup float tile1[OUT_PROD_BK*OUT_PROD_BN];
 
-    const int64_t ic = ((int64_t) tgpig.x*TILE + tid.x);
-    const int64_t i1 =  (int64_t) tgpig.y*TILE + tid.y;
-    const int64_t i2 =  (int64_t) tgpig.z % args.ne2;
-    const int64_t i3 =  (int64_t) tgpig.z / args.ne2;
-    const int64_t i0 = ic * 16;
-    const bool valid0 = i0 < args.ne0;
-    const bool valid = valid0 && i1 < args.ne1 && i3 < args.ne3;
+    // tn varies fastest, so neighbouring threads read consecutive tile1 entries
+    // and their TM tile0 reads collapse onto few distinct addresses.
+    const ushort tn = tiitg % OUT_PROD_BN;
+    const ushort tm = tiitg / OUT_PROD_BN;
+
+    const int64_t m0 = (int64_t) tgpig.x * OUT_PROD_BM;
+    const int64_t n0 = (int64_t) tgpig.y * OUT_PROD_BN;
+    const int64_t i2 = (int64_t) tgpig.z % args.ne2;
+    const int64_t i3 = (int64_t) tgpig.z / args.ne2;
+    // Uniform across the threadgroup, so this early return cannot strand a
+    // thread at the barriers below -- unlike a per-element bounds test.
+    if (i3 >= args.ne3) {
+        return;
+    }
 
     const int64_t i02 = i2 / args.dps2;
     const int64_t i03 = i3 / args.dps3;
-    const int64_t ib  = i0 / QK_K;
-    const short   il  = (i0 % QK_K) / 16;
+    const int64_t off1 = i2*args.s12 + i3*args.s13;
 
-    device const char * base0 = src0 + i02*args.s02 + i03*args.s03;
-    const int64_t off1 = i1*args.s10 + i2*args.s12 + i3*args.s13;
+    float acc[OUT_PROD_TM];
+    for (ushort r = 0; r < OUT_PROD_TM; ++r) {
+        acc[r] = 0.0f;
+    }
 
-    float4x4 acc(0.0f);
-    for (int64_t k = 0; k < args.ne01; ++k) {
-        // One row of the group cooperatively dequantizes eight adjacent
-        // 16-value chunks. The other seven rows reuse those values for their
-        // independent dst rows instead of repeating the same block decode.
-        if (tid.y == 0) {
-            float4x4 values(0.0f);
-            if (valid0) {
-                dequantize_func((device const block_q *)(base0 + k*args.s01) + ib, il, values);
-            }
-            tile0[tid.x] = values;
-        }
-        if (tid.x == 0) {
-            tile1[tid.y] = i1 < args.ne1 ? src1[off1 + k*args.s11] : 0.0f;
+    for (int64_t k0 = 0; k0 < args.ne01; k0 += OUT_PROD_BK) {
+        loader::load(tile0, src0, args, i02, i03, m0, k0, tiitg);
+        for (ushort l = tiitg; l < OUT_PROD_BK*OUT_PROD_BN; l += OUT_PROD_NTH) {
+            const int64_t n = n0 + (l % OUT_PROD_BN);
+            const int64_t k = k0 + (l / OUT_PROD_BN);
+            tile1[l] = (n < args.ne1 && k < args.ne01)
+                    ? src1[off1 + n*args.s10 + k*args.s11] : 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (valid) {
-            acc += tile0[tid.x] * tile1[tid.y];
+        for (ushort kk = 0; kk < OUT_PROD_BK; ++kk) {
+            const float bv = tile1[kk*OUT_PROD_BN + tn];
+            for (ushort r = 0; r < OUT_PROD_TM; ++r) {
+                acc[r] += tile0[kk*OUT_PROD_BM + tm*OUT_PROD_TM + r] * bv;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    if (valid) {
-        *((device float4x4 *)(dst + i0 + i1*args.s1 + i2*args.s2 + i3*args.s3)) = acc;
+    const int64_t n = n0 + tn;
+    if (n >= args.ne1) {
+        return;
+    }
+    for (ushort r = 0; r < OUT_PROD_TM; ++r) {
+        const int64_t m = m0 + tm*OUT_PROD_TM + r;
+        if (m < args.ne0) {
+            dst[m + n*args.s1 + i2*args.s2 + i3*args.s3] = acc[r];
+        }
     }
 }
 
-typedef decltype(kernel_out_prod_k<block_q2_K, dequantize_q2_K>) out_prod_k_t;
+typedef decltype(kernel_out_prod_impl<out_prod_tile_f32>) out_prod_t;
 
-template [[host_name("kernel_out_prod_q2_K")]] kernel out_prod_k_t kernel_out_prod_k<block_q2_K, dequantize_q2_K>;
-template [[host_name("kernel_out_prod_q3_K")]] kernel out_prod_k_t kernel_out_prod_k<block_q3_K, dequantize_q3_K>;
-template [[host_name("kernel_out_prod_q4_K")]] kernel out_prod_k_t kernel_out_prod_k<block_q4_K, dequantize_q4_K>;
-template [[host_name("kernel_out_prod_q5_K")]] kernel out_prod_k_t kernel_out_prod_k<block_q5_K, dequantize_q5_K>;
-template [[host_name("kernel_out_prod_q6_K")]] kernel out_prod_k_t kernel_out_prod_k<block_q6_K, dequantize_q6_K>;
+template [[host_name("kernel_out_prod_f32")]]  kernel out_prod_t kernel_out_prod_impl<out_prod_tile_f32>;
+template [[host_name("kernel_out_prod_q8_0")]] kernel out_prod_t kernel_out_prod_impl<out_prod_tile_q8_0>;
+template [[host_name("kernel_out_prod_q5_0")]] kernel out_prod_t kernel_out_prod_impl<out_prod_tile_q5_0>;
+
+template [[host_name("kernel_out_prod_q2_K")]] kernel out_prod_t kernel_out_prod_impl<out_prod_tile_k<block_q2_K, dequantize_q2_K>>;
+template [[host_name("kernel_out_prod_q3_K")]] kernel out_prod_t kernel_out_prod_impl<out_prod_tile_k<block_q3_K, dequantize_q3_K>>;
+template [[host_name("kernel_out_prod_q4_K")]] kernel out_prod_t kernel_out_prod_impl<out_prod_tile_k<block_q4_K, dequantize_q4_K>>;
+template [[host_name("kernel_out_prod_q5_K")]] kernel out_prod_t kernel_out_prod_impl<out_prod_tile_k<block_q5_K, dequantize_q5_K>>;
+template [[host_name("kernel_out_prod_q6_K")]] kernel out_prod_t kernel_out_prod_impl<out_prod_tile_k<block_q6_K, dequantize_q6_K>>;
 
 // retro delta: threadgroup-wide sum/max over per-simdgroup partials. Safe for any
 // threadgroup size (including a partial trailing simdgroup): only simdgroup 0
@@ -5757,6 +5790,285 @@ kernel void kernel_cross_entropy_loss_back_f32(
         d[i00] = active ? (label_mass * sm - s1[i00]) * d_by_nr : 0.0f;
     }
 }
+
+// retro delta: fused sparse cross-entropy over a (possibly quantized)
+// projection head, forward and backward. Ported from the Vulkan shaders
+// (fused_sparse_ce{,_back}.comp), which is the right lineage for Metal: the
+// head is read *in the kernel* through the per-type dequantizers, so no F32
+// scratch copy of it is ever allocated -- unlike the CUDA path, which
+// dequantizes into a tiled buffer. See docs/backends/UNIFY.md 6.3 and the CPU
+// oracle ggml_compute_forward_fused_sparse_ce_f32.
+//
+// One threadgroup per token. The [n_vocab, n_tokens] logits are never
+// materialized: each logit z[v,t] = dot(w[:,v], h[:,t]) (+ bias[v]) is
+// recomputed on the fly, and the log-sum-exp is accumulated online in F32.
+//
+// `nl` is the number of 16-element chunks per block of the head's type -- the
+// same convention as kernel_mul_mm, so `dequantize_func(blk, il, reg)` hands
+// back the 16 consecutive logical elements starting at 16*chunk.
+//
+// n_active (the divisor both the loss and the gradient use) is counted inside
+// the threadgroup rather than by a separate dispatch into a scratch buffer as
+// on Vulkan: it is O(n_tokens) next to O(n_vocab * n_embd) of real work, and it
+// keeps this op free of any allocation the graph allocator does not already
+// own -- the property that makes Metal's memory accounting exact (UNIFY.md 4).
+
+#define FSCE_NTH 256
+// Chunks of 16 embedding elements one thread may own in the backward's
+// accumulator. FSCE_NTH*16*FSCE_MAXC = 16384 is the n_embd ceiling that
+// supports_op enforces.
+#define FSCE_MAXC 4
+
+// z[v,t] = dot(w[:,v], h[:,t]), F32 throughout so a low-precision head never
+// biases the gradient.
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread float4x4 &)>
+static float fsce_w_dot_h(
+        device const char  * w,
+        device const float * h_col,
+        uint64_t nb_w,
+        int      v,
+        int      n_chunks) {
+    device const char * w_row = w + (size_t) v*nb_w;
+    float z = 0.0f;
+    for (int c = 0; c < n_chunks; ++c) {
+        float4x4 reg;
+        dequantize_func((device const block_q *) w_row + c/nl, (short) (c%nl), reg);
+        device const float4 * hc = (device const float4 *)(h_col + c*16);
+        z += dot(reg[0], hc[0]) + dot(reg[1], hc[1]) + dot(reg[2], hc[2]) + dot(reg[3], hc[3]);
+    }
+    return z;
+}
+
+// Active tokens: a real target with a non-zero coefficient. Same predicate as
+// the CPU reference, evaluated on device because the targets only exist there.
+static int fsce_count_active(
+        device const int   * targets,
+        device const float * weights,
+        int n_tokens,
+        int n_vocab,
+        threadgroup float * sh,
+        ushort tpitg, ushort sgitg, ushort tiisg, ushort ntg) {
+    float local = 0.0f;
+    for (int i = tpitg; i < n_tokens; i += ntg) {
+        const int tgt = targets[i];
+        if (tgt >= 0 && tgt < n_vocab && weights[i] != 0.0f) {
+            local += 1.0f;
+        }
+    }
+    return (int) retro_tg_sum(local, sh, sgitg, tiisg, ntg);
+}
+
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread float4x4 &)>
+kernel void kernel_fused_sparse_ce(
+        constant ggml_metal_kargs_fused_sparse_ce & args,
+        device const char   * h,
+        device const char   * w,
+        device const int    * targets,
+        device const float  * weights,
+        device const float  * bias,
+        device atomic_float * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3 ntg[[threads_per_threadgroup]]) {
+    threadgroup float sh[32];
+
+    const int t = tgpig.x;
+
+    // Uniform across the threadgroup (it depends on the token only), so the
+    // reductions below can never be reached by some threads and not others.
+    const int n_active = fsce_count_active(
+            targets, weights, args.n_tokens, args.n_vocab, sh, tpitg.x, sgitg, tiisg, ntg.x);
+
+    const int   tgt = targets[t];
+    const float wgt = weights[t];
+    if (!(tgt >= 0 && tgt < args.n_vocab && wgt != 0.0f) || n_active == 0) {
+        return;
+    }
+
+    device const float * h_col = (device const float *)(h + (size_t) t*args.nb_h);
+    const int n_chunks = args.n_embd/16;
+
+    float lmax = -INFINITY;
+    float lsum = 0.0f;
+    float ztgt = 0.0f;
+    for (int v = tpitg.x; v < args.n_vocab; v += ntg.x) {
+        float z = fsce_w_dot_h<block_q, nl, dequantize_func>(w, h_col, args.nb_w, v, n_chunks);
+        if (args.has_bias) {
+            z += bias[v];
+        }
+        if (z > lmax) {
+            lsum = lsum*exp(lmax - z) + 1.0f;
+            lmax = z;
+        } else {
+            lsum += exp(z - lmax);
+        }
+        if (v == tgt) {
+            ztgt = z;
+        }
+    }
+
+    // Merge the partial online log-sum-exps: rescale every thread's sum to the
+    // threadgroup max, then add. A thread that was handed no vocabulary row
+    // contributes lsum = 0, and exp(-inf - max) = 0, so it stays neutral.
+    const float lmax_all = retro_tg_max(lmax, sh, sgitg, tiisg, ntg.x);
+    const float lsum_all = retro_tg_sum(lsum*exp(lmax - lmax_all), sh, sgitg, tiisg, ntg.x);
+    // Exactly one thread saw the target row, so a sum broadcasts its value.
+    const float ztgt_all = retro_tg_sum(ztgt, sh, sgitg, tiisg, ntg.x);
+
+    if (tpitg.x == 0) {
+        const float lse = lmax_all + log(lsum_all);
+        atomic_fetch_add_explicit(dst, wgt*(lse - ztgt_all)/(float) n_active, memory_order_relaxed);
+    }
+}
+
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread float4x4 &)>
+kernel void kernel_fused_sparse_ce_back(
+        constant ggml_metal_kargs_fused_sparse_ce & args,
+        device const float * grad,
+        device const char  * h,
+        device const char  * w,
+        device const int   * targets,
+        device const float * weights,
+        device const float * bias,
+        device       char  * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3 ntg[[threads_per_threadgroup]]) {
+    threadgroup float sh[32];
+    threadgroup float sh_p[FSCE_NTH];
+
+    const int t = tgpig.x;
+    const int n_chunks = args.n_embd/16;
+
+    const int n_active = fsce_count_active(
+            targets, weights, args.n_tokens, args.n_vocab, sh, tpitg.x, sgitg, tiisg, ntg.x);
+
+    const int   tgt = targets[t];
+    const float wgt = weights[t];
+    device float * dst_col = (device float *)(dst + (size_t) t*args.nb_d);
+
+    if (!(tgt >= 0 && tgt < args.n_vocab && wgt != 0.0f) || n_active == 0) {
+        for (int e = tpitg.x; e < args.n_embd; e += ntg.x) {
+            dst_col[e] = 0.0f;
+        }
+        return;
+    }
+
+    device const float * h_col = (device const float *)(h + (size_t) t*args.nb_h);
+
+    // Pass 1: the token's log-sum-exp, recomputed exactly as the forward did
+    // rather than stored -- this op checkpoints the logits, it never keeps them.
+    float lmax = -INFINITY;
+    float lsum = 0.0f;
+    for (int v = tpitg.x; v < args.n_vocab; v += ntg.x) {
+        float z = fsce_w_dot_h<block_q, nl, dequantize_func>(w, h_col, args.nb_w, v, n_chunks);
+        if (args.has_bias) {
+            z += bias[v];
+        }
+        if (z > lmax) {
+            lsum = lsum*exp(lmax - z) + 1.0f;
+            lmax = z;
+        } else {
+            lsum += exp(z - lmax);
+        }
+    }
+    const float lmax_all = retro_tg_max(lmax, sh, sgitg, tiisg, ntg.x);
+    const float lsum_all = retro_tg_sum(lsum*exp(lmax - lmax_all), sh, sgitg, tiisg, ntg.x);
+    const float lse = lmax_all + log(lsum_all);
+
+    // Pass 2: acc[e] = sum_v softmax(z[v]) * w[e,v], streamed in threadgroup-sized
+    // vocabulary tiles. Each tile's softmax weights are produced one thread per
+    // vocabulary row, then consumed one thread per 16-element chunk of the
+    // embedding, so every accumulation stays in registers and no atomic or
+    // shared-memory accumulator is needed.
+    //
+    // The consumption half only has n_embd/16 threads to give work to, so it
+    // runs at partial occupancy below n_embd = 4096. Deliberate: it keeps the
+    // decode count identical to pass 1 (one dequantize call per 16 values),
+    // which is what dominates. Splitting the tile across the idle threads would
+    // need a second accumulator per thread and a reduction over it.
+    float4x4 acc[FSCE_MAXC];
+    for (short k = 0; k < FSCE_MAXC; ++k) {
+        acc[k] = float4x4(0.0f);
+    }
+
+    for (int tile = 0; tile < args.n_vocab; tile += ntg.x) {
+        const int v = tile + tpitg.x;
+        float p = 0.0f;
+        if (v < args.n_vocab) {
+            float z = fsce_w_dot_h<block_q, nl, dequantize_func>(w, h_col, args.nb_w, v, n_chunks);
+            if (args.has_bias) {
+                z += bias[v];
+            }
+            p = exp(z - lse);
+        }
+        sh_p[tpitg.x] = p;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const int tile_n = min((int) ntg.x, args.n_vocab - tile);
+        short k = 0;
+        for (int c = tpitg.x; c < n_chunks; c += ntg.x, ++k) {
+            float4x4 a(0.0f);
+            for (int j = 0; j < tile_n; ++j) {
+                float4x4 reg;
+                dequantize_func(
+                        (device const block_q *)(w + (size_t)(tile + j)*args.nb_w) + c/nl,
+                        (short) (c%nl), reg);
+                a += sh_p[j]*reg;
+            }
+            acc[k] += a;
+        }
+        // Also orders the last read of `h` above before the writes below, which
+        // matters because the graph allocator may have placed dst on top of h
+        // (the fused CE's offload_h option).
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float coef = grad[0]*wgt/(float) n_active;
+    short k = 0;
+    for (int c = tpitg.x; c < n_chunks; c += ntg.x, ++k) {
+        float4x4 wt;
+        dequantize_func(
+                (device const block_q *)(w + (size_t) tgt*args.nb_w) + c/nl, (short) (c%nl), wt);
+        device float4 * d = (device float4 *)(dst_col + c*16);
+        for (short r = 0; r < 4; ++r) {
+            d[r] = coef*(acc[k][r] - wt[r]);
+        }
+    }
+}
+
+typedef decltype(kernel_fused_sparse_ce<float4x4, 1, dequantize_f32>) fused_sparse_ce_t;
+typedef decltype(kernel_fused_sparse_ce_back<float4x4, 1, dequantize_f32>) fused_sparse_ce_back_t;
+
+template [[host_name("kernel_fused_sparse_ce_f32")]]  kernel fused_sparse_ce_t kernel_fused_sparse_ce<float4x4,   1,     dequantize_f32>;
+template [[host_name("kernel_fused_sparse_ce_f16")]]  kernel fused_sparse_ce_t kernel_fused_sparse_ce<half4x4,    1,     dequantize_f16>;
+template [[host_name("kernel_fused_sparse_ce_q4_0")]] kernel fused_sparse_ce_t kernel_fused_sparse_ce<block_q4_0, 2,     dequantize_q4_0>;
+template [[host_name("kernel_fused_sparse_ce_q4_1")]] kernel fused_sparse_ce_t kernel_fused_sparse_ce<block_q4_1, 2,     dequantize_q4_1>;
+template [[host_name("kernel_fused_sparse_ce_q5_0")]] kernel fused_sparse_ce_t kernel_fused_sparse_ce<block_q5_0, 2,     dequantize_q5_0>;
+template [[host_name("kernel_fused_sparse_ce_q5_1")]] kernel fused_sparse_ce_t kernel_fused_sparse_ce<block_q5_1, 2,     dequantize_q5_1>;
+template [[host_name("kernel_fused_sparse_ce_q8_0")]] kernel fused_sparse_ce_t kernel_fused_sparse_ce<block_q8_0, 2,     dequantize_q8_0>;
+template [[host_name("kernel_fused_sparse_ce_q2_K")]] kernel fused_sparse_ce_t kernel_fused_sparse_ce<block_q2_K, QK_NL, dequantize_q2_K>;
+template [[host_name("kernel_fused_sparse_ce_q3_K")]] kernel fused_sparse_ce_t kernel_fused_sparse_ce<block_q3_K, QK_NL, dequantize_q3_K>;
+template [[host_name("kernel_fused_sparse_ce_q4_K")]] kernel fused_sparse_ce_t kernel_fused_sparse_ce<block_q4_K, QK_NL, dequantize_q4_K>;
+template [[host_name("kernel_fused_sparse_ce_q5_K")]] kernel fused_sparse_ce_t kernel_fused_sparse_ce<block_q5_K, QK_NL, dequantize_q5_K>;
+template [[host_name("kernel_fused_sparse_ce_q6_K")]] kernel fused_sparse_ce_t kernel_fused_sparse_ce<block_q6_K, QK_NL, dequantize_q6_K>;
+
+template [[host_name("kernel_fused_sparse_ce_back_f32")]]  kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<float4x4,   1,     dequantize_f32>;
+template [[host_name("kernel_fused_sparse_ce_back_f16")]]  kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<half4x4,    1,     dequantize_f16>;
+template [[host_name("kernel_fused_sparse_ce_back_q4_0")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<block_q4_0, 2,     dequantize_q4_0>;
+template [[host_name("kernel_fused_sparse_ce_back_q4_1")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<block_q4_1, 2,     dequantize_q4_1>;
+template [[host_name("kernel_fused_sparse_ce_back_q5_0")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<block_q5_0, 2,     dequantize_q5_0>;
+template [[host_name("kernel_fused_sparse_ce_back_q5_1")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<block_q5_1, 2,     dequantize_q5_1>;
+template [[host_name("kernel_fused_sparse_ce_back_q8_0")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<block_q8_0, 2,     dequantize_q8_0>;
+template [[host_name("kernel_fused_sparse_ce_back_q2_K")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<block_q2_K, QK_NL, dequantize_q2_K>;
+template [[host_name("kernel_fused_sparse_ce_back_q3_K")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<block_q3_K, QK_NL, dequantize_q3_K>;
+template [[host_name("kernel_fused_sparse_ce_back_q4_K")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<block_q4_K, QK_NL, dequantize_q4_K>;
+template [[host_name("kernel_fused_sparse_ce_back_q5_K")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<block_q5_K, QK_NL, dequantize_q5_K>;
+template [[host_name("kernel_fused_sparse_ce_back_q6_K")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<block_q6_K, QK_NL, dequantize_q6_K>;
 
 // retro delta: get-rows backward for LoRA training.
 // src0 = grad rows [ne00, nr], src1 = I32 row indices [nr]; dst [ne00, n_vocab]

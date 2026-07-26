@@ -1509,6 +1509,19 @@ typedef struct {
     int32_t nactive; // rows with a non-zero label distribution
 } ggml_metal_kargs_cross_entropy_loss_back;
 
+// retro delta: fused sparse cross-entropy (forward and backward share it).
+// nb_h / nb_w / nb_d are the byte strides of a hidden-state column, a head row
+// and a gradient column; the kernel derives every other offset from n_embd.
+typedef struct {
+    int32_t  n_embd;
+    int32_t  n_tokens;
+    int32_t  n_vocab;
+    int32_t  has_bias;
+    uint64_t nb_h;
+    uint64_t nb_w;
+    uint64_t nb_d;
+} ggml_metal_kargs_fused_sparse_ce;
+
 // retro delta: get-rows backward (scatter-add of grad rows into the vocab-sized dst)
 typedef struct {
      int64_t ne00; // row width (n_embd)

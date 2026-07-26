@@ -37,6 +37,7 @@ layout(push_constant) uniform parameter {
     uint n_vocab;
     uint h_stride;
     uint d_stride;
+    uint has_bias; // retro delta: the optional per-vocab bias of the head
 } p;
 
 layout(binding = 0) readonly buffer H   {float data_h[];};
@@ -54,10 +55,13 @@ layout(binding = 2) readonly buffer Tgt {int   data_tgt[];};
 layout(binding = 3) readonly buffer Wgt {float data_wgt[];};
 layout(binding = 4) readonly buffer Cnt {uint  data_count[];};
 layout(binding = 5) coherent buffer Dst {float data_dst[];};
+// retro delta: optional per-vocab bias [n_vocab]. When the head has none the host
+// binds a dummy and clears has_bias, since a descriptor set must stay complete.
+layout(binding = 6) readonly buffer Bs  {float data_bias[];};
 
 #include "dequant_funcs.glsl"
 
-// z[v,t] = dot(w[:,v], h[:,t]) in F32. w is dequantized on the fly with the
+// z[v,t] = dot(w[:,v], h[:,t]) (+ bias[v]) in F32. w is dequantized on the fly with the
 // generic helpers, using the same logical (ib, iqs, y_offset) mapping as
 // get_rows_quant.comp so the pairing with h is correct for every quant type
 // (the dot product is order independent, so we only need each dequantized value
@@ -78,6 +82,10 @@ float w_dot_h(uint v, uint h_off) {
 #endif
         z += dq.x * data_h[h_off + iybs + iqs];
         z += dq.y * data_h[h_off + iybs + iqs + y_offset];
+    }
+    // Added after the dot, exactly where the CPU oracle adds it.
+    if (p.has_bias != 0u) {
+        z += data_bias[v];
     }
     return z;
 }

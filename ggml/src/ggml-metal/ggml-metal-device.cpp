@@ -2564,6 +2564,60 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_out_prod(ggml_me
     return res;
 }
 
+// retro delta: repeat backward pipeline (gradient of a broadcast input)
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_repeat_back(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_REPEAT_BACK);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_repeat_back_%s", ggml_type_name(op->type));
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
+// retro delta: fused sparse cross-entropy pipelines. One variant per head type,
+// named after it, exactly like the out-prod and mul_mm families.
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fused_sparse_ce(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_FUSED_SPARSE_CE);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_fused_sparse_ce_%s", ggml_type_name(op->src[1]->type));
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fused_sparse_ce_back(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_FUSED_SPARSE_CE_BACK);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_fused_sparse_ce_back_%s", ggml_type_name(op->src[2]->type));
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
 // retro delta: soft-max backward pipeline (LoRA training on Metal)
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max_back(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_SOFT_MAX_BACK);

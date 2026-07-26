@@ -531,9 +531,21 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_out_prod(ctx, idx);
             } break;
+        case GGML_OP_REPEAT_BACK: // retro delta
+            {
+                n_fuse = ggml_metal_op_repeat_back(ctx, idx);
+            } break;
         case GGML_OP_SOFT_MAX_BACK: // retro delta
             {
                 n_fuse = ggml_metal_op_soft_max_back(ctx, idx);
+            } break;
+        case GGML_OP_FUSED_SPARSE_CE: // retro delta
+            {
+                n_fuse = ggml_metal_op_fused_sparse_ce(ctx, idx);
+            } break;
+        case GGML_OP_FUSED_SPARSE_CE_BACK: // retro delta
+            {
+                n_fuse = ggml_metal_op_fused_sparse_ce_back(ctx, idx);
             } break;
         case GGML_OP_CROSS_ENTROPY_LOSS: // retro delta
             {
@@ -5811,6 +5823,53 @@ int ggml_metal_op_l2_norm_back(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// retro delta: repeat backward -- reduce a broadcast input's gradient back onto
+// its own shape. Same argument layout as the forward repeat, so it reuses that
+// op's kargs struct: the two are exact duals, src0 and dst simply swap roles.
+int ggml_metal_op_repeat_back(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
+    GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
+
+    auto pipeline = ggml_metal_library_get_pipeline_repeat_back(lib, op);
+
+    ggml_metal_kargs_repeat args = {
+        /*.ne00 =*/ ne00,
+        /*.ne01 =*/ ne01,
+        /*.ne02 =*/ ne02,
+        /*.ne03 =*/ ne03,
+        /*.nb00 =*/ nb00,
+        /*.nb01 =*/ nb01,
+        /*.nb02 =*/ nb02,
+        /*.nb03 =*/ nb03,
+        /*.ne0  =*/ ne0,
+        /*.ne1  =*/ ne1,
+        /*.ne2  =*/ ne2,
+        /*.ne3  =*/ ne3,
+        /*.nb0  =*/ nb0,
+        /*.nb1  =*/ nb1,
+        /*.nb2  =*/ nb2,
+        /*.nb3  =*/ nb3,
+    };
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
+
+    const int nth = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), ne0);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, ne1, ne2, ne3, nth, 1, 1);
+
+    return 1;
+}
+
 // retro delta: out-prod (weight-gradient GEMM), tiled across both output axes.
 int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
@@ -5842,28 +5901,27 @@ int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
         /*.s1   =*/ (int64_t) nb1  / es, /*.s2  =*/ (int64_t) nb2  / es, /*.s3  =*/ (int64_t) nb3  / es,
     };
 
+    // The K-quant tile loader decodes a whole 16-value chunk per thread, so a
+    // trailing partial chunk would read past the tensor. Every K-quant row is a
+    // multiple of QK_K anyway; the assert is what keeps that assumption honest.
     const bool is_k_quant = op->src[0]->type >= GGML_TYPE_Q2_K &&
                             op->src[0]->type <= GGML_TYPE_Q6_K;
-    const int64_t outputs_per_thread = is_k_quant ? 16 : 1;
-    GGML_ASSERT(ne0 % outputs_per_thread == 0);
+    GGML_ASSERT(!is_k_quant || ne0 % 16 == 0);
+
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
-    if (is_k_quant) {
-        constexpr int tile = 8;
-        const int64_t ne0_chunks = ne0 / outputs_per_thread;
-        ggml_metal_encoder_dispatch_threadgroups(
-                enc, (ne0_chunks + tile - 1)/tile, (ne1 + tile - 1)/tile, ne2*ne3,
-                tile, tile, 1);
-    } else {
-        constexpr int tile = 8;
-        ggml_metal_encoder_dispatch_threadgroups(
-                enc, (ne0 + tile - 1)/tile, (ne1 + tile - 1)/tile, ne2*ne3,
-                tile, tile, 1);
-    }
+    // retro delta (P2 port): one threadgroup per BM x BN tile of dst, 256
+    // threads each. Must match OUT_PROD_{BM,BN,NTH} in ggml-metal.metal.
+    constexpr int64_t BM  = 64;
+    constexpr int64_t BN  = 16;
+    constexpr int64_t NTH = 256;
+    ggml_metal_encoder_dispatch_threadgroups(
+            enc, (ne0 + BM - 1)/BM, (ne1 + BN - 1)/BN, ne2*ne3,
+            NTH, 1, 1);
 
     return 1;
 }
@@ -6286,6 +6344,91 @@ int ggml_metal_op_soft_max_back(ggml_metal_op_t ctx, int idx) {
 // retro delta: cross-entropy loss forward. Zero the scalar dst, then one
 // threadgroup per row computes the row's loss contribution and atomically
 // accumulates it into dst[0].
+// retro delta: fused sparse cross-entropy, forward. One threadgroup per token;
+// the head is read quantized inside the kernel, so this op allocates nothing.
+// The scalar destination is atomically accumulated, hence the zero-fill first.
+int ggml_metal_op_fused_sparse_ce(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * h    = op->src[0];
+    const ggml_tensor * w    = op->src[1];
+    const ggml_tensor * bias = op->src[4];
+
+    ggml_metal_op_retro_fill_zero(ctx, op);
+
+    auto pipeline = ggml_metal_library_get_pipeline_fused_sparse_ce(lib, op);
+
+    ggml_metal_kargs_fused_sparse_ce args = {
+        /*.n_embd   =*/ (int32_t) h->ne[0],
+        /*.n_tokens =*/ (int32_t) h->ne[1],
+        /*.n_vocab  =*/ (int32_t) w->ne[1],
+        /*.has_bias =*/ bias ? 1 : 0,
+        /*.nb_h     =*/ h->nb[1],
+        /*.nb_w     =*/ w->nb[1],
+        /*.nb_d     =*/ 0,
+    };
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2]), 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[3]), 4);
+    // The bias is optional; bind the hidden states in its place so the slot is
+    // always a valid buffer. has_bias is what decides whether it is read.
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(bias ? bias : op->src[0]), 5);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         6);
+
+    const int nth = std::min(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, h->ne[1], 1, 1, nth, 1, 1);
+
+    return 1;
+}
+
+// retro delta: fused sparse cross-entropy, backward wrt the hidden states.
+int ggml_metal_op_fused_sparse_ce_back(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * h    = op->src[1];
+    const ggml_tensor * w    = op->src[2];
+    const ggml_tensor * bias = op->src[5];
+
+    auto pipeline = ggml_metal_library_get_pipeline_fused_sparse_ce_back(lib, op);
+
+    ggml_metal_kargs_fused_sparse_ce args = {
+        /*.n_embd   =*/ (int32_t) h->ne[0],
+        /*.n_tokens =*/ (int32_t) h->ne[1],
+        /*.n_vocab  =*/ (int32_t) w->ne[1],
+        /*.has_bias =*/ bias ? 1 : 0,
+        /*.nb_h     =*/ h->nb[1],
+        /*.nb_w     =*/ w->nb[1],
+        /*.nb_d     =*/ op->nb[1],
+    };
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2]), 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[3]), 4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[4]), 5);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(bias ? bias : op->src[1]), 6);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         7);
+
+    const int nth = std::min(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, h->ne[1], 1, 1, nth, 1, 1);
+
+    return 1;
+}
+
 int ggml_metal_op_cross_entropy_loss(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
