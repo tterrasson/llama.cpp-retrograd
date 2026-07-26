@@ -1056,6 +1056,31 @@ extern "C" {
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
 
+    // retro delta: device-side target log-probabilities.
+    //
+    // Requests, for the next llama_decode() only, log softmax(logits)[target]
+    // for each output row of that batch. `targets` is indexed by batch token
+    // (n_targets must equal batch.n_tokens); entries whose batch.logits[i] == 0
+    // are ignored. The softmax and the gather are graph nodes, so the decode
+    // copies back one float per output row instead of a full n_vocab logits row
+    // -- 608 KiB per scored position on a 152k-token vocabulary.
+    //
+    // While the request is in effect the raw logits are NOT copied back to the
+    // host: llama_get_logits*() must not be used for that decode. The request is
+    // consumed by the decode; a following decode reverts to plain logits.
+    //
+    // Returns false and leaves the next decode unchanged if the request cannot
+    // be served (no targets, or a target outside the vocabulary).
+    LLAMA_API bool llama_set_target_logprobs(
+            struct llama_context * ctx,
+            const llama_token    * targets,
+                          size_t   n_targets);
+
+    // retro delta: the target log-probability of the ith batch token, indexed
+    // exactly like llama_get_logits_ith(). Returns NAN when the last decode
+    // carried no target request or when i produced no output.
+    LLAMA_API float llama_get_target_logprob_ith(struct llama_context * ctx, int32_t i);
+
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
     // the embeddings for which llama_batch.logits[i] != 0 are stored contiguously
