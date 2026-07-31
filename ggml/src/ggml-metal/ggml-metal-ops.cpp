@@ -5901,13 +5901,6 @@ int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
         /*.s1   =*/ (int64_t) nb1  / es, /*.s2  =*/ (int64_t) nb2  / es, /*.s3  =*/ (int64_t) nb3  / es,
     };
 
-    // The K-quant tile loader decodes a whole 16-value chunk per thread, so a
-    // trailing partial chunk would read past the tensor. Every K-quant row is a
-    // multiple of QK_K anyway; the assert is what keeps that assumption honest.
-    const bool is_k_quant = op->src[0]->type >= GGML_TYPE_Q2_K &&
-                            op->src[0]->type <= GGML_TYPE_Q6_K;
-    GGML_ASSERT(!is_k_quant || ne0 % 16 == 0);
-
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);

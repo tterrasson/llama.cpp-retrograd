@@ -139,10 +139,11 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     // only handles F32 x F32; the CPU/Vulkan forks dequantize src0 and accumulate
     // in F32. Here src0 is dequantized with ggml-cuda's existing per-type kernels
     // (bit-identical to the CPU oracle's dequant) and the proven cuBLAS path is
-    // reused, so every quant type with a to_fp32 kernel is covered with F32
-    // accumulation -- but in slices along the reduction axis, so the F32 scratch
+    // reused, so every type with a to_fp32 kernel is covered with F32 accumulation
+    // (F16 included) -- but in slices along the reduction axis, so the F32 scratch
     // never scales with the whole weight (see ggml_cuda_dequant_budget_bytes).
-    GGML_ASSERT(src0->type == GGML_TYPE_F32 || ggml_is_quantized(src0->type));
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 ||
+                ggml_is_quantized(src0->type));
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
@@ -182,7 +183,7 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t dps2 = ne2 / ne02;
     const int64_t dps3 = ne3 / ne03;
 
-    if (!ggml_is_quantized(src0->type)) {
+    if (src0->type == GGML_TYPE_F32) {
         ggml_cuda_out_prod_gemm(ctx,
             (const float *) src0->data, nb01 / sizeof(float), nb02 / sizeof(float), nb03 / sizeof(float),
             src1_d, ldb, src1_op, s12, s13,

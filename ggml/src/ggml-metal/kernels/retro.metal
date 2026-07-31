@@ -1,5 +1,6 @@
 #include "common.h"
 #include "dequantize.h" // retro delta: quantized training kernels
+#include "ggml-retro-quant.h" // retro delta: shared fork dequantization table
 // retro delta: repeat backward. dst is the smaller tensor; every element sums
 // the src0 elements that ggml_repeat would have copied onto it, i.e. src0 is
 // walked with a stride of the dst extent along each broadcast axis.
@@ -5438,68 +5439,27 @@ struct out_prod_tile_f32 {
     }
 };
 
-// Q8_0: 32 signed 8-bit values per block, one shared scale.
-struct out_prod_tile_q8_0 {
-    static void load(
-            threadgroup float * tile0,
-            device const char * src0,
-            constant ggml_metal_kargs_out_prod & args,
-            int64_t i02, int64_t i03, int64_t m0, int64_t k0, ushort tiitg) {
-        device const char * base0 = src0 + i02*args.s02 + i03*args.s03;
-        for (ushort l = tiitg; l < OUT_PROD_BK*OUT_PROD_BM; l += OUT_PROD_NTH) {
-            const int64_t m = m0 + (l % OUT_PROD_BM);
-            const int64_t k = k0 + (l / OUT_PROD_BM);
-            float v = 0.0f;
-            if (m < args.ne0 && k < args.ne01) {
-                device const block_q8_0 * blk =
-                    (device const block_q8_0 *)(base0 + k*args.s01) + m/QK8_0;
-                v = (float) blk->d * blk->qs[m % QK8_0];
-            }
-            tile0[l] = v;
-        }
-    }
-};
-
-// Q5_0: 32 five-bit values per block -- low nibbles in qs, fifth bits in qh,
-// zero point -16.
-struct out_prod_tile_q5_0 {
-    static void load(
-            threadgroup float * tile0,
-            device const char * src0,
-            constant ggml_metal_kargs_out_prod & args,
-            int64_t i02, int64_t i03, int64_t m0, int64_t k0, ushort tiitg) {
-        device const char * base0 = src0 + i02*args.s02 + i03*args.s03;
-        for (ushort l = tiitg; l < OUT_PROD_BK*OUT_PROD_BM; l += OUT_PROD_NTH) {
-            const int64_t m = m0 + (l % OUT_PROD_BM);
-            const int64_t k = k0 + (l / OUT_PROD_BM);
-            float v = 0.0f;
-            if (m < args.ne0 && k < args.ne01) {
-                device const block_q5_0 * blk =
-                    (device const block_q5_0 *)(base0 + k*args.s01) + m/QK5_0;
-                const short iq  = m % QK5_0;
-                const short il  = iq & 15;
-                const uint  qh  = *((device const uint *) blk->qh);
-                const int   low = iq < 16 ? (blk->qs[il] & 0x0f) : (blk->qs[il] >> 4);
-                const int   q   = low | (int) (((qh >> iq) & 1u) << 4);
-                v = (float) blk->d * (float) (q - 16);
-            }
-            tile0[l] = v;
-        }
-    }
-};
-
-// K-quants: the block decoders hand back 16 adjacent values at once, so one
-// thread owns one 16-value chunk of the tile row rather than one element. BM is
-// a multiple of 16 and the host asserts ne0 is too, so a chunk never straddles
-// the end of the tensor and never crosses a QK_K block.
-template<typename block_q, void (*dequantize_func)(device const block_q *, short, thread float4x4 &)>
-struct out_prod_tile_k {
+// Every non-F32 type, through the one decoding contract the whole file already
+// relies on: dequantize_<T>(blk, il, reg) fills the 16 *consecutive* elements at
+// il*16 within a block of nl*16 values (the same (block, nl, dequantize) triple
+// kernel_mul_mm is instantiated with). So one thread owns one 16-value chunk of
+// the tile row rather than one element, and the type only enters as template
+// arguments -- no per-format bit twiddling here. F16 is the nl == 1 case;
+// nothing about it is special.
+//
+// BM is a multiple of 16, and supports_op rejects a src0 whose row width is not,
+// so a chunk never straddles the end of the tensor and never crosses a block
+// boundary. Out-of-range lanes store zero rather than skipping, so the inner
+// product below needs no per-element predicate.
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread float4x4 &)>
+struct out_prod_tile_dq {
     static void load(
             threadgroup float * tile0,
             device const char * src0,
             constant ggml_metal_kargs_out_prod & args,
             int64_t i02, int64_t i03, int64_t m0, int64_t k0, ushort tiitg) {
         constexpr ushort n_chunks = OUT_PROD_BM / 16;
+        constexpr short  qk       = nl*16; // elements per block
         device const char * base0 = src0 + i02*args.s02 + i03*args.s03;
         for (ushort l = tiitg; l < OUT_PROD_BK*n_chunks; l += OUT_PROD_NTH) {
             const ushort kk = l / n_chunks;
@@ -5509,8 +5469,8 @@ struct out_prod_tile_k {
             float4x4 values(0.0f);
             if (m < args.ne0 && k < args.ne01) {
                 dequantize_func(
-                        (device const block_q *)(base0 + k*args.s01) + m/QK_K,
-                        (short) ((m % QK_K) / 16), values);
+                        (device const block_q *)(base0 + k*args.s01) + m/qk,
+                        (short) ((m % qk) / 16), values);
             }
             threadgroup float * out = tile0 + kk*OUT_PROD_BM + cc*16;
             for (ushort j = 0; j < 16; ++j) {
@@ -5588,14 +5548,15 @@ kernel void kernel_out_prod_impl(
 typedef decltype(kernel_out_prod_impl<out_prod_tile_f32>) out_prod_t;
 
 template [[host_name("kernel_out_prod_f32")]]  kernel out_prod_t kernel_out_prod_impl<out_prod_tile_f32>;
-template [[host_name("kernel_out_prod_q8_0")]] kernel out_prod_t kernel_out_prod_impl<out_prod_tile_q8_0>;
-template [[host_name("kernel_out_prod_q5_0")]] kernel out_prod_t kernel_out_prod_impl<out_prod_tile_q5_0>;
 
-template [[host_name("kernel_out_prod_q2_K")]] kernel out_prod_t kernel_out_prod_impl<out_prod_tile_k<block_q2_K, dequantize_q2_K>>;
-template [[host_name("kernel_out_prod_q3_K")]] kernel out_prod_t kernel_out_prod_impl<out_prod_tile_k<block_q3_K, dequantize_q3_K>>;
-template [[host_name("kernel_out_prod_q4_K")]] kernel out_prod_t kernel_out_prod_impl<out_prod_tile_k<block_q4_K, dequantize_q4_K>>;
-template [[host_name("kernel_out_prod_q5_K")]] kernel out_prod_t kernel_out_prod_impl<out_prod_tile_k<block_q5_K, dequantize_q5_K>>;
-template [[host_name("kernel_out_prod_q6_K")]] kernel out_prod_t kernel_out_prod_impl<out_prod_tile_k<block_q6_K, dequantize_q6_K>>;
+// retro delta: one pipeline per decodable type, straight from the shared table.
+// The pipeline name must be kernel_out_prod_<ggml_type_name(type)> -- that is
+// what ggml_metal_library_get_pipeline_out_prod builds at dispatch time.
+#define GGML_RETRO_OUT_PROD_PIPELINE(TYPE, BLK, NL, NAME, VKNAME)               \
+    template [[host_name("kernel_out_prod_" #NAME)]]                            \
+    kernel out_prod_t kernel_out_prod_impl<out_prod_tile_dq<BLK, NL, dequantize_##NAME>>;
+GGML_RETRO_DEQUANT_TYPES(GGML_RETRO_OUT_PROD_PIPELINE)
+#undef GGML_RETRO_OUT_PROD_PIPELINE
 
 // retro delta: threadgroup-wide sum/max over per-simdgroup partials. Safe for any
 // threadgroup size (including a partial trailing simdgroup): only simdgroup 0
@@ -6044,31 +6005,20 @@ kernel void kernel_fused_sparse_ce_back(
 typedef decltype(kernel_fused_sparse_ce<float4x4, 1, dequantize_f32>) fused_sparse_ce_t;
 typedef decltype(kernel_fused_sparse_ce_back<float4x4, 1, dequantize_f32>) fused_sparse_ce_back_t;
 
-template [[host_name("kernel_fused_sparse_ce_f32")]]  kernel fused_sparse_ce_t kernel_fused_sparse_ce<float4x4,   1,     dequantize_f32>;
-template [[host_name("kernel_fused_sparse_ce_f16")]]  kernel fused_sparse_ce_t kernel_fused_sparse_ce<half4x4,    1,     dequantize_f16>;
-template [[host_name("kernel_fused_sparse_ce_q4_0")]] kernel fused_sparse_ce_t kernel_fused_sparse_ce<block_q4_0, 2,     dequantize_q4_0>;
-template [[host_name("kernel_fused_sparse_ce_q4_1")]] kernel fused_sparse_ce_t kernel_fused_sparse_ce<block_q4_1, 2,     dequantize_q4_1>;
-template [[host_name("kernel_fused_sparse_ce_q5_0")]] kernel fused_sparse_ce_t kernel_fused_sparse_ce<block_q5_0, 2,     dequantize_q5_0>;
-template [[host_name("kernel_fused_sparse_ce_q5_1")]] kernel fused_sparse_ce_t kernel_fused_sparse_ce<block_q5_1, 2,     dequantize_q5_1>;
-template [[host_name("kernel_fused_sparse_ce_q8_0")]] kernel fused_sparse_ce_t kernel_fused_sparse_ce<block_q8_0, 2,     dequantize_q8_0>;
-template [[host_name("kernel_fused_sparse_ce_q2_K")]] kernel fused_sparse_ce_t kernel_fused_sparse_ce<block_q2_K, QK_NL, dequantize_q2_K>;
-template [[host_name("kernel_fused_sparse_ce_q3_K")]] kernel fused_sparse_ce_t kernel_fused_sparse_ce<block_q3_K, QK_NL, dequantize_q3_K>;
-template [[host_name("kernel_fused_sparse_ce_q4_K")]] kernel fused_sparse_ce_t kernel_fused_sparse_ce<block_q4_K, QK_NL, dequantize_q4_K>;
-template [[host_name("kernel_fused_sparse_ce_q5_K")]] kernel fused_sparse_ce_t kernel_fused_sparse_ce<block_q5_K, QK_NL, dequantize_q5_K>;
-template [[host_name("kernel_fused_sparse_ce_q6_K")]] kernel fused_sparse_ce_t kernel_fused_sparse_ce<block_q6_K, QK_NL, dequantize_q6_K>;
+template [[host_name("kernel_fused_sparse_ce_f32")]]      kernel fused_sparse_ce_t      kernel_fused_sparse_ce     <float4x4, 1, dequantize_f32>;
+template [[host_name("kernel_fused_sparse_ce_back_f32")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<float4x4, 1, dequantize_f32>;
 
-template [[host_name("kernel_fused_sparse_ce_back_f32")]]  kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<float4x4,   1,     dequantize_f32>;
-template [[host_name("kernel_fused_sparse_ce_back_f16")]]  kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<half4x4,    1,     dequantize_f16>;
-template [[host_name("kernel_fused_sparse_ce_back_q4_0")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<block_q4_0, 2,     dequantize_q4_0>;
-template [[host_name("kernel_fused_sparse_ce_back_q4_1")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<block_q4_1, 2,     dequantize_q4_1>;
-template [[host_name("kernel_fused_sparse_ce_back_q5_0")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<block_q5_0, 2,     dequantize_q5_0>;
-template [[host_name("kernel_fused_sparse_ce_back_q5_1")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<block_q5_1, 2,     dequantize_q5_1>;
-template [[host_name("kernel_fused_sparse_ce_back_q8_0")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<block_q8_0, 2,     dequantize_q8_0>;
-template [[host_name("kernel_fused_sparse_ce_back_q2_K")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<block_q2_K, QK_NL, dequantize_q2_K>;
-template [[host_name("kernel_fused_sparse_ce_back_q3_K")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<block_q3_K, QK_NL, dequantize_q3_K>;
-template [[host_name("kernel_fused_sparse_ce_back_q4_K")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<block_q4_K, QK_NL, dequantize_q4_K>;
-template [[host_name("kernel_fused_sparse_ce_back_q5_K")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<block_q5_K, QK_NL, dequantize_q5_K>;
-template [[host_name("kernel_fused_sparse_ce_back_q6_K")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<block_q6_K, QK_NL, dequantize_q6_K>;
+// retro delta: the head-type family, from the same table that drives out_prod.
+// It is the same (BLK, NL, dequantize_<NAME>) triple, so a type added to the
+// table lands on both ops at once -- which is the point: before the table, this
+// list and out_prod's had drifted apart by four types.
+#define GGML_RETRO_FUSED_SPARSE_CE_PIPELINE(TYPE, BLK, NL, NAME, VKNAME)                    \
+    template [[host_name("kernel_fused_sparse_ce_" #NAME)]]                                 \
+    kernel fused_sparse_ce_t      kernel_fused_sparse_ce     <BLK, NL, dequantize_##NAME>;  \
+    template [[host_name("kernel_fused_sparse_ce_back_" #NAME)]]                            \
+    kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<BLK, NL, dequantize_##NAME>;
+GGML_RETRO_DEQUANT_TYPES(GGML_RETRO_FUSED_SPARSE_CE_PIPELINE)
+#undef GGML_RETRO_FUSED_SPARSE_CE_PIPELINE
 
 // retro delta: get-rows backward for LoRA training.
 // src0 = grad rows [ne00, nr], src1 = I32 row indices [nr]; dst [ne00, n_vocab]

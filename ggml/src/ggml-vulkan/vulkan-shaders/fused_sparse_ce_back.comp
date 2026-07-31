@@ -19,9 +19,10 @@
 // ggml_compute_forward_fused_sparse_ce_back_f32. See docs/memory/GPUVOCAB.md.
 
 // See fused_sparse_ce.comp for the include ordering rationale.
+#define FLOAT_TYPE float
+
 #include "types.glsl"
 
-#define FLOAT_TYPE float
 #define WG 256
 // Max embedding slots per thread: supports n_embd up to WG*MAXACC.
 #define MAXACC 32
@@ -114,6 +115,11 @@ shared float sh_lse;
 shared float sh_p[WG];
 
 void main() {
+#ifdef NEEDS_INIT_IQ_SHMEM
+    // Must precede the early return below: it barriers, and that return is
+    // workgroup-uniform, so no invocation can strand the others.
+    init_iq_shmem(gl_WorkGroupSize);
+#endif
     const uint t = gl_WorkGroupID.x;
     if (t >= p.n_tokens) {
         return;
