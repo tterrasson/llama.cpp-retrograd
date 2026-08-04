@@ -2804,6 +2804,29 @@ extern "C" {
             struct ggml_tensor  * grad,
             int64_t               K);
 
+    // retro delta: same op, with the formulation pinned instead of left to the
+    // backend default (docs/optims/OPTIMS_V4.md part A). Two implementations of
+    // the same gradients exist: the per-token sequential scan, and a chunkwise
+    // one that replaces the scan inside a chunk of `chunk` tokens by six matrix
+    // products and a unit-triangular solve. `chunk`:
+    //   0  backend default (CPU: sequential; CUDA: chunkwise)
+    //   <0 force the sequential scan -- the reference both are checked against
+    //   >0 force the chunkwise form with this chunk length
+    // Backends without a chunkwise kernel ignore a positive value. Only tests
+    // and the two GGML_*_GDN_BACK_CHUNK environment overrides need this;
+    // graph builders should call ggml_gated_delta_net_back.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_back_chunked(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * grad,
+            int64_t               K,
+            int32_t               chunk);
+
     // retro delta: gathers the K overlapping causal-conv rollback snapshot
     // windows used by the shared-prefix GRPO scorer's recurrent-state rollback
     // (see build_conv_state / [TAG_RECURRENT_ROLLBACK_SPLITS] in

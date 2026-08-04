@@ -1,0 +1,665 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_atomic_float : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// retro delta: Vulkan adaptation of docs/optims/OPTIMS_V4.md part A.
+//
+// CUDA expresses the chunkwise recurrence as batched cuBLAS GEMMs and chooses a
+// gate-dependent layout on the host. Neither maps cleanly to Vulkan's recorded,
+// asynchronous command stream. This shader instead keeps one workgroup per
+// (head, sequence), evaluates every matrix product cooperatively, and keeps the
+// whole chunk loop in one dispatch. The serial chain is still reduced from T
+// token steps to T/C chunk steps; the triangular solves are the only row-wise
+// scans left inside a chunk.
+//
+// The outer layout depends only on (T, C, K), so the host knows its exact scratch
+// size without reading gates back. Each workgroup checks its own cumulative gate
+// range. A dangerous outer chunk uses the original per-token scan locally, with
+// a trajectory for that one chunk only. Thus the numerical floor remains exact
+// while scratch is O((T/C)*S^2 + C*S^2), not O(T*S^2). In normal trained-model
+// gates the fallback trajectory is allocated but never touched.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#define GDN_S_V_MAX 256
+#define GDN_MAX_SUBGROUPS 64
+#define GDN_CHUNK_LOG_LIMIT 41.5888308f
+
+layout(push_constant) uniform Parameters {
+    uint S_v, H, n_tokens, n_seqs, K;
+    uint neq1, nek1, rq3, rk3;
+    uint sq1, sq2, sq3;
+    uint sk1, sk2, sk3;
+    uint sv1, sv2, sv3;
+    uint sb1, sb2, sb3;
+    uint kda;
+    float scale;
+    uint C, n_chunks, per_unit;
+} p;
+
+layout(binding = 0) readonly  buffer QBuf     { float data_q[];     };
+layout(binding = 1) readonly  buffer KBuf     { float data_k[];     };
+layout(binding = 2) readonly  buffer VBuf     { float data_v[];     };
+layout(binding = 3) readonly  buffer GBuf     { float data_g[];     };
+layout(binding = 4) readonly  buffer BetaBuf  { float data_beta[];  };
+layout(binding = 5) readonly  buffer StateBuf { float data_state[]; };
+layout(binding = 6) readonly  buffer GradBuf  { float data_grad[];  };
+layout(binding = 7)           buffer DstBuf   { float data_dst[];   };
+layout(binding = 8)           buffer Scratch  { float work[];       };
+
+shared float s_k[GDN_S_V_MAX];
+shared float s_v[GDN_S_V_MAX];
+shared float s_q[GDN_S_V_MAX];
+shared float s_do[GDN_S_V_MAX];
+shared float s_gexp[GDN_S_V_MAX];
+shared float s_pre[GDN_S_V_MAX];
+shared float s_delta[GDN_S_V_MAX];
+shared float s_dpre[GDN_S_V_MAX];
+shared float s_ddelta[GDN_S_V_MAX];
+shared float s_red[GDN_MAX_SUBGROUPS];
+shared uint  s_unsafe;
+
+const uint TILE_A   = 0u;
+const uint TILE_QT  = 1u;
+const uint TILE_KT  = 2u;
+const uint TILE_KH  = 3u;
+const uint TILE_VMZ = 4u;
+const uint TILE_U   = 5u;
+const uint TILE_DO  = 6u;
+const uint TILE_DQT = 7u;
+const uint TILE_DKT = 8u;
+const uint TILE_DKH = 9u;
+const uint TILE_DU  = 10u;
+const uint TILE_DZ  = 11u;
+const uint TILE_DA  = 12u;
+
+void work_sync() {
+    memoryBarrierBuffer();
+    barrier();
+}
+
+float block_reduce_sum(float val) {
+    val = subgroupAdd(val);
+    if (gl_SubgroupInvocationID == 0u) {
+        s_red[gl_SubgroupID] = val;
+    }
+    barrier();
+    float total = 0.0f;
+    for (uint i = 0u; i < gl_NumSubgroups; ++i) {
+        total += s_red[i];
+    }
+    barrier();
+    return total;
+}
+
+uint unit_id() { return gl_WorkGroupID.x; }
+uint head_id() { return unit_id() % p.H; }
+uint seq_id()  { return unit_id() / p.H; }
+uint SS()      { return p.S_v*p.S_v; }
+
+uint entry_base(uint base)  { return base; }
+uint starts_base(uint base) { return base + p.n_chunks*SS(); }
+uint tiles_base(uint base)  { return starts_base(base) + p.n_chunks + 1u; }
+uint tile_base(uint base, uint tile) { return tiles_base(base) + tile*p.C*p.S_v; }
+uint beta_base(uint base)   { return tiles_base(base) + 13u*p.C*p.S_v; }
+uint mats_base(uint base)   { return beta_base(base) + p.C; }
+uint mat_base(uint base, uint mat) { return mats_base(base) + mat*p.C*p.C; }
+uint sq_base(uint base)     { return mats_base(base) + 4u*p.C*p.C; }
+uint xt_base(uint base)     { return sq_base(base); }
+uint gt_base(uint base)     { return sq_base(base) + SS(); }
+uint ds_base(uint base)     { return sq_base(base) + 2u*SS(); }
+uint traj_base(uint base)   { return sq_base(base) + 3u*SS(); }
+
+uint q_base() {
+    uint ih = head_id();
+    return (seq_id()/p.rq3)*p.sq3 + (ih % p.neq1)*p.sq1;
+}
+uint k_base() {
+    uint ih = head_id();
+    return (seq_id()/p.rk3)*p.sk3 + (ih % p.nek1)*p.sk1;
+}
+uint v_base() { return seq_id()*p.sv3 + head_id()*p.sv1; }
+uint b_base() { return seq_id()*p.sb3 + head_id()*p.sb1; }
+uint g_base() { return b_base()*(p.kda != 0u ? p.S_v : 1u); }
+
+uint n_q()    { return p.S_v*p.neq1*p.n_tokens*(p.n_seqs/p.rq3); }
+uint n_k()    { return p.S_v*p.nek1*p.n_tokens*(p.n_seqs/p.rk3); }
+uint n_v()    { return p.S_v*p.H*p.n_tokens*p.n_seqs; }
+uint n_g()    { return (p.kda != 0u ? p.S_v : 1u)*p.H*p.n_tokens*p.n_seqs; }
+uint n_beta() { return p.H*p.n_tokens*p.n_seqs; }
+
+uint dq_off(uint t, uint i) {
+    uint ih = head_id();
+    uint iq1 = ih % p.neq1;
+    uint iq3 = seq_id()/p.rq3;
+    return p.S_v*(iq1 + p.neq1*(t + p.n_tokens*iq3)) + i;
+}
+uint dk_off(uint t, uint i) {
+    uint ih = head_id();
+    uint ik1 = ih % p.nek1;
+    uint ik3 = seq_id()/p.rk3;
+    return n_q() + p.S_v*(ik1 + p.nek1*(t + p.n_tokens*ik3)) + i;
+}
+uint dv_off(uint t, uint j) {
+    return n_q() + n_k() + p.S_v*(head_id() + p.H*(t + p.n_tokens*seq_id())) + j;
+}
+uint dg_off(uint t, uint i) {
+    uint base = n_q() + n_k() + n_v();
+    return base + (p.kda != 0u
+        ? p.S_v*(head_id() + p.H*(t + p.n_tokens*seq_id())) + i
+        : head_id() + p.H*(t + p.n_tokens*seq_id()));
+}
+uint db_off(uint t) {
+    return n_q() + n_k() + n_v() + n_g() + head_id() + p.H*(t + p.n_tokens*seq_id());
+}
+uint grad_attn_off(uint t, uint j) {
+    return (seq_id()*p.n_tokens*p.H + t*p.H + head_id())*p.S_v + j;
+}
+
+uint outer_len(uint t0) {
+    uint L = min(p.C, p.n_tokens - t0);
+    if (p.K > 1u) {
+        uint first_snap = max(t0, p.n_tokens > p.K ? p.n_tokens - p.K : 0u);
+        if (first_snap < t0 + L - 1u) {
+            L = first_snap - t0 + 1u;
+        }
+    }
+    return L;
+}
+
+bool chunk_is_safe(uint t0, uint L) {
+    uint tid = gl_LocalInvocationIndex;
+    if (tid == 0u) {
+        s_unsafe = 0u;
+    }
+    barrier();
+    uint nch = p.kda != 0u ? p.S_v : 1u;
+    for (uint i = tid; i < nch; i += gl_WorkGroupSize.x) {
+        float sum = 0.0f;
+        for (uint r = 0u; r < L; ++r) {
+            sum += data_g[g_base() + (t0 + r)*(p.kda != 0u ? p.S_v*p.H : p.H) + i];
+            if (!(abs(sum) <= GDN_CHUNK_LOG_LIMIT)) {
+                atomicOr(s_unsafe, 1u);
+            }
+        }
+    }
+    barrier();
+    return s_unsafe == 0u;
+}
+
+// (ii)-(viii). With full=false this is the state-only pass: qtil and P are not
+// needed to advance the recurrent state and are deliberately skipped.
+void chunk_forward(uint base, uint t0, uint L, uint S0, uint Snext, bool write_next, bool full) {
+    uint tid = gl_LocalInvocationIndex;
+    uint S = p.S_v;
+    uint A = tile_base(base, TILE_A);
+    uint Qt = tile_base(base, TILE_QT);
+    uint Kt = tile_base(base, TILE_KT);
+    uint Kh = tile_base(base, TILE_KH);
+    uint VmZ = tile_base(base, TILE_VMZ);
+    uint U = tile_base(base, TILE_U);
+    uint bet = beta_base(base);
+    uint M = mat_base(base, 0u);
+    uint T = mat_base(base, 1u);
+    uint P = mat_base(base, 2u);
+    uint XT = xt_base(base);
+
+    for (uint i = tid; i < S; i += gl_WorkGroupSize.x) {
+        float acc = 1.0f;
+        for (uint r = 0u; r < L; ++r) {
+            uint t = t0 + r;
+            float gv = data_g[g_base() + t*(p.kda != 0u ? S*p.H : p.H) + (p.kda != 0u ? i : 0u)];
+            acc *= exp(gv);
+            float kv = data_k[k_base() + t*p.sk2 + i];
+            work[A + r*S + i] = acc;
+            work[Kt + r*S + i] = kv*acc;
+            work[Kh + r*S + i] = kv/acc;
+            if (full) {
+                work[Qt + r*S + i] = data_q[q_base() + t*p.sq2 + i]*acc;
+            }
+        }
+    }
+    for (uint r = tid; r < L; r += gl_WorkGroupSize.x) {
+        work[bet + r] = data_beta[b_base() + (t0 + r)*p.sb2];
+    }
+    work_sync();
+
+    for (uint n = tid; n < L*S; n += gl_WorkGroupSize.x) {
+        uint r = n/S, j = n - r*S;
+        float sum = 0.0f;
+        for (uint i = 0u; i < S; ++i) {
+            sum += work[Kt + r*S + i]*work[S0 + j*S + i];
+        }
+        float d = data_v[v_base() + (t0 + r)*p.sv2 + j] - sum;
+        work[VmZ + n] = d;
+        work[U + n] = work[bet + r]*d;
+    }
+    work_sync();
+
+    for (uint n = tid; n < L*L; n += gl_WorkGroupSize.x) {
+        uint r = n/L, c = n - r*L;
+        float sum = 0.0f;
+        for (uint i = 0u; i < S; ++i) {
+            sum += work[Kt + r*S + i]*work[Kh + c*S + i];
+        }
+        work[M + r*p.C + c] = sum;
+        work[T + r*p.C + c] = c < r ? work[bet + r]*sum : 0.0f;
+    }
+    work_sync();
+
+    for (uint r = 0u; r < L; ++r) {
+        if (tid < S) {
+            float val = work[U + r*S + tid];
+            for (uint c = 0u; c < r; ++c) {
+                val -= work[T + r*p.C + c]*work[U + c*S + tid];
+            }
+            work[U + r*S + tid] = val;
+        }
+        work_sync();
+    }
+
+    if (full) {
+        for (uint n = tid; n < L*L; n += gl_WorkGroupSize.x) {
+            uint r = n/L, c = n - r*L;
+            float sum = 0.0f;
+            for (uint i = 0u; i < S; ++i) {
+                sum += work[Qt + r*S + i]*work[Kh + c*S + i];
+            }
+            work[P + r*p.C + c] = c <= r ? sum : 0.0f;
+        }
+        work_sync();
+    }
+
+    for (uint n = tid; n < S*S; n += gl_WorkGroupSize.x) {
+        uint j = n/S, i = n - j*S;
+        float sum = 0.0f;
+        for (uint r = 0u; r < L; ++r) {
+            sum += work[U + r*S + j]*work[Kh + r*S + i];
+        }
+        float x = work[S0 + n] + sum;
+        work[XT + n] = x;
+        if (write_next) {
+            work[Snext + n] = work[A + (L - 1u)*S + i]*x;
+        }
+    }
+    work_sync();
+}
+
+void chunk_backward(uint base, uint t0, uint L, uint S0) {
+    uint tid = gl_LocalInvocationIndex;
+    uint S = p.S_v;
+    uint A = tile_base(base, TILE_A), Qt = tile_base(base, TILE_QT);
+    uint Kt = tile_base(base, TILE_KT), Kh = tile_base(base, TILE_KH);
+    uint VmZ = tile_base(base, TILE_VMZ), U = tile_base(base, TILE_U);
+    uint dO = tile_base(base, TILE_DO), dQt = tile_base(base, TILE_DQT);
+    uint dKt = tile_base(base, TILE_DKT), dKh = tile_base(base, TILE_DKH);
+    uint dU = tile_base(base, TILE_DU), dZ = tile_base(base, TILE_DZ);
+    uint dA = tile_base(base, TILE_DA), bet = beta_base(base);
+    uint M = mat_base(base, 0u), T = mat_base(base, 1u);
+    uint P = mat_base(base, 2u), X = mat_base(base, 3u);
+    uint XT = xt_base(base), GT = gt_base(base), dST = ds_base(base);
+
+    chunk_forward(base, t0, L, S0, 0u, false, true);
+    for (uint n = tid; n < L*S; n += gl_WorkGroupSize.x) {
+        uint r = n/S, j = n - r*S;
+        work[dO + n] = data_grad[grad_attn_off(t0 + r, j)];
+    }
+    work_sync();
+
+    // (viii)^T
+    for (uint i = tid; i < S; i += gl_WorkGroupSize.x) {
+        float da = 0.0f;
+        for (uint r = 0u; r + 1u < L; ++r) work[dA + r*S + i] = 0.0f;
+        for (uint j = 0u; j < S; ++j) {
+            uint n = j*S + i;
+            work[GT + n] = work[dST + n]*work[A + (L - 1u)*S + i];
+            da += work[dST + n]*work[XT + n];
+        }
+        work[dA + (L - 1u)*S + i] = da;
+    }
+    work_sync();
+    for (uint n = tid; n < L*S; n += gl_WorkGroupSize.x) {
+        uint r = n/S, i = n - r*S;
+        float sk = 0.0f, su = 0.0f;
+        for (uint j = 0u; j < S; ++j) {
+            sk += work[U + r*S + j]*work[GT + j*S + i];
+            su += work[Kh + r*S + j]*work[GT + i*S + j];
+        }
+        work[dKh + n] = sk;
+        work[dU + n] = su;
+    }
+    for (uint n = tid; n < S*S; n += gl_WorkGroupSize.x) work[dST + n] = work[GT + n];
+    work_sync();
+
+    // (vii)^T
+    for (uint n = tid; n < L*S; n += gl_WorkGroupSize.x) {
+        uint r = n/S, i = n - r*S;
+        float sum = 0.0f;
+        for (uint j = 0u; j < S; ++j) sum += work[dO + r*S + j]*work[S0 + j*S + i];
+        work[dQt + n] = p.scale*sum;
+    }
+    for (uint n = tid; n < S*S; n += gl_WorkGroupSize.x) {
+        uint j = n/S, i = n - j*S;
+        float sum = 0.0f;
+        for (uint r = 0u; r < L; ++r) sum += work[dO + r*S + j]*work[Qt + r*S + i];
+        work[dST + n] += p.scale*sum;
+    }
+    for (uint n = tid; n < L*L; n += gl_WorkGroupSize.x) {
+        uint r = n/L, c = n - r*L;
+        float sum = 0.0f;
+        for (uint j = 0u; j < S; ++j) sum += work[dO + r*S + j]*work[U + c*S + j];
+        work[X + r*p.C + c] = c <= r ? p.scale*sum : 0.0f;
+    }
+    work_sync();
+    for (uint n = tid; n < L*S; n += gl_WorkGroupSize.x) {
+        uint r = n/S, j = n - r*S;
+        float sum = 0.0f;
+        for (uint c = 0u; c < L; ++c) sum += work[P + c*p.C + r]*work[dO + c*S + j];
+        work[dU + n] += p.scale*sum;
+    }
+    work_sync();
+
+    // (vi)^T
+    for (uint n = tid; n < L*S; n += gl_WorkGroupSize.x) {
+        uint r = n/S, i = n - r*S;
+        float sq = 0.0f, sk = 0.0f;
+        for (uint c = 0u; c < L; ++c) {
+            sq += work[X + r*p.C + c]*work[Kh + c*S + i];
+            sk += work[X + c*p.C + r]*work[Qt + c*S + i];
+        }
+        work[dQt + n] += sq;
+        work[dKh + n] += sk;
+    }
+    work_sync();
+
+    // (v)^T: dWhat = (I+T)^-T dU, in place.
+    for (int rr = int(L) - 1; rr >= 0; --rr) {
+        uint r = uint(rr);
+        if (tid < S) {
+            float val = work[dU + r*S + tid];
+            for (uint c = r + 1u; c < L; ++c) val -= work[T + c*p.C + r]*work[dU + c*S + tid];
+            work[dU + r*S + tid] = val;
+        }
+        work_sync();
+    }
+
+    // (iv)^T
+    for (uint n = tid; n < L*L; n += gl_WorkGroupSize.x) {
+        uint r = n/L, c = n - r*L;
+        float sum = 0.0f;
+        for (uint j = 0u; j < S; ++j) sum += work[dU + r*S + j]*work[U + c*S + j];
+        work[X + r*p.C + c] = -sum;
+    }
+    work_sync();
+    for (uint r = 0u; r < L; ++r) {
+        float part = 0.0f;
+        for (uint c = tid; c < L; c += gl_WorkGroupSize.x) {
+            uint o = X + r*p.C + c;
+            if (c < r) {
+                float x = work[o];
+                part += x*work[M + r*p.C + c];
+                work[o] = work[bet + r]*x;
+            } else work[o] = 0.0f;
+        }
+        float total = block_reduce_sum(part);
+        if (tid == 0u) data_dst[db_off(t0 + r)] += total;
+    }
+    work_sync();
+    for (uint n = tid; n < L*S; n += gl_WorkGroupSize.x) {
+        uint r = n/S, i = n - r*S;
+        float st = 0.0f, sh = 0.0f;
+        for (uint c = 0u; c < L; ++c) {
+            st += work[X + r*p.C + c]*work[Kh + c*S + i];
+            sh += work[X + c*p.C + r]*work[Kt + c*S + i];
+        }
+        work[dKt + n] = st;
+        work[dKh + n] += sh;
+    }
+    work_sync();
+
+    // (iii)^T
+    for (uint r = 0u; r < L; ++r) {
+        float part = 0.0f;
+        float b = work[bet + r];
+        for (uint j = tid; j < S; j += gl_WorkGroupSize.x) {
+            uint o = r*S + j;
+            float dw = work[dU + o];
+            data_dst[dv_off(t0 + r, j)] += b*dw;
+            part += dw*work[VmZ + o];
+            work[dZ + o] = -b*dw;
+        }
+        float total = block_reduce_sum(part);
+        if (tid == 0u) data_dst[db_off(t0 + r)] += total;
+    }
+    work_sync();
+
+    // (ii)^T
+    for (uint n = tid; n < L*S; n += gl_WorkGroupSize.x) {
+        uint r = n/S, i = n - r*S;
+        float sum = 0.0f;
+        for (uint j = 0u; j < S; ++j) sum += work[dZ + r*S + j]*work[S0 + j*S + i];
+        work[dKt + n] += sum;
+    }
+    for (uint n = tid; n < S*S; n += gl_WorkGroupSize.x) {
+        uint j = n/S, i = n - j*S;
+        float sum = 0.0f;
+        for (uint r = 0u; r < L; ++r) sum += work[dZ + r*S + j]*work[Kt + r*S + i];
+        work[dST + n] += sum;
+    }
+    work_sync();
+
+    // (i)^T
+    if (tid < S) {
+        uint i = tid;
+        for (uint r = 0u; r < L; ++r) {
+            uint n = r*S + i, t = t0 + r;
+            float av = work[A + n], inv = 1.0f/av;
+            float kv = data_k[k_base() + t*p.sk2 + i];
+            float qv = data_q[q_base() + t*p.sq2 + i];
+            atomicAdd(data_dst[dk_off(t, i)], work[dKt + n]*av + work[dKh + n]*inv);
+            atomicAdd(data_dst[dq_off(t, i)], work[dQt + n]*av);
+            work[dA + n] += work[dKt + n]*kv + work[dQt + n]*qv
+                           - ((work[dKh + n]*kv)*inv)*inv;
+        }
+    }
+    work_sync();
+    float run = 0.0f;
+    for (int rr = int(L) - 1; rr >= 0; --rr) {
+        uint r = uint(rr);
+        if (tid < S) run += work[dA + r*S + tid]*work[A + r*S + tid];
+        if (p.kda != 0u) {
+            if (tid < S) data_dst[dg_off(t0 + r, tid)] += run;
+        } else {
+            float total = block_reduce_sum(tid < S ? run : 0.0f);
+            if (tid == 0u) data_dst[dg_off(t0 + r, 0u)] += total;
+        }
+    }
+    work_sync();
+}
+
+// Sequential fallback for one outer chunk. The trajectory is local to the
+// reusable chunk workspace, never retained for the full sequence.
+void fallback_forward(uint base, uint t0, uint L, uint S0, uint Snext, bool write_next) {
+    uint tid = gl_LocalInvocationIndex, S = p.S_v, ss = S*S;
+    uint traj = traj_base(base);
+    for (uint n = tid; n < ss; n += gl_WorkGroupSize.x) work[traj + n] = work[S0 + n];
+    work_sync();
+    for (uint r = 0u; r < L; ++r) {
+        uint t = t0 + r, prev = traj + r*ss, next = traj + (r + 1u)*ss;
+        for (uint i = tid; i < S; i += gl_WorkGroupSize.x) {
+            s_k[i] = data_k[k_base() + t*p.sk2 + i];
+            s_v[i] = data_v[v_base() + t*p.sv2 + i];
+            s_gexp[i] = exp(data_g[g_base() + t*(p.kda != 0u ? S*p.H : p.H) + (p.kda != 0u ? i : 0u)]);
+        }
+        barrier();
+        for (uint j = gl_SubgroupID; j < S; j += gl_NumSubgroups) {
+            float acc = 0.0f;
+            for (uint i = gl_SubgroupInvocationID; i < S; i += gl_SubgroupSize) {
+                acc += work[prev + j*S + i]*s_gexp[i]*s_k[i];
+            }
+            acc = subgroupAdd(acc);
+            if (gl_SubgroupInvocationID == 0u) s_pre[j] = acc;
+        }
+        barrier();
+        float b = data_beta[b_base() + t*p.sb2];
+        for (uint j = tid; j < S; j += gl_WorkGroupSize.x) s_delta[j] = b*(s_v[j] - s_pre[j]);
+        barrier();
+        for (uint n = tid; n < ss; n += gl_WorkGroupSize.x) {
+            uint j = n/S, i = n - j*S;
+            work[next + n] = work[prev + n]*s_gexp[i] + s_k[i]*s_delta[j];
+        }
+        work_sync();
+    }
+    if (write_next) {
+        for (uint n = tid; n < ss; n += gl_WorkGroupSize.x) work[Snext + n] = work[traj + L*ss + n];
+        work_sync();
+    }
+}
+
+void fallback_backward(uint base, uint t0, uint L, uint S0) {
+    uint tid = gl_LocalInvocationIndex, S = p.S_v, ss = S*S;
+    uint traj = traj_base(base), S1 = xt_base(base), Snew = gt_base(base), dST = ds_base(base);
+    fallback_forward(base, t0, L, S0, 0u, false);
+    for (int rr = int(L) - 1; rr >= 0; --rr) {
+        uint r = uint(rr), t = t0 + r, Sprev = traj + r*ss, dS1 = traj + (r + 1u)*ss;
+        float b = data_beta[b_base() + t*p.sb2];
+        for (uint i = tid; i < S; i += gl_WorkGroupSize.x) {
+            s_k[i] = data_k[k_base() + t*p.sk2 + i];
+            s_v[i] = data_v[v_base() + t*p.sv2 + i];
+            s_q[i] = data_q[q_base() + t*p.sq2 + i];
+            s_do[i] = data_grad[grad_attn_off(t, i)];
+            s_gexp[i] = exp(data_g[g_base() + t*(p.kda != 0u ? S*p.H : p.H) + (p.kda != 0u ? i : 0u)]);
+        }
+        barrier();
+        for (uint j = gl_SubgroupID; j < S; j += gl_NumSubgroups) {
+            float acc = 0.0f;
+            for (uint i = gl_SubgroupInvocationID; i < S; i += gl_SubgroupSize) {
+                acc += work[Sprev + j*S + i]*s_gexp[i]*s_k[i];
+            }
+            acc = subgroupAdd(acc);
+            if (gl_SubgroupInvocationID == 0u) s_pre[j] = acc;
+        }
+        barrier();
+        for (uint j = tid; j < S; j += gl_WorkGroupSize.x) s_delta[j] = b*(s_v[j] - s_pre[j]);
+        barrier();
+        for (uint n = tid; n < ss; n += gl_WorkGroupSize.x) {
+            uint j = n/S, i = n - j*S;
+            work[S1 + n] = work[Sprev + n]*s_gexp[i];
+            work[Snew + n] = work[S1 + n] + s_k[i]*s_delta[j];
+        }
+        work_sync();
+
+        if (tid < S) {
+            uint i = tid;
+            float dqi = 0.0f;
+            for (uint j = 0u; j < S; ++j) {
+                work[dST + j*S + i] += p.scale*s_do[j]*s_q[i];
+                dqi += work[Snew + j*S + i]*s_do[j];
+            }
+            atomicAdd(data_dst[dq_off(t, i)], p.scale*dqi);
+        }
+        work_sync();
+
+        for (uint n = tid; n < ss; n += gl_WorkGroupSize.x) work[dS1 + n] = work[dST + n];
+        for (uint j = gl_SubgroupID; j < S; j += gl_NumSubgroups) {
+            float acc = 0.0f;
+            for (uint i = gl_SubgroupInvocationID; i < S; i += gl_SubgroupSize) acc += work[dST + j*S + i]*s_k[i];
+            acc = subgroupAdd(acc);
+            if (gl_SubgroupInvocationID == 0u) s_ddelta[j] = acc;
+        }
+        barrier();
+        if (tid < S) {
+            float dki = 0.0f;
+            for (uint j = 0u; j < S; ++j) dki += work[dST + j*S + tid]*s_delta[j];
+            atomicAdd(data_dst[dk_off(t, tid)], dki);
+        }
+        float dbpart = 0.0f;
+        for (uint j = tid; j < S; j += gl_WorkGroupSize.x) {
+            s_dpre[j] = -s_ddelta[j]*b;
+            dbpart += s_ddelta[j]*(s_v[j] - s_pre[j]);
+            data_dst[dv_off(t, j)] += s_ddelta[j]*b;
+        }
+        float dbtotal = block_reduce_sum(dbpart);
+        if (tid == 0u) data_dst[db_off(t)] += dbtotal;
+        for (uint n = tid; n < ss; n += gl_WorkGroupSize.x) {
+            uint j = n/S, i = n - j*S;
+            work[dS1 + n] += s_dpre[j]*s_k[i];
+        }
+        work_sync();
+        if (tid < S) {
+            float dki = 0.0f;
+            for (uint j = 0u; j < S; ++j) dki += s_dpre[j]*work[S1 + j*S + tid];
+            atomicAdd(data_dst[dk_off(t, tid)], dki);
+        }
+        work_sync();
+        if (p.kda != 0u) {
+            if (tid < S) {
+                float dg = 0.0f;
+                for (uint j = 0u; j < S; ++j) {
+                    uint n = j*S + tid;
+                    dg += work[dS1 + n]*work[Sprev + n];
+                    work[dST + n] = work[dS1 + n]*s_gexp[tid];
+                }
+                data_dst[dg_off(t, tid)] += dg*s_gexp[tid];
+            }
+        } else {
+            float part = 0.0f;
+            for (uint n = tid; n < ss; n += gl_WorkGroupSize.x) {
+                part += work[dS1 + n]*work[Sprev + n];
+                work[dST + n] = work[dS1 + n]*s_gexp[0];
+            }
+            float total = block_reduce_sum(part);
+            if (tid == 0u) data_dst[dg_off(t, 0u)] += total*s_gexp[0];
+        }
+        work_sync();
+    }
+}
+
+void main() {
+    uint unit = unit_id();
+    if (unit >= p.H*p.n_seqs) return;
+    uint tid = gl_LocalInvocationIndex, ss = SS();
+    uint base = unit*p.per_unit;
+    uint entries = entry_base(base), starts = starts_base(base), dST = ds_base(base);
+
+    uint state0 = seq_id()*ss*p.H + head_id()*ss;
+    for (uint n = tid; n < ss; n += gl_WorkGroupSize.x) work[entries + n] = data_state[state0 + n];
+    work_sync();
+
+    uint t0 = 0u;
+    for (uint c = 0u; c < p.n_chunks; ++c) {
+        uint L = outer_len(t0);
+        if (tid == 0u) work[starts + c] = float(t0);
+        work_sync();
+        uint S0 = entries + c*ss;
+        uint Snext = entries + (c + 1u)*ss;
+        bool write_next = c + 1u < p.n_chunks;
+        if (chunk_is_safe(t0, L)) chunk_forward(base, t0, L, S0, Snext, write_next, false);
+        else fallback_forward(base, t0, L, S0, Snext, write_next);
+        t0 += L;
+    }
+    if (tid == 0u) work[starts + p.n_chunks] = float(p.n_tokens);
+    for (uint n = tid; n < ss; n += gl_WorkGroupSize.x) work[dST + n] = 0.0f;
+    work_sync();
+
+    for (int cc = int(p.n_chunks) - 1; cc >= 0; --cc) {
+        uint c = uint(cc);
+        uint ct0 = uint(work[starts + c]);
+        uint L = uint(work[starts + c + 1u]) - ct0;
+        uint slot = p.n_tokens - 1u - (ct0 + L - 1u);
+        if (slot < p.K) {
+            uint grad_state = p.S_v*p.H*p.n_tokens*p.n_seqs + slot*ss*p.H*p.n_seqs + unit*ss;
+            for (uint n = tid; n < ss; n += gl_WorkGroupSize.x) work[dST + n] += data_grad[grad_state + n];
+            work_sync();
+        }
+        uint S0 = entries + c*ss;
+        if (chunk_is_safe(ct0, L)) chunk_backward(base, ct0, L, S0);
+        else fallback_backward(base, ct0, L, S0);
+    }
+
+    uint gs = n_q() + n_k() + n_v() + n_g() + n_beta() + unit*ss;
+    for (uint n = tid; n < ss; n += gl_WorkGroupSize.x) data_dst[gs + n] += work[dST + n];
+}

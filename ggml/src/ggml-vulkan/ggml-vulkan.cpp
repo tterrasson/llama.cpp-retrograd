@@ -1204,6 +1204,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_gated_delta_net[4][2];
     // retro delta: analytic backward for GATED_DELTA_NET.
     vk_pipeline pipeline_gated_delta_net_back_f32;
+    vk_pipeline pipeline_gated_delta_net_back_chunked_f32;
     vk_pipeline pipeline_ssm_scan_f32_d64;
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
@@ -2123,6 +2124,9 @@ struct vk_op_gated_delta_net_back_push_constants {
     uint32_t sb1, sb2, sb3;
     uint32_t kda;
     float scale;
+    // Used only by the chunkwise variant. Zeroes are valid for the sequential
+    // pipeline and keep both variants on one descriptor/push-constant ABI.
+    uint32_t C, n_chunks, per_unit;
 };
 
 struct vk_op_ssm_scan_push_constants {
@@ -6494,6 +6498,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // use subgroupAdd, so full subgroups are required.
         if (device->subgroup_basic && device->subgroup_arithmetic && device->subgroup_require_full_support) {
             ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_back_f32, "gated_delta_net_back_f32", gated_delta_net_back_f32_len, gated_delta_net_back_f32_data, "main", 9, sizeof(vk_op_gated_delta_net_back_push_constants), {256, 1, 1}, {}, 1, false, true);
+            ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_back_chunked_f32, "gated_delta_net_back_chunked_f32", gated_delta_net_back_chunked_f32_len, gated_delta_net_back_chunked_f32_data, "main", 9, sizeof(vk_op_gated_delta_net_back_push_constants), {256, 1, 1}, {}, 1, false, true);
         }
     }
 
@@ -13854,11 +13859,12 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
         pc, { H, n_seqs, S_v });
 }
 
-// retro delta: analytic backward for GATED_DELTA_NET (gated_delta_net_back.comp).
-// Single dispatch: one workgroup of 256 per (head, sequence) unit recomputes the
-// trajectory into a scratch buffer (ctx->prealloc_x), then reverse-scans it, with
-// each O(S_v^2) step of the sequential token scan spread across the workgroup.
-// See the shader's header comment for the parallelisation and memory tradeoffs.
+// Vulkan keeps the sequential reference reachable, but defaults to the
+// chunkwise formulation from docs/optims/OPTIMS_V4.md part A. Unlike CUDA, the
+// Vulkan path cannot read gates back while retaining an asynchronous recorded
+// command stream. Its outer chunks therefore depend only on (T, C, K), and each
+// workgroup checks its own gate range on-device; an unsafe chunk locally uses a
+// per-token trajectory for that chunk only. See gated_delta_net_back_chunked.comp.
 static void ggml_vk_gated_delta_net_back(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     const ggml_tensor * src_q     = dst->src[0];
     const ggml_tensor * src_k     = dst->src[1];
@@ -13895,6 +13901,46 @@ static void ggml_vk_gated_delta_net_back(ggml_backend_vk_context * ctx, vk_conte
 
     const float scale = 1.0f / sqrtf((float) S_v);
 
+    int64_t chunk = ggml_get_op_params_i32(dst, 1);
+    if (chunk == 0) {
+        const char * env = getenv("GGML_VULKAN_GDN_BACK_CHUNK");
+        if (env) {
+            const int64_t requested = (int64_t) atoll(env);
+            chunk = requested > 0 ? requested : -1;
+        } else {
+            chunk = 64;
+        }
+    }
+    // The shader gives one channel to one invocation in the final gate adjoint,
+    // matching the hard limit of the CUDA chunkwise implementation.
+    const bool use_chunked = chunk > 0 && S_v <= 256 && n_tokens > 0;
+    const uint32_t C = use_chunked ? (uint32_t)MIN(MIN(chunk, 64), (int64_t)n_tokens) : 0u;
+
+    uint32_t n_chunks = 0;
+    if (use_chunked) {
+        for (uint32_t t = 0; t < n_tokens; ) {
+            uint32_t L = MIN(C, n_tokens - t);
+            if (K > 1) {
+                const uint32_t first_snap = MAX(t, n_tokens > K ? n_tokens - K : 0u);
+                if (first_snap < t + L - 1) {
+                    L = first_snap - t + 1;
+                }
+            }
+            ++n_chunks;
+            t += L;
+        }
+    }
+
+    const uint64_t SS = (uint64_t)S_v*S_v;
+    uint64_t per_unit = 0;
+    if (use_chunked) {
+        // Entries + starts; 13 CxS tiles + beta; four CxC matrices; XT/GT/dST;
+        // and a reusable (C+1)-state trajectory for a numerically unsafe chunk.
+        per_unit = (uint64_t)n_chunks*SS + n_chunks + 1ull
+                 + 13ull*C*S_v + C + 4ull*C*C + 3ull*SS + (uint64_t)(C + 1u)*SS;
+        GGML_ASSERT(per_unit <= UINT32_MAX);
+    }
+
     const vk_op_gated_delta_net_back_push_constants pc = {
         S_v, H, n_tokens, n_seqs, K,
         neq1, nek1, rq3, rk3,
@@ -13903,9 +13949,12 @@ static void ggml_vk_gated_delta_net_back(ggml_backend_vk_context * ctx, vk_conte
         sv1, sv2, sv3,
         sb1, sb2, sb3,
         kda, scale,
+        C, n_chunks, (uint32_t)per_unit,
     };
 
-    vk_pipeline pipeline = ctx->device->pipeline_gated_delta_net_back_f32;
+    vk_pipeline pipeline = use_chunked
+        ? ctx->device->pipeline_gated_delta_net_back_chunked_f32
+        : ctx->device->pipeline_gated_delta_net_back_f32;
     GGML_ASSERT(pipeline != nullptr);
 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
@@ -13916,12 +13965,9 @@ static void ggml_vk_gated_delta_net_back(ggml_backend_vk_context * ctx, vk_conte
         src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i]);
     }
 
-    // The trajectory dominates; S1/Snew/dS/dS1 are the four working matrices.
-    // pre/delta/gexp/dpre/ddelta live in the shader's shared memory.
-    const uint64_t SS          = (uint64_t)S_v * S_v;
-    const uint64_t per_unit    = (uint64_t)n_tokens * SS + 4ull*SS;
     const uint64_t n_units     = (uint64_t)H * n_seqs;
-    const size_t   scratch_bytes = (size_t)(per_unit * n_units) * sizeof(float);
+    const uint64_t sequential_per_unit = (uint64_t)n_tokens*SS + 4ull*SS;
+    const size_t scratch_bytes = (size_t)((use_chunked ? per_unit : sequential_per_unit)*n_units)*sizeof(float);
 
     if (ctx->prealloc_size_x < scratch_bytes) {
         ctx->prealloc_size_x = scratch_bytes;
@@ -13932,11 +13978,14 @@ static void ggml_vk_gated_delta_net_back(ggml_backend_vk_context * ctx, vk_conte
     ggml_vk_buffer_memset_async(subctx, dst_buf.buffer, dst_buf.offset, 0, dst_buf.size);
     ggml_vk_sync_buffers(ctx, subctx);
 
-    // One workgroup of 256 per (head, sequence): wg_denoms is {256,1,1}, so the
-    // x element count is H*256 and the shader reads the unit off gl_WorkGroupID.
+    // The sequential shader uses a 2-D (head, sequence) grid; the chunkwise
+    // shader flattens units so its long-lived workgroups are contiguous.
+    const std::array<uint32_t, 3> elements = use_chunked
+        ? std::array<uint32_t, 3>{ H*n_seqs*256, 1, 1 }
+        : std::array<uint32_t, 3>{ H*256, n_seqs, 1 };
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], src_buf[6], dst_buf, scratch_buf},
-        pc, { H * 256, n_seqs, 1 });
+        pc, elements);
 
     ctx->prealloc_x_need_sync = true;
 }

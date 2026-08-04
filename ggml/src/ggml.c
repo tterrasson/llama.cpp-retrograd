@@ -6722,6 +6722,20 @@ struct ggml_tensor * ggml_gated_delta_net_back(
         struct ggml_tensor  * state,
         struct ggml_tensor  * grad,
         int64_t               K) {
+    return ggml_gated_delta_net_back_chunked(ctx, q, k, v, g, beta, state, grad, K, 0);
+}
+
+struct ggml_tensor * ggml_gated_delta_net_back_chunked(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * grad,
+        int64_t               K,
+        int32_t               chunk) {
     GGML_ASSERT(grad->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(grad));
     GGML_ASSERT(K >= 1);
@@ -6741,6 +6755,7 @@ struct ggml_tensor * ggml_gated_delta_net_back(
         ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_q + n_k + n_v + n_g + n_beta + n_s);
 
     ggml_set_op_params_i32(result, 0, (int32_t) K);
+    ggml_set_op_params_i32(result, 1, chunk);
 
     result->op     = GGML_OP_GATED_DELTA_NET_BACK;
     result->src[0] = q;
