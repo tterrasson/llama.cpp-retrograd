@@ -165,7 +165,11 @@ void main_q() {
             l = l*exp(m - mn) + exp(s - mn); m = mn;
             row_l[lid] = l; row_m[lid] = m;
         }
-        grad[p.off_stats + si] = m + log(l);
+        // A fully masked row (only reachable without sinks) stores +inf rather
+        // than the -inf that m + log(0) would give: the KV pass reads this back
+        // as exp(score - lse), and +inf is the sentinel that drives that to zero
+        // for any score instead of to NaN. Matches the CUDA kernels.
+        grad[p.off_stats + si] = l > 0.0 ? m + log(l) : uintBitsToFloat(0x7f800000u);
         grad[p.off_stats + p.N*p.n_head*p.n_batch + si] = row_delta[lid];
     }
     barrier();

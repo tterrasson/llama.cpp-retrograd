@@ -9,6 +9,7 @@
 #include "vec.h"
 
 #include <algorithm>
+#include <numeric>
 #include <cfloat>
 #include <cmath>
 #include <cstdlib>
@@ -11774,9 +11775,38 @@ void ggml_compute_forward_conv_rs_gather(
 // structure: recompute the state trajectory forward once, then reverse-scan
 // it, accumulating the state adjoint and each token's input gradients.
 //
-// Parallelized across sequences only (n_seqs), not heads: q/k can be
-// broadcast across several v-heads (H_v % H_k == 0), so every v-head sharing
-// a given q/k head must land in one thread to stay race-free without atomics.
+// Parallelized across (head group, sequence) -- see gdn_back_partition.
+//
+// How the (head, sequence) units are handed to threads, for both backward
+// formulations. grad_v/grad_g/grad_beta/grad_state are unique per unit, but
+// grad_q and grad_k are not: q/k can be GQA-broadcast across several v-heads
+// (H_v % H_qk == 0) and across sequences (n_seqs % ne3 == 0), and this op writes
+// them without atomics. So two units may only land on different threads when
+// they cannot share a q or k row.
+//
+// v-heads iv1 and iv1' share a q head exactly when iv1 == iv1' (mod neq1), and a
+// k head when iv1 == iv1' (mod nek1). The finest partition of the head axis that
+// separates neither is therefore by residue modulo gcd(neq1, nek1) -- H groups
+// when q/k are not broadcast at all (the common case, and the one where this
+// matters: a single-sequence ubatch used to run the whole op on one thread), one
+// group when every v-head shares one q/k head, which is the old behaviour.
+// Sequences join the partition only when q/k are not broadcast across them.
+struct gdn_back_partition {
+    int64_t n_groups;      // work items to hand out round-robin over ith/nth
+    int64_t head_groups;   // heads iv1 = hg, hg + head_groups, ... belong to group hg
+    bool    split_seqs;    // false: each group walks every sequence itself
+};
+
+static gdn_back_partition gdn_back_make_partition(
+        int64_t H, int64_t n_seqs, int64_t neq1, int64_t nek1, int64_t rq3, int64_t rk3) {
+    gdn_back_partition p = {};
+    p.head_groups = (int64_t) std::gcd(neq1, nek1);
+    p.split_seqs  = rq3 == 1 && rk3 == 1;
+    p.n_groups    = (p.split_seqs ? n_seqs : 1) * p.head_groups;
+    GGML_UNUSED(H);
+    return p;
+}
+
 static void ggml_compute_forward_gated_delta_net_back_f32(
     const ggml_compute_params * params,
     ggml_tensor * dst) {
@@ -11853,8 +11883,14 @@ static void ggml_compute_forward_gated_delta_net_back_f32(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    for (int64_t iv3 = ith; iv3 < n_seqs; iv3 += nth) {
-        for (int64_t iv1 = 0; iv1 < H; ++iv1) {
+    const gdn_back_partition part = gdn_back_make_partition(H, n_seqs, neq1, nek1, rq3, rk3);
+
+    for (int64_t grp = ith; grp < part.n_groups; grp += nth) {
+        const int64_t hg   = grp % part.head_groups;
+        const int64_t sq0  = part.split_seqs ? grp/part.head_groups : 0;
+        const int64_t sq1_ = part.split_seqs ? sq0 + 1 : n_seqs;
+        for (int64_t iv3 = sq0; iv3 < sq1_; ++iv3) {
+        for (int64_t iv1 = hg; iv1 < H; iv1 += part.head_groups) {
             const int64_t iq1 = iv1 % neq1;
             const int64_t ik1 = iv1 % nek1;
             const int64_t iq3 = iv3 / rq3;
@@ -12008,6 +12044,7 @@ static void ggml_compute_forward_gated_delta_net_back_f32(
             // dS now holds dL/d(state_in) for this (head, seq)
             float * gs_out = g_state + iv3 * state_seq_stride + iv1 * S_v * S_v;
             for (int64_t n = 0; n < S_v * S_v; ++n) { gs_out[n] += dS[n]; }
+        }
         }
     }
 }
@@ -12618,11 +12655,17 @@ static void ggml_compute_forward_gated_delta_net_back_chunked_f32(
     std::vector<int64_t> starts;
     std::vector<float> gexp(S_v), delta(S_v);
 
-    // Same split as the sequential path: over sequences only, so every v-head
-    // sharing a GQA-broadcast q/k head lands in one thread and grad_q/grad_k
-    // need no atomics.
-    for (int64_t iv3 = params->ith; iv3 < n_seqs; iv3 += params->nth) {
-        for (int64_t iv1 = 0; iv1 < H; ++iv1) {
+    // Same split as the sequential path (gdn_back_partition): the finest one
+    // that keeps every v-head sharing a GQA-broadcast q/k row on one thread, so
+    // grad_q/grad_k need no atomics.
+    const gdn_back_partition part = gdn_back_make_partition(H, n_seqs, neq1, nek1, rq3, rk3);
+
+    for (int64_t grp = params->ith; grp < part.n_groups; grp += params->nth) {
+        const int64_t hg   = grp % part.head_groups;
+        const int64_t sq0  = part.split_seqs ? grp/part.head_groups : 0;
+        const int64_t sqN  = part.split_seqs ? sq0 + 1 : n_seqs;
+        for (int64_t iv3 = sq0; iv3 < sqN; ++iv3) {
+        for (int64_t iv1 = hg; iv1 < H; iv1 += part.head_groups) {
             const int64_t iq1 = iv1 % neq1;
             const int64_t ik1 = iv1 % nek1;
             const int64_t iq3 = iv3 / rq3;
@@ -12709,6 +12752,7 @@ static void ggml_compute_forward_gated_delta_net_back_chunked_f32(
             for (int64_t n = 0; n < SS; ++n) {
                 gs_out[n] += dS[n];
             }
+        }
         }
     }
 }

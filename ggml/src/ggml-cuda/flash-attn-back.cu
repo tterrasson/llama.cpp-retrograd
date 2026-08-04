@@ -235,7 +235,13 @@ static __global__ void flash_attn_back_mma_q_kernel(
         const int64_t stat = (ib*nhead + ih)*nq + q0 + tid;
         const int64_t nstats = gridDim.z*nhead*nq;
         float * stats = (float *) ((char *) dst + off_s);
-        stats[stat] = row_l[tid] > 0.0f ? row_m[tid] + logf(row_l[tid]) : -INFINITY;
+        // A fully masked row gets +INFINITY, not -INFINITY, and the scalar
+        // kernel does the same: the KV kernel reads this back as
+        // exp(score - lse), so the sentinel has to drive that to zero for *any*
+        // score it might see. -INFINITY would drive it to +inf, i.e. NaN in
+        // dK/dV, the moment the two kernels ever disagreed about which entries
+        // are masked.
+        stats[stat] = row_l[tid] > 0.0f ? row_m[tid] + logf(row_l[tid]) : INFINITY;
         stats[nstats + stat] = row_delta[tid];
     }
     if (!want_dq) {

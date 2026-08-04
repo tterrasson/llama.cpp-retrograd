@@ -25,11 +25,12 @@
 // (grad_v/grad_g/grad_beta/grad_state) is unique per (head, seq) and written
 // directly.
 //
-// Memory note: like the CPU reference, each unit keeps the full per-token
-// state trajectory (n_tokens * S_v * S_v floats) live at once, so the pool
-// scratch buffer scales with n_tokens * S_v^2 * H * n_seqs. Fine for the LoRA
-// ubatch sizes Retroback targets; a chunked/checkpointed backward would be
-// needed for very long contexts.
+// Memory note: this formulation keeps the full per-token state trajectory
+// (n_tokens * S_v * S_v floats per unit) live at once, so the pool scratch
+// scales with n_tokens * S_v^2 * H * n_seqs -- 1.00 GiB on the profiled model.
+// That, and the latency chain of the token scan, is why the chunkwise
+// formulation in the second half of this file is the default; this one stays as
+// its reference and as what runs when it is switched off.
 
 #define GDN_BACK_BLOCK 256
 
@@ -76,330 +77,10 @@ static __device__ __forceinline__ void gdn_col_dot(
     }
 }
 
-static __global__ __launch_bounds__(GDN_BACK_BLOCK) void gated_delta_net_back_kernel(
-        const float * __restrict__ q, const float * __restrict__ k, const float * __restrict__ v,
-        const float * __restrict__ g, const float * __restrict__ beta, const float * __restrict__ state0,
-        const float * __restrict__ grad,
-        float * __restrict__ dst,
-        float * __restrict__ scratch, const int64_t scratch_stride,
-        const int64_t S_v, const int64_t H, const int64_t n_tokens, const int64_t n_seqs,
-        const int64_t neq1, const int64_t nek1, const int64_t rq3, const int64_t rk3,
-        const int64_t sq1, const int64_t sq2, const int64_t sq3,
-        const int64_t sk1, const int64_t sk2, const int64_t sk3,
-        const int64_t sv1, const int64_t sv2, const int64_t sv3,
-        const int64_t sb1, const int64_t sb2, const int64_t sb3,
-        const bool kda, const float scale, const int K,
-        const int64_t n_q, const int64_t n_k, const int64_t n_v, const int64_t n_g, const int64_t n_beta,
-        const int64_t state_seq_stride) {
-    const int64_t unit = blockIdx.x;
-    if (unit >= H * n_seqs) {
-        return;
-    }
-    const int     tid  = threadIdx.x;
-    const int     nthr = blockDim.x;
-
-    const int64_t iv1 = unit % H;
-    const int64_t iv3 = unit / H;
-
-    const int64_t iq1 = iv1 % neq1;
-    const int64_t ik1 = iv1 % nek1;
-    const int64_t iq3 = iv3 / rq3;
-    const int64_t ik3 = iv3 / rk3;
-
-    float * g_q     = dst;
-    float * g_k     = g_q + n_q;
-    float * g_v     = g_k + n_k;
-    float * g_g     = g_v + n_v;
-    float * g_beta  = g_g + n_g;
-    float * g_state = g_beta + n_beta;
-
-    const int64_t SS                  = S_v * S_v;
-    const int64_t attn_score_elems    = S_v * H * n_tokens * n_seqs;
-    const int64_t state_size_per_snap = SS * H * n_seqs;
-    const float * grad_attn_base  = grad;
-    const float * grad_state_base = grad + attn_score_elems;
-
-    const float * s0 = state0 + iv3 * state_seq_stride + iv1 * SS;
-
-    float * base = scratch + unit * scratch_stride;
-    float * traj = base;                  // n_tokens*S_v*S_v : S_prev per token
-    float * S1   = traj + n_tokens * SS;  // S_v*S_v
-    float * Snew = S1 + SS;               // S_v*S_v
-    float * dS   = Snew + SS;             // S_v*S_v
-    float * dS1  = dS + SS;               // S_v*S_v
-
-    extern __shared__ float smem[];
-    float * s_k      = smem;              // S_v
-    float * s_v      = s_k + S_v;         // S_v
-    float * s_q      = s_v + S_v;         // S_v
-    float * s_do     = s_q + S_v;         // S_v
-    float * s_gexp   = s_do + S_v;        // S_v
-    float * s_pre    = s_gexp + S_v;      // S_v
-    float * s_delta  = s_pre + S_v;       // S_v
-    float * s_dpre   = s_delta + S_v;     // S_v
-    float * s_ddelta = s_dpre + S_v;      // S_v
-    float * s_red    = s_ddelta + S_v;    // blockDim.x / WARP_SIZE
-
-    // Flat walk of an S_v*S_v matrix keeping (i, j) in step without a modulo
-    // in the inner loop.
-    const int64_t i0     = tid % S_v;
-    const int64_t j0     = tid / S_v;
-    const int64_t i_step = nthr % S_v;
-    const int64_t j_step = nthr / S_v;
-
-    // ---- forward recompute: fill the S_prev trajectory ----
-    for (int64_t n = tid; n < SS; n += nthr) {
-        traj[n] = s0[n];
-    }
-    __syncthreads();
-
-    for (int64_t t = 0; t < n_tokens - 1; ++t) {
-        const float * k_d = k + ik3 * sk3 + t * sk2 + ik1 * sk1;
-        const float * v_d = v + iv3 * sv3 + t * sv2 + iv1 * sv1;
-        const int64_t gb_off = iv3 * sb3 + t * sb2 + iv1 * sb1;
-        const float beta_val = beta[gb_off];
-        const float * g_d = g + gb_off * (kda ? S_v : 1);
-
-        const float * S_prev = traj + t * SS;
-        float *       S_next = traj + (t + 1) * SS;
-
-        for (int64_t i = tid; i < S_v; i += nthr) {
-            s_k[i]    = k_d[i];
-            s_v[i]    = v_d[i];
-            s_gexp[i] = expf(kda ? g_d[i] : g_d[0]);
-        }
-        __syncthreads();
-
-        for (int64_t n = tid, i = i0; n < SS; n += nthr) {
-            S1[n] = S_prev[n] * s_gexp[i];
-            i += i_step;
-            if (i >= S_v) i -= S_v;
-        }
-        __syncthreads();
-
-        gdn_col_dot(S1, s_k, s_pre, S_v);
-        __syncthreads();
-
-        for (int64_t j = tid; j < S_v; j += nthr) {
-            s_delta[j] = (s_v[j] - s_pre[j]) * beta_val;
-        }
-        __syncthreads();
-
-        for (int64_t n = tid, i = i0, j = j0; n < SS; n += nthr) {
-            S_next[n] = S1[n] + s_k[i] * s_delta[j];
-            i += i_step;
-            j += j_step;
-            if (i >= S_v) { i -= S_v; ++j; }
-        }
-        __syncthreads();
-    }
-
-    // ---- reverse scan ----
-    for (int64_t n = tid; n < SS; n += nthr) {
-        dS[n] = 0.0f;
-    }
-    __syncthreads();
-
-    for (int64_t t = n_tokens - 1; t >= 0; --t) {
-        const float * q_d = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
-        const float * k_d = k + ik3 * sk3 + t * sk2 + ik1 * sk1;
-        const float * v_d = v + iv3 * sv3 + t * sv2 + iv1 * sv1;
-        const int64_t gb_off = iv3 * sb3 + t * sb2 + iv1 * sb1;
-        const float beta_val = beta[gb_off];
-        const float * g_d = g + gb_off * (kda ? S_v : 1);
-
-        const float * S_prev = traj + t * SS;
-        const float * d_out  = grad_attn_base + (iv3 * n_tokens * H + t * H + iv1) * S_v;
-
-        for (int64_t i = tid; i < S_v; i += nthr) {
-            s_k[i]    = k_d[i];
-            s_v[i]    = v_d[i];
-            s_q[i]    = q_d[i];
-            s_do[i]   = d_out[i];
-            s_gexp[i] = expf(kda ? g_d[i] : g_d[0]);
-        }
-        __syncthreads();
-
-        for (int64_t n = tid, i = i0; n < SS; n += nthr) {
-            S1[n] = S_prev[n] * s_gexp[i];
-            i += i_step;
-            if (i >= S_v) i -= S_v;
-        }
-        __syncthreads();
-
-        gdn_col_dot(S1, s_k, s_pre, S_v);
-        __syncthreads();
-
-        for (int64_t j = tid; j < S_v; j += nthr) {
-            s_delta[j] = (s_v[j] - s_pre[j]) * beta_val;
-        }
-        __syncthreads();
-
-        for (int64_t n = tid, i = i0, j = j0; n < SS; n += nthr) {
-            Snew[n] = S1[n] + s_k[i] * s_delta[j];
-            i += i_step;
-            j += j_step;
-            if (i >= S_v) { i -= S_v; ++j; }
-        }
-        __syncthreads();
-
-        // dS += scale * outer(q, d_out); grad_q = scale * Snew . d_out
-        float * gq_out = g_q + S_v * (iq1 + neq1 * (t + n_tokens * iq3));
-        for (int64_t i = tid; i < S_v; i += nthr) {
-            const float q_i = s_q[i];
-            float dqi = 0.0f;
-            for (int64_t j = 0; j < S_v; ++j) {
-                dS[i + j*S_v] += scale * s_do[j] * q_i;
-                dqi           += Snew[i + j*S_v] * s_do[j];
-            }
-            atomicAdd(&gq_out[i], scale * dqi);
-        }
-        __syncthreads();
-
-        const int64_t target_slot = n_tokens - 1 - t;
-        if (target_slot < K) {
-            const float * d_snap = grad_state_base + target_slot * state_size_per_snap
-                    + (iv3 * H + iv1) * SS;
-            for (int64_t n = tid; n < SS; n += nthr) {
-                dS[n] += d_snap[n];
-            }
-            __syncthreads();
-        }
-
-        // step 3 backward: S_new = S1 + outer(k, delta)
-        for (int64_t n = tid; n < SS; n += nthr) {
-            dS1[n] = dS[n];
-        }
-        gdn_col_dot(dS, s_k, s_ddelta, S_v);
-        float * gk_out = g_k + S_v * (ik1 + nek1 * (t + n_tokens * ik3));
-        for (int64_t i = tid; i < S_v; i += nthr) {
-            float dki = 0.0f;
-            for (int64_t j = 0; j < S_v; ++j) {
-                dki += dS[i + j*S_v] * s_delta[j];
-            }
-            atomicAdd(&gk_out[i], dki);
-        }
-        __syncthreads();
-
-        // step 2 backward: delta[j] = beta*(v[j] - pre[j])
-        float dbeta_partial = 0.0f;
-        for (int64_t j = tid; j < S_v; j += nthr) {
-            const float dd = s_ddelta[j];
-            s_dpre[j] = -dd * beta_val;
-            dbeta_partial += dd * (s_v[j] - s_pre[j]);
-            g_v[j + S_v * (iv1 + H * (t + n_tokens * iv3))] += dd * beta_val;
-        }
-        const float dbeta_t = gdn_block_reduce_sum(dbeta_partial, s_red);
-        if (tid == 0) {
-            g_beta[iv1 + H * (t + n_tokens * iv3)] += dbeta_t;
-        }
-        __syncthreads();
-
-        for (int64_t n = tid, i = i0, j = j0; n < SS; n += nthr) {
-            dS1[n] += s_dpre[j] * s_k[i];
-            i += i_step;
-            j += j_step;
-            if (i >= S_v) { i -= S_v; ++j; }
-        }
-        __syncthreads();
-
-        for (int64_t i = tid; i < S_v; i += nthr) {
-            float dki2 = 0.0f;
-            for (int64_t j = 0; j < S_v; ++j) {
-                dki2 += s_dpre[j] * S1[i + j*S_v];
-            }
-            atomicAdd(&gk_out[i], dki2);
-        }
-        __syncthreads();
-
-        // step 1 backward: S1[i,j] = S_prev[i,j] * gexp[i]
-        if (kda) {
-            float * gg_out = g_g + S_v * (iv1 + H * (t + n_tokens * iv3));
-            for (int64_t i = tid; i < S_v; i += nthr) {
-                const float ge = s_gexp[i];
-                float dgexp_i = 0.0f;
-                for (int64_t j = 0; j < S_v; ++j) {
-                    const int64_t idx = i + j*S_v;
-                    dgexp_i += dS1[idx] * S_prev[idx];
-                    dS[idx]  = dS1[idx] * ge;
-                }
-                gg_out[i] += dgexp_i * ge;
-            }
-        } else {
-            const float ge = s_gexp[0];
-            float dgexp_partial = 0.0f;
-            for (int64_t n = tid; n < SS; n += nthr) {
-                dgexp_partial += dS1[n] * S_prev[n];
-                dS[n] = dS1[n] * ge;
-            }
-            const float dgexp_sum = gdn_block_reduce_sum(dgexp_partial, s_red);
-            if (tid == 0) {
-                g_g[iv1 + H * (t + n_tokens * iv3)] += dgexp_sum * ge;
-            }
-        }
-        __syncthreads();
-    }
-
-    float * gs_out = g_state + iv3 * state_seq_stride + iv1 * SS;
-    for (int64_t n = tid; n < SS; n += nthr) {
-        gs_out[n] += dS[n];
-    }
-}
-
-// ===========================================================================
-// Chunkwise backward -- docs/optims/OPTIMS_V4.md part A.
-//
-// The kernel above is correct and 1200x slower than its own forward: it is one
-// block per (head, sequence) walking the tokens one at a time, so every one of
-// n_tokens steps is a chain of block-wide reductions and __syncthreads on
-// ~100 kFLOP of work, on H*n_seqs blocks. Neither compute- nor bandwidth-bound;
-// a latency chain. It measured 88% of all GPU time on Qwen3.5-0.8B.
-//
-// This path changes the algorithm instead of the mapping. Over a chunk of C
-// tokens the recurrence closes in six matrix products and one unit-triangular
-// solve (derivation, notation and adjoints: see the long comment on
-// ggml_compute_forward_gated_delta_net_back_chunked_f32 in ggml-cpu/ops.cpp --
-// that CPU function is this code's oracle, and tests/gated_delta_net_chunked.rs
-// validates the two against the sequential scan). What is left sequential is
-// chunk to chunk, i.e. n_tokens/C steps, and every step is a batched GEMM over
-// all H*n_seqs units at once. The per-token state trajectory disappears with
-// it: only one entry state per chunk stays live, which is the 1.00 GiB of
-// scratch this op used to hold divided by C.
-//
-// Two things are host-side decisions rather than kernel ones:
-//
-//   * The chunk layout is uniform across units, so every batched GEMM has one
-//     shape and one stride. K > 1 injects a state gradient at the last K tokens,
-//     so those become chunks of one token.
-//   * The decay normalisation khat = k/A overflows F32 over a long run of
-//     strongly negative gates, so the layout is also bounded by the gates:
-//     k_gdn_gate_worst reduces g to one number per token -- the largest |g| over
-//     every unit and channel -- and the host then walks that array greedily,
-//     closing a chunk before the running sum passes GDN_CHUNK_LOG_LIMIT
-//     (|sum g| <= sum |g|, so this is a valid bound on 1/A). One token whose own
-//     gate exceeds even the single-token bound sends the node to the sequential
-//     kernel; nothing in a trained model comes close.
-//
-//     This costs one n_tokens-float copy back per node -- microseconds against
-//     the 101 ms it replaces -- and it matters more than it looks: an earlier
-//     version halved one *global* chunk length until the worst chunk in the
-//     batch fit, and on Qwen3.5-0.8B that collapsed C from 64 to ~2, because a
-//     handful of tokens carry gates two orders of magnitude above the median.
-//     Bounding per token isolates those tokens into short chunks and leaves the
-//     rest long. The CPU reference splits per (unit, chunk) instead, which is
-//     finer still but needs a per-unit layout no batched GEMM can use.
-// ===========================================================================
-
-#define GDN_CHUNK_BLOCK      256
-#define GDN_CHUNK_DEFAULT     64
-#define GDN_CHUNK_MAX        128
-// 60*ln(2): 1/A <= 2^60 inside a chunk of two tokens or more. See the numerics
-// note in ops.cpp. A chunk of one token needs no cross-token ratio, so it only
-// has to keep 1/A itself and the (i)^T products representable: 80*ln(2) leaves
-// ~14 decades of F32 headroom there.
-#define GDN_CHUNK_LOG_LIMIT         41.5888308f
-#define GDN_CHUNK_SINGLE_LOG_LIMIT  55.4518f
-
+// Everything the two formulations share: the geometry of one node, where a
+// (head, sequence) unit's operands and gradients live inside it, and the two
+// per-token steps of the recurrence. The chunkwise path below uses the steps as
+// its numerical fallback, so they are written once here rather than twice.
 struct gdn_geom {
     int64_t S_v, H, n_tokens, n_seqs, units, C;
     int64_t neq1, nek1, rq3, rk3;
@@ -417,7 +98,7 @@ struct gdn_geom {
 
 // Every pointer one unit needs, resolved once: the inputs offset to the unit's
 // token 0 (per-token strides live in gdn_geom) and the six gradient blocks
-// packed in dst. Same index arithmetic as the sequential kernel.
+// packed in dst.
 struct gdn_unit_ptrs {
     const float * q;
     const float * k;
@@ -467,10 +148,406 @@ static __device__ __forceinline__ gdn_unit_ptrs gdn_unit(
     return p;
 }
 
-static __device__ __forceinline__ int64_t gdn_dq_stride (const gdn_geom & G) { return G.S_v*G.neq1; }
-static __device__ __forceinline__ int64_t gdn_dk_stride (const gdn_geom & G) { return G.S_v*G.nek1; }
-static __device__ __forceinline__ int64_t gdn_dv_stride (const gdn_geom & G) { return G.S_v*G.H;    }
-static __device__ __forceinline__ int64_t gdn_dg_stride (const gdn_geom & G) { return G.kda ? G.S_v*G.H : G.H; }
+static __device__ __forceinline__ int64_t gdn_dq_stride   (const gdn_geom & G) { return G.S_v*G.neq1; }
+static __device__ __forceinline__ int64_t gdn_dk_stride   (const gdn_geom & G) { return G.S_v*G.nek1; }
+static __device__ __forceinline__ int64_t gdn_dv_stride   (const gdn_geom & G) { return G.S_v*G.H;    }
+static __device__ __forceinline__ int64_t gdn_dg_stride   (const gdn_geom & G) { return G.kda ? G.S_v*G.H : G.H; }
+static __device__ __forceinline__ int64_t gdn_dbeta_stride(const gdn_geom & G) { return G.H; }
+
+// The unit's slice of the recurrent state tensor, which is laid out per
+// sequence where every working buffer here is laid out per unit.
+static __device__ __forceinline__ int64_t gdn_state_off(const gdn_geom & G, int64_t unit) {
+    return (unit/G.H)*G.state_seq_stride + (unit % G.H)*G.S_v*G.S_v;
+}
+
+// One token's row of the upstream attention-score gradient.
+static __device__ __forceinline__ const float * gdn_dout_row(
+        const gdn_geom & G, int64_t unit, const float * grad_attn, int64_t t) {
+    const int64_t iv1 = unit % G.H;
+    const int64_t iv3 = unit / G.H;
+    return grad_attn + (iv3*G.n_tokens*G.H + t*G.H + iv1)*G.S_v;
+}
+
+// Per-token scratch, one set per block, carved out of the dynamic shared block.
+struct gdn_seq_smem {
+    float * k;
+    float * v;
+    float * q;
+    float * dout;
+    float * gexp;
+    float * pre;
+    float * delta;
+    float * dpre;
+    float * ddelta;
+    float * red;
+};
+
+static __device__ __forceinline__ gdn_seq_smem gdn_seq_smem_bind(float * raw, int64_t S_v) {
+    gdn_seq_smem s;
+    s.k      = raw;
+    s.v      = s.k      + S_v;
+    s.q      = s.v      + S_v;
+    s.dout   = s.q      + S_v;
+    s.gexp   = s.dout   + S_v;
+    s.pre    = s.gexp   + S_v;
+    s.delta  = s.pre    + S_v;
+    s.dpre   = s.delta  + S_v;
+    s.ddelta = s.dpre   + S_v;
+    s.red    = s.ddelta + S_v;
+    return s;
+}
+
+static size_t gdn_seq_smem_bytes(int64_t S_v, int block) {
+    return (9*(size_t) S_v + block/WARP_SIZE)*sizeof(float);
+}
+
+// One token of the forward recurrence, spread over the block:
+//   S1    = Diag(exp(g_t)) S_in
+//   delta = beta_t (v_t - S1^T k_t)
+//   S_out = S1 + outer(k_t, delta)
+// `S_in` and `S_out` may alias. On exit S1, and the gexp/k/v/pre/delta entries
+// of `sm`, hold what the backward step of the same token needs.
+static __device__ void gdn_step_forward_dev(
+        const gdn_geom & G, const gdn_unit_ptrs & p, int64_t t,
+        const float * S_in, float * S1, float * S_out, const gdn_seq_smem & sm) {
+    const int64_t S    = G.S_v;
+    const int64_t SS   = S*S;
+    const int     tid  = threadIdx.x;
+    const int     nthr = blockDim.x;
+
+    // Flat walk of an S_v*S_v matrix keeping (i, j) in step without a modulo
+    // in the inner loop.
+    const int64_t i0     = tid % S;
+    const int64_t j0     = tid / S;
+    const int64_t i_step = nthr % S;
+    const int64_t j_step = nthr / S;
+
+    const float beta_val = p.beta[t*G.sb2];
+
+    for (int64_t i = tid; i < S; i += nthr) {
+        sm.k[i]    = p.k[t*G.sk2 + i];
+        sm.v[i]    = p.v[t*G.sv2 + i];
+        sm.gexp[i] = expf(G.kda ? p.g[t*G.sg2 + i] : p.g[t*G.sg2]);
+    }
+    __syncthreads();
+
+    for (int64_t n = tid, i = i0; n < SS; n += nthr) {
+        S1[n] = S_in[n] * sm.gexp[i];
+        i += i_step;
+        if (i >= S) i -= S;
+    }
+    __syncthreads();
+
+    gdn_col_dot(S1, sm.k, sm.pre, S);
+    __syncthreads();
+
+    for (int64_t j = tid; j < S; j += nthr) {
+        sm.delta[j] = (sm.v[j] - sm.pre[j]) * beta_val;
+    }
+    __syncthreads();
+
+    for (int64_t n = tid, i = i0, j = j0; n < SS; n += nthr) {
+        S_out[n] = S1[n] + sm.k[i] * sm.delta[j];
+        i += i_step;
+        j += j_step;
+        if (i >= S) { i -= S; ++j; }
+    }
+    __syncthreads();
+}
+
+// One token of the reverse scan. `S_prev` is the state before token t; `dS`
+// holds dL/dS_new on entry and dL/dS_prev on exit; S1/Snew/dS1 are S_v*S_v of
+// scratch. `d_snap` is the rollback-snapshot gradient this token's state
+// receives, or null when the caller has already folded it into `dS`.
+static __device__ void gdn_step_back_dev(
+        const gdn_geom & G, const gdn_unit_ptrs & p, int64_t t,
+        const float * grad_attn_row, const float * d_snap,
+        const float * S_prev, float * S1, float * Snew, float * dS1, float * dS,
+        const gdn_seq_smem & sm) {
+    const int64_t S    = G.S_v;
+    const int64_t SS   = S*S;
+    const int     tid  = threadIdx.x;
+    const int     nthr = blockDim.x;
+    const int64_t i0     = tid % S;
+    const int64_t j0     = tid / S;
+    const int64_t i_step = nthr % S;
+    const int64_t j_step = nthr / S;
+
+    // Recompute S1, gexp, pre, delta and S_new for this token.
+    gdn_step_forward_dev(G, p, t, S_prev, S1, Snew, sm);
+
+    const float beta_val = p.beta[t*G.sb2];
+
+    for (int64_t i = tid; i < S; i += nthr) {
+        sm.q[i]    = p.q[t*G.sq2 + i];
+        sm.dout[i] = grad_attn_row[i];
+    }
+    __syncthreads();
+
+    // dS += scale * outer(q, d_out); grad_q = scale * S_new . d_out
+    float * dq_out = p.dq + t*gdn_dq_stride(G);
+    for (int64_t i = tid; i < S; i += nthr) {
+        const float q_i = sm.q[i];
+        float dqi = 0.0f;
+        for (int64_t j = 0; j < S; ++j) {
+            dS[i + j*S] += G.scale * sm.dout[j] * q_i;
+            dqi         += Snew[i + j*S] * sm.dout[j];
+        }
+        atomicAdd(&dq_out[i], G.scale * dqi);
+    }
+    __syncthreads();
+
+    if (d_snap) {
+        for (int64_t n = tid; n < SS; n += nthr) {
+            dS[n] += d_snap[n];
+        }
+        __syncthreads();
+    }
+
+    // step 3 backward: S_new = S1 + outer(k, delta)
+    for (int64_t n = tid; n < SS; n += nthr) {
+        dS1[n] = dS[n];
+    }
+    gdn_col_dot(dS, sm.k, sm.ddelta, S);
+    float * dk_out = p.dk + t*gdn_dk_stride(G);
+    for (int64_t i = tid; i < S; i += nthr) {
+        float dki = 0.0f;
+        for (int64_t j = 0; j < S; ++j) {
+            dki += dS[i + j*S] * sm.delta[j];
+        }
+        atomicAdd(&dk_out[i], dki);
+    }
+    __syncthreads();
+
+    // step 2 backward: delta[j] = beta*(v[j] - pre[j])
+    float dbeta_partial = 0.0f;
+    for (int64_t j = tid; j < S; j += nthr) {
+        const float dd = sm.ddelta[j];
+        sm.dpre[j] = -dd * beta_val;
+        dbeta_partial += dd * (sm.v[j] - sm.pre[j]);
+        p.dv[t*gdn_dv_stride(G) + j] += dd * beta_val;
+    }
+    const float dbeta_t = gdn_block_reduce_sum(dbeta_partial, sm.red);
+    if (tid == 0) {
+        p.dbeta[t*gdn_dbeta_stride(G)] += dbeta_t;
+    }
+    __syncthreads();
+
+    for (int64_t n = tid, i = i0, j = j0; n < SS; n += nthr) {
+        dS1[n] += sm.dpre[j] * sm.k[i];
+        i += i_step;
+        j += j_step;
+        if (i >= S) { i -= S; ++j; }
+    }
+    __syncthreads();
+
+    for (int64_t i = tid; i < S; i += nthr) {
+        float dki2 = 0.0f;
+        for (int64_t j = 0; j < S; ++j) {
+            dki2 += sm.dpre[j] * S1[i + j*S];
+        }
+        atomicAdd(&dk_out[i], dki2);
+    }
+    __syncthreads();
+
+    // step 1 backward: S1[i,j] = S_prev[i,j] * gexp[i]
+    if (G.kda) {
+        float * dg_out = p.dg + t*gdn_dg_stride(G);
+        for (int64_t i = tid; i < S; i += nthr) {
+            const float ge = sm.gexp[i];
+            float dgexp_i = 0.0f;
+            for (int64_t j = 0; j < S; ++j) {
+                const int64_t idx = i + j*S;
+                dgexp_i += dS1[idx] * S_prev[idx];
+                dS[idx]  = dS1[idx] * ge;
+            }
+            dg_out[i] += dgexp_i * ge;
+        }
+    } else {
+        const float ge = sm.gexp[0];
+        float dgexp_partial = 0.0f;
+        for (int64_t n = tid; n < SS; n += nthr) {
+            dgexp_partial += dS1[n] * S_prev[n];
+            dS[n] = dS1[n] * ge;
+        }
+        const float dgexp_sum = gdn_block_reduce_sum(dgexp_partial, sm.red);
+        if (tid == 0) {
+            p.dg[t*gdn_dg_stride(G)] += dgexp_sum * ge;
+        }
+    }
+    __syncthreads();
+}
+
+// The whole-sequence sequential scan: one block per (head, sequence) unit
+// recomputes the S_prev trajectory forward, then reverse-scans it. Kept as the
+// reference the chunkwise path is checked against, and as what runs when the
+// chunkwise path is switched off or does not apply.
+static __global__ __launch_bounds__(GDN_BACK_BLOCK) void gated_delta_net_back_kernel(
+        const gdn_geom G,
+        const float * __restrict__ q, const float * __restrict__ k, const float * __restrict__ v,
+        const float * __restrict__ g, const float * __restrict__ beta,
+        const float * __restrict__ state0, const float * __restrict__ grad,
+        float * __restrict__ dst,
+        float * __restrict__ scratch, const int64_t scratch_stride) {
+    const int64_t unit = blockIdx.x;
+    if (unit >= G.units) {
+        return;
+    }
+    const int     tid  = threadIdx.x;
+    const int     nthr = blockDim.x;
+    const int64_t S    = G.S_v;
+    const int64_t SS   = S*S;
+
+    const gdn_unit_ptrs p = gdn_unit(G, unit, q, k, v, g, beta, dst);
+
+    const float * grad_attn  = grad;
+    const float * grad_state = grad + S*G.H*G.n_tokens*G.n_seqs;
+    const int64_t state_size_per_snap = SS*G.units;
+
+    float * base = scratch + unit * scratch_stride;
+    float * traj = base;                        // n_tokens*S_v*S_v : S_prev per token
+    float * S1   = traj + G.n_tokens * SS;      // S_v*S_v
+    float * Snew = S1 + SS;                     // S_v*S_v
+    float * dS   = Snew + SS;                   // S_v*S_v
+    float * dS1  = dS + SS;                     // S_v*S_v
+
+    extern __shared__ float smem[];
+    const gdn_seq_smem sm = gdn_seq_smem_bind(smem, S);
+
+    const float * s0 = state0 + gdn_state_off(G, unit);
+    for (int64_t n = tid; n < SS; n += nthr) {
+        traj[n] = s0[n];
+    }
+    __syncthreads();
+
+    for (int64_t t = 0; t < G.n_tokens - 1; ++t) {
+        gdn_step_forward_dev(G, p, t, traj + t*SS, S1, traj + (t + 1)*SS, sm);
+    }
+
+    for (int64_t n = tid; n < SS; n += nthr) {
+        dS[n] = 0.0f;
+    }
+    __syncthreads();
+
+    for (int64_t t = G.n_tokens - 1; t >= 0; --t) {
+        const int64_t slot = G.n_tokens - 1 - t;
+        const float * d_snap = slot < G.K
+                ? grad_state + slot*state_size_per_snap + unit*SS
+                : nullptr;
+        gdn_step_back_dev(G, p, t, gdn_dout_row(G, unit, grad_attn, t), d_snap,
+                          traj + t*SS, S1, Snew, dS1, dS, sm);
+    }
+
+    float * g_state = dst + G.n_q + G.n_k + G.n_v + G.n_g + G.n_beta;
+    float * gs_out  = g_state + gdn_state_off(G, unit);
+    for (int64_t n = tid; n < SS; n += nthr) {
+        gs_out[n] += dS[n];
+    }
+}
+
+// ===========================================================================
+// Chunkwise backward -- docs/optims/OPTIMS_V4.md part A.
+//
+// The kernel above is correct and 1200x slower than its own forward: it is one
+// block per (head, sequence) walking the tokens one at a time, so every one of
+// n_tokens steps is a chain of block-wide reductions and __syncthreads on
+// ~100 kFLOP of work, on H*n_seqs blocks. Neither compute- nor bandwidth-bound;
+// a latency chain. It measured 88% of all GPU time on Qwen3.5-0.8B.
+//
+// This path changes the algorithm instead of the mapping. Over a chunk of C
+// tokens the recurrence closes in six matrix products and one unit-triangular
+// solve (derivation, notation and adjoints: see the long comment on
+// ggml_compute_forward_gated_delta_net_back_chunked_f32 in ggml-cpu/ops.cpp --
+// that CPU function is this code's oracle, and tests/gated_delta_net_chunked.rs
+// validates the two against the sequential scan). What is left sequential is
+// chunk to chunk, i.e. n_tokens/C steps, and every step is a batched GEMM over
+// all H*n_seqs units at once. The per-token state trajectory disappears with
+// it: only one entry state per chunk stays live, which is the 1.00 GiB of
+// scratch this op used to hold divided by C.
+//
+// Two things are host-side decisions rather than kernel ones:
+//
+//   * The chunk layout is uniform across units, so every batched GEMM has one
+//     shape and one stride. K > 1 injects a state gradient at the last K tokens,
+//     so those become chunks of one token.
+//   * The decay normalisation khat = k/A overflows F32 over a long run of
+//     strongly negative gates, so the layout is also bounded by the gates:
+//     k_gdn_gate_worst reduces g to one number per token -- the largest |g| over
+//     every unit and channel -- and the host then walks that array greedily,
+//     closing a chunk before the running sum passes GDN_CHUNK_LOG_LIMIT
+//     (|sum g| <= sum |g|, so this is a valid bound on 1/A). One token whose own
+//     gate exceeds even the single-token bound sends the node to the sequential
+//     kernel; nothing in a trained model comes close.
+//
+//     This costs one n_tokens-float copy back per node -- microseconds against
+//     the 101 ms it replaces -- and it matters more than it looks: an earlier
+//     version halved one *global* chunk length until the worst chunk in the
+//     batch fit, and on Qwen3.5-0.8B that collapsed C from 64 to ~2, because a
+//     handful of tokens carry gates two orders of magnitude above the median.
+//     Bounding per token isolates those tokens into short chunks and leaves the
+//     rest long. The CPU reference splits per (unit, chunk) instead, which is
+//     finer still but needs a per-unit layout no batched GEMM can use.
+//
+//     The device-to-host copy that this implies drags a cudaStreamSynchronize
+//     into the middle of the graph, once per GDN node. That looked like the
+//     obvious thing to remove -- Vulkan does not pay it, because its layout
+//     depends only on (T, C, K) and each workgroup checks its own gates on the
+//     GPU (see gated_delta_net_back_chunked.comp). Porting that here was tried
+//     and reverted, and the reason is worth keeping: with a batched GEMM the
+//     device-side check cannot *shorten* a chunk, only push the whole
+//     (chunk, unit) pair onto a per-token fallback, and on this model the gates
+//     put 1 to 43 pairs out of 256 over the bound on a typical node. A token
+//     step here costs ~0.8 ms, so a fallback chunk costs seconds and the node
+//     regresses by ~50x. The layout has to adapt to the gates, and adapting it
+//     is what needs the gates on the host. See docs/optims/OPTIMS_V4.md A.9.
+// ===========================================================================
+
+#define GDN_CHUNK_BLOCK      256
+#define GDN_CHUNK_DEFAULT     64
+#define GDN_CHUNK_MAX        128
+// 60*ln(2): 1/A <= 2^60 inside a chunk of two tokens or more. See the numerics
+// note in ops.cpp. A chunk of one token needs no cross-token ratio, so it only
+// has to keep 1/A itself and the (i)^T products representable: 80*ln(2) leaves
+// ~14 decades of F32 headroom there.
+#define GDN_CHUNK_LOG_LIMIT         41.5888308f
+#define GDN_CHUNK_SINGLE_LOG_LIMIT  55.4518f
+
+// The chunk layout, uniform across units. Three things bound a chunk: the
+// requested length C; a state snapshot, whose gradient is injected at the
+// chunk's *last* token, so with K > 1 the last K tokens are chunks of one; and
+// the gates, through the running sum of `worst` (see the block comment). Returns
+// empty when one token's own gate is past the single-token bound, i.e. no layout
+// is safe and the caller must run the sequential kernel.
+static std::vector<int64_t> gdn_chunk_layout(int64_t n_tokens, int64_t C, int64_t K,
+                                             const float * worst) {
+    std::vector<int64_t> starts;
+    for (int64_t t = 0; t < n_tokens; ) {
+        int64_t limit = MIN(C, n_tokens - t);
+        if (K > 1) {
+            const int64_t first_snap = MAX(t, n_tokens - K);
+            if (first_snap < t + limit - 1) {
+                limit = first_snap - t + 1;
+            }
+        }
+        float   sum = 0.0f;
+        int64_t L   = 0;
+        while (L < limit) {
+            const float w = worst[t + L];
+            if (L > 0 && sum + w > GDN_CHUNK_LOG_LIMIT) {
+                break;
+            }
+            sum += w;
+            ++L;
+        }
+        if (L == 1 && worst[t] > GDN_CHUNK_SINGLE_LOG_LIMIT) {
+            return {};
+        }
+        starts.push_back(t);
+        t += L;
+    }
+    starts.push_back(n_tokens);
+    return starts;
+}
 
 // g reduced to one number per token: the largest |g| over every unit and gate
 // channel. That is all the host needs to bound 1/A over any candidate chunk
@@ -487,10 +564,8 @@ static __global__ void k_gdn_gate_worst(const gdn_geom G, const float * __restri
     }
     const int64_t t   = n / nch;
     const int64_t ch  = n - t*nch;
-    const int64_t iv1 = unit % G.H;
-    const int64_t iv3 = unit / G.H;
-    const float   gv  = g[iv3*G.sg3 + iv1*G.sg1 + t*G.sg2 + ch];
-    atomicMax((int *) &worst[t], __float_as_int(fabsf(gv)));
+    const gdn_unit_ptrs p = gdn_unit(G, unit, nullptr, nullptr, nullptr, g, nullptr, nullptr);
+    atomicMax((int *) &worst[t], __float_as_int(fabsf(p.g[t*G.sg2 + ch])));
 }
 
 // A (cumulative decay relative to the chunk start), qtil = q*A, ktil = k*A,
@@ -649,7 +724,7 @@ static __global__ __launch_bounds__(GDN_CHUNK_BLOCK) void k_gdn_dvz(
     __shared__ float red[GDN_CHUNK_BLOCK/WARP_SIZE];
     const float total = gdn_block_reduce_sum(partial, red);
     if (threadIdx.x == 0) {
-        p.dbeta[(t0 + r)*G.H] += total;
+        p.dbeta[(t0 + r)*gdn_dbeta_stride(G)] += total;
     }
 }
 
@@ -678,7 +753,7 @@ static __global__ __launch_bounds__(GDN_CHUNK_BLOCK) void k_gdn_dt(
     __shared__ float red[GDN_CHUNK_BLOCK/WARP_SIZE];
     const float total = gdn_block_reduce_sum(partial, red);
     if (threadIdx.x == 0) {
-        p.dbeta[(t0 + r)*G.H] += total;
+        p.dbeta[(t0 + r)*gdn_dbeta_stride(G)] += total;
     }
 }
 
@@ -792,9 +867,7 @@ static __global__ void k_gdn_state_grad_out(const gdn_geom G,
     if (n >= SS) {
         return;
     }
-    const int64_t iv1 = unit % G.H;
-    const int64_t iv3 = unit / G.H;
-    g_state[iv3*G.state_seq_stride + iv1*SS + n] += dST[unit*SS + n];
+    g_state[gdn_state_off(G, unit) + n] += dST[unit*SS + n];
 }
 
 // Row-major front end for cublasSgemmStridedBatched: C[m,n] = alpha*op(A)*op(B)
@@ -1029,43 +1102,6 @@ static void gdn_chunk_backward(ggml_backend_cuda_context & ctx, const gdn_geom &
     CUDA_CHECK(cudaGetLastError());
 }
 
-// The chunk layout, uniform across units. Three things bound a chunk: the
-// requested length C; a state snapshot, whose gradient is injected at the
-// chunk's *last* token, so with K > 1 the last K tokens are chunks of one; and
-// the gates, through the running sum of `worst` (see the block comment). Returns
-// empty when one token's own gate is past the single-token bound, i.e. no layout
-// is safe and the caller must run the sequential kernel.
-static std::vector<int64_t> gdn_chunk_layout(int64_t n_tokens, int64_t C, int64_t K,
-                                             const float * worst) {
-    std::vector<int64_t> starts;
-    for (int64_t t = 0; t < n_tokens; ) {
-        int64_t limit = MIN(C, n_tokens - t);
-        if (K > 1) {
-            const int64_t first_snap = MAX(t, n_tokens - K);
-            if (first_snap < t + limit - 1) {
-                limit = first_snap - t + 1;
-            }
-        }
-        float   sum = 0.0f;
-        int64_t L   = 0;
-        while (L < limit) {
-            const float w = worst[t + L];
-            if (L > 0 && sum + w > GDN_CHUNK_LOG_LIMIT) {
-                break;
-            }
-            sum += w;
-            ++L;
-        }
-        if (L == 1 && worst[t] > GDN_CHUNK_SINGLE_LOG_LIMIT) {
-            return {};
-        }
-        starts.push_back(t);
-        t += L;
-    }
-    starts.push_back(n_tokens);
-    return starts;
-}
-
 // Returns false when no chunk length is numerically safe, i.e. the caller must
 // run the sequential kernel.
 static bool ggml_cuda_gated_delta_net_back_chunked(
@@ -1165,15 +1201,14 @@ static bool ggml_cuda_gated_delta_net_back_chunked(
     // set/restore idiom, as out-prod.cu:64.
     CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH));
 
+    const dim3 grid_unit((SS + GDN_CHUNK_BLOCK - 1)/GDN_CHUNK_BLOCK, (unsigned) units);
+
     // Pass 1: forward over chunks, keeping each chunk's entry state. The
     // per-unit state is copied in from the recurrent-state tensor, which is laid
     // out per sequence rather than per unit.
-    {
-        const dim3 grid((SS + GDN_CHUNK_BLOCK - 1)/GDN_CHUNK_BLOCK, (unsigned) units);
-        k_gdn_state_in<<<grid, GDN_CHUNK_BLOCK, 0, stream>>>(
-            G, (const float *) src_state->data, b.entry);
-        CUDA_CHECK(cudaGetLastError());
-    }
+    k_gdn_state_in<<<grid_unit, GDN_CHUNK_BLOCK, 0, stream>>>(
+        G, (const float *) src_state->data, b.entry);
+    CUDA_CHECK(cudaGetLastError());
     for (int64_t c = 0; c < n_chunks; ++c) {
         const int64_t t0 = starts[c];
         const int64_t L  = starts[c + 1] - t0;
@@ -1200,13 +1235,13 @@ static bool ggml_cuda_gated_delta_net_back_chunked(
 
     {
         float * g_state = dst_d + G.n_q + G.n_k + G.n_v + G.n_g + G.n_beta;
-        const dim3 grid((SS + GDN_CHUNK_BLOCK - 1)/GDN_CHUNK_BLOCK, (unsigned) units);
-        k_gdn_state_grad_out<<<grid, GDN_CHUNK_BLOCK, 0, stream>>>(G, b.dST, g_state);
+        k_gdn_state_grad_out<<<grid_unit, GDN_CHUNK_BLOCK, 0, stream>>>(G, b.dST, g_state);
         CUDA_CHECK(cudaGetLastError());
     }
 
     // revert to the standard mode from common.cuh
     CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH));
+
     return true;
 }
 
@@ -1281,64 +1316,55 @@ void ggml_cuda_op_gated_delta_net_back(ggml_backend_cuda_context & ctx, ggml_ten
     float * dst_d = (float *) dst->data;
     CUDA_CHECK(cudaMemsetAsync(dst_d, 0, ggml_nbytes(dst), stream));
 
+    // Geometry, shared by both formulations.
+    gdn_geom G = {};
+    G.S_v      = S_v;
+    G.H        = H;
+    G.n_tokens = n_tokens;
+    G.n_seqs   = n_seqs;
+    G.units    = H*n_seqs;
+    G.C        = 0;                     // set by the chunkwise path
+    G.neq1     = neq1;
+    G.nek1     = nek1;
+    G.rq3      = rq3;
+    G.rk3      = rk3;
+    G.sq1      = nbq1/sizeof(float); G.sq2 = nbq2/sizeof(float); G.sq3 = nbq3/sizeof(float);
+    G.sk1      = nbk1/sizeof(float); G.sk2 = nbk2/sizeof(float); G.sk3 = nbk3/sizeof(float);
+    G.sv1      = nbv1/sizeof(float); G.sv2 = nbv2/sizeof(float); G.sv3 = nbv3/sizeof(float);
+    G.sg1      = nbg1/sizeof(float); G.sg2 = nbg2/sizeof(float); G.sg3 = nbg3/sizeof(float);
+    G.sb1      = nbb1/sizeof(float); G.sb2 = nbb2/sizeof(float); G.sb3 = nbb3/sizeof(float);
+    G.n_q      = n_q;
+    G.n_k      = n_k;
+    G.n_v      = n_v;
+    G.n_g      = n_g;
+    G.n_beta   = n_beta;
+    G.state_seq_stride = state_seq_stride;
+    G.scale    = scale;
+    G.K        = K;
+    G.kda      = kda;
+
     // The chunkwise path (see the block comment above it) if it is selected and
     // applicable, otherwise the sequential kernel below. `S_v > GDN_CHUNK_BLOCK`
     // is a hard limit rather than a heuristic: k_gdn_finalize's reverse
-    // cumulative sum gives one gate channel to one thread for a whole chunk.
+    // cumulative sum gives one gate channel to one thread for a whole chunk, and
+    // so does the fallback's per-token step.
     const int64_t chunk = ggml_cuda_gdn_back_chunk_len(dst);
-    if (chunk > 0 && S_v <= GDN_CHUNK_BLOCK) {
-        gdn_geom G = {};
-        G.S_v      = S_v;
-        G.H        = H;
-        G.n_tokens = n_tokens;
-        G.n_seqs   = n_seqs;
-        G.units    = H*n_seqs;
-        G.C        = 0;   // set once the gate range picks a chunk length
-        G.neq1     = neq1;
-        G.nek1     = nek1;
-        G.rq3      = rq3;
-        G.rk3      = rk3;
-        G.sq1      = nbq1/sizeof(float); G.sq2 = nbq2/sizeof(float); G.sq3 = nbq3/sizeof(float);
-        G.sk1      = nbk1/sizeof(float); G.sk2 = nbk2/sizeof(float); G.sk3 = nbk3/sizeof(float);
-        G.sv1      = nbv1/sizeof(float); G.sv2 = nbv2/sizeof(float); G.sv3 = nbv3/sizeof(float);
-        G.sg1      = nbg1/sizeof(float); G.sg2 = nbg2/sizeof(float); G.sg3 = nbg3/sizeof(float);
-        G.sb1      = nbb1/sizeof(float); G.sb2 = nbb2/sizeof(float); G.sb3 = nbb3/sizeof(float);
-        G.n_q      = n_q;
-        G.n_k      = n_k;
-        G.n_v      = n_v;
-        G.n_g      = n_g;
-        G.n_beta   = n_beta;
-        G.state_seq_stride = state_seq_stride;
-        G.scale    = scale;
-        G.K        = K;
-        G.kda      = kda;
-        if (ggml_cuda_gated_delta_net_back_chunked(ctx, dst, G, chunk)) {
-            return;
-        }
+    if (chunk > 0 && S_v <= GDN_CHUNK_BLOCK &&
+        ggml_cuda_gated_delta_net_back_chunked(ctx, dst, G, chunk)) {
+        return;
     }
 
     // The trajectory dominates; S1/Snew/dS/dS1 are the four working matrices.
-    // pre/delta/gexp/dpre/ddelta moved to shared memory.
-    const int64_t scratch_stride = n_tokens * S_v * S_v + 4 * S_v * S_v;
-    const int64_t n_units = H * n_seqs;
-    ggml_cuda_pool_alloc<float> scratch(ctx.pool(), (size_t) (n_units * scratch_stride));
+    // pre/delta/gexp/dpre/ddelta live in shared memory.
+    const int64_t scratch_stride = n_tokens*S_v*S_v + 4*S_v*S_v;
+    ggml_cuda_pool_alloc<float> scratch(ctx.pool(), (size_t) (G.units * scratch_stride));
 
-    const int block  = GDN_BACK_BLOCK;
-    const int grid   = (int) n_units;
-    const size_t shmem = (9 * (size_t) S_v + block / WARP_SIZE) * sizeof(float);
-    gated_delta_net_back_kernel<<<grid, block, shmem, stream>>>(
+    const size_t shmem = gdn_seq_smem_bytes(S_v, GDN_BACK_BLOCK);
+    gated_delta_net_back_kernel<<<(unsigned) G.units, GDN_BACK_BLOCK, shmem, stream>>>(
+        G,
         (const float *) src_q->data, (const float *) src_k->data, (const float *) src_v->data,
-        (const float *) src_g->data, (const float *) src_beta->data, (const float *) src_state->data,
-        (const float *) src_grad->data, dst_d,
-        scratch.get(), scratch_stride,
-        S_v, H, n_tokens, n_seqs,
-        neq1, nek1, rq3, rk3,
-        nbq1 / sizeof(float), nbq2 / sizeof(float), nbq3 / sizeof(float),
-        nbk1 / sizeof(float), nbk2 / sizeof(float), nbk3 / sizeof(float),
-        nbv1 / sizeof(float), nbv2 / sizeof(float), nbv3 / sizeof(float),
-        nbb1 / sizeof(float), nbb2 / sizeof(float), nbb3 / sizeof(float),
-        kda, scale, K,
-        n_q, n_k, n_v, n_g, n_beta,
-        state_seq_stride);
+        (const float *) src_g->data, (const float *) src_beta->data,
+        (const float *) src_state->data, (const float *) src_grad->data, dst_d,
+        scratch.get(), scratch_stride);
     CUDA_CHECK(cudaGetLastError());
 }

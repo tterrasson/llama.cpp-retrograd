@@ -263,6 +263,12 @@ static bool launch_out_prod_quant_type(ggml_backend_cuda_context & ctx,
 // uncommon geometries retain bounded dequantize+SGEMM as a correctness fallback.
 static bool ggml_cuda_out_prod_quant_native(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // Every loader indexes a src0 row as a tightly packed run of blocks (the
+    // super-block decoders take a block index, the pair decoders derive one from
+    // the element offset). Rows themselves are reached through nb01, so only the
+    // within-row packing has to hold -- the same invariant the dequantize+SGEMM
+    // fallback asserts on the way in.
+    GGML_ASSERT(src0->nb[0] == ggml_type_size(src0->type));
 #define OUT_PROD_NATIVE_CASE(TYPE, BLK, NL, NAME, VKNAME) \
         case TYPE: return launch_out_prod_quant_type<TYPE>(ctx, src0, src1, dst);
     switch (src0->type) {
