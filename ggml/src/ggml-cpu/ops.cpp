@@ -4640,7 +4640,14 @@ static void ggml_compute_forward_out_prod_q_f32(
     //       for i0:
     //         dst[i0,i1,i2,i3] += src0[i0,i01,i2,i3] * src1[i1,i01,i2,i3]
 
-    float * wdata = (float *) params->wdata + (ne0 + CACHE_LINE_SIZE_F32) * ith;
+    // OPTIMS_V4 Q2 (CPU): decode one quantization-aligned tile on the worker
+    // stack and consume it immediately.  The former per-worker buffer scaled as
+    // ne0*nth even though OUT_PROD never needs a whole decoded row alive.
+    // 256 is divisible by every block size admitted by this path.
+    constexpr int64_t q_chunk = 256;
+    alignas(64) float decoded[q_chunk];
+    const int64_t qk = ggml_blck_size(type);
+    GGML_ASSERT(ne0 % qk == 0);
 
     for (int64_t ir = ir0; ir < ir1; ++ir) {
         // dst indices
@@ -4662,8 +4669,13 @@ static void ggml_compute_forward_out_prod_q_f32(
             float * s1 = (float *) ((char *) src1->data + (i1*nb10 + i11*nb11 + i12*nb12 + i13*nb13));
             float * d  = (float *) ((char *)  dst->data + (          i1*nb1 + i2*nb2 + i3*nb3));
 
-            dequantize_row_q(s0, wdata, ne0);
-            ggml_vec_mad_f32(ne0, d, wdata, *s1);
+            for (int64_t i0 = 0; i0 < ne0; i0 += q_chunk) {
+                const int64_t n = MIN(q_chunk, ne0 - i0);
+                GGML_ASSERT(n % qk == 0);
+                const char * q = (const char *) s0 + (i0/qk)*ggml_type_size(type);
+                dequantize_row_q(q, decoded, n);
+                ggml_vec_mad_f32(n, d + i0, decoded, *s1);
+            }
         }
     }
 }
@@ -4707,7 +4719,8 @@ static void ggml_compute_forward_out_prod_f16_f32(
     const int64_t ir0 = dr*ith;
     const int64_t ir1 = MIN(ir0 + dr, nr);
 
-    float * wdata = (float *) params->wdata + (ne0 + CACHE_LINE_SIZE_F32) * ith;
+    constexpr int64_t f16_chunk = 256;
+    alignas(64) float decoded[f16_chunk];
 
     for (int64_t ir = ir0; ir < ir1; ++ir) {
         const int64_t i3 = ir/(ne2*ne1);
@@ -4726,8 +4739,11 @@ static void ggml_compute_forward_out_prod_f16_f32(
             const int64_t i11 = i01;
             ggml_fp16_t * s0 = (ggml_fp16_t *) ((char *) src0->data + (i01*nb01 + i02*nb02 + i03*nb03));
             float * s1 = (float *) ((char *) src1->data + (i1*nb10 + i11*nb11 + i12*nb12 + i13*nb13));
-            ggml_fp16_to_fp32_row(s0, wdata, ne0);
-            ggml_vec_mad_f32(ne0, d, wdata, *s1);
+            for (int64_t i0 = 0; i0 < ne0; i0 += f16_chunk) {
+                const int64_t n = MIN(f16_chunk, ne0 - i0);
+                ggml_fp16_to_fp32_row(s0 + i0, decoded, n);
+                ggml_vec_mad_f32(n, d + i0, decoded, *s1);
+            }
         }
     }
 }

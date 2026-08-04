@@ -2956,10 +2956,9 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_OUT_PROD:
                     {
-                        if (ggml_is_quantized(node->src[0]->type) ||
-                            node->src[0]->type == GGML_TYPE_F16) {
-                            cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
-                        }
+                        // OPTIMS_V4 Q2: quantized/F16 OUT_PROD now decodes a
+                        // fixed 256-value tile on each worker's stack.
+                        cur = 0;
                     } break;
                 case GGML_OP_SET_ROWS:
                     {

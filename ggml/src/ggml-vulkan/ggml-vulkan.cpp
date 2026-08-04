@@ -6386,7 +6386,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // workgroup (see out_prod.comp), so the workgroup denominators must match the
     // tile, not the 256-thread local size.
     ggml_vk_create_pipeline(device, device->pipeline_out_prod_f32, "out_prod_f32", out_prod_f32_len, out_prod_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {64, 16, 1}, {}, 1);
-    // One pipeline per GGML_RETRO_DEQUANT_TYPES entry; supports_op gates on the
+    // One pipeline per GGML_RETRO_OUT_PROD_TYPES entry; supports_op gates on the
     // pipeline being non-null, so this table is the Vulkan answer to "which types
     // can out_prod decode". F16 is the one entry that needs the fp16 guard: for it
     // A_TYPE is float16_t, i.e. 16-bit *storage*, unlike the quant types whose
@@ -6395,7 +6395,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     if (TYPE != GGML_TYPE_F16 || device->fp16) { \
         ggml_vk_create_pipeline(device, device->pipeline_out_prod_quant_f32[TYPE], "out_prod_" #VKNAME "_f32", out_prod_ ## VKNAME ## _f32_len, out_prod_ ## VKNAME ## _f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {64, 16, 1}, {}, 1); \
     }
-    GGML_RETRO_DEQUANT_TYPES(CREATE_OUT_PROD_QUANT)
+    GGML_RETRO_OUT_PROD_TYPES(CREATE_OUT_PROD_QUANT)
 #undef CREATE_OUT_PROD_QUANT
 
     ggml_vk_create_pipeline(device, device->pipeline_snake_f32,  "snake_f32",  snake_f32_len,  snake_f32_data,  "main", 4, sizeof(vk_op_snake_push_constants), {256, 1, 1}, {}, 1);
@@ -20661,7 +20661,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 return true;
             }
             // The pipeline table is the type gate: it is built from
-            // GGML_RETRO_DEQUANT_TYPES, so it cannot disagree with the shaders.
+            // GGML_RETRO_OUT_PROD_TYPES, so it cannot disagree with the shaders.
             return ggml_is_contiguous(op->src[0]) &&
                    device->pipeline_out_prod_quant_f32[op->src[0]->type] != nullptr;
         case GGML_OP_LOG:

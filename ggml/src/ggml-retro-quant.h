@@ -34,16 +34,14 @@
 // dequantize()/get_dm() exist for DATA_A_<upper(VKNAME)> in dequant_funcs.glsl,
 // and real GGUF files use it.
 //
-// Deliberately excluded:
-//   IQ1_S, IQ1_M   1.5-1.75 bpw. The templates would cover them for free, but a
-//                  LoRA over a base that coarse has a questionable gradient
-//                  signal-to-noise ratio, and it is not claimed as supported
-//                  without a parity test that argues otherwise. Two lines to add.
+// Deliberately excluded from this Metal/CE table:
+//   IQ1_S, IQ1_M   1.5-1.75 bpw; now covered and parity-tested by OUT_PROD only.
+//   NVFP4          Blackwell-oriented; now covered by OUT_PROD only.
+//   Q1_0, Q2_0     Very recent; now covered by OUT_PROD only.
+// Deliberately excluded from every table:
 //   BF16           ggml_compute_forward_out_prod hits GGML_ABORT on it, so there
 //                  is no CPU oracle. Needs a CPU path first.
-//   NVFP4          Blackwell-only, essentially no public GGUF.
-//   Q1_0, Q2_0     Very recent, no models in circulation.
-//   TQ1_0, TQ2_0   Same signal-to-noise objection as IQ1, and no dequantize_tq*.
+//   TQ1_0, TQ2_0   CUDA and Vulkan expose no dequantize_tq* primitive to reuse.
 //
 // F32 is not a row: it needs no decoding and both ops give it a cheaper dedicated
 // path. Sites that want it list it explicitly alongside the expansion.
@@ -76,3 +74,21 @@
 // Row count, for the probe ABI and for tests asserting they enumerate the whole
 // table rather than a stale copy of it.
 #define GGML_RETRO_DEQUANT_TYPE_COUNT 19
+
+// OUT_PROD Q2 is also implemented on CPU, CUDA and Vulkan for the rarer formats
+// below.  They are intentionally not folded into GGML_RETRO_DEQUANT_TYPES:
+// that table is shared with Metal and with fused sparse CE, whose support policy
+// is narrower.  Keeping the extension declarative avoids a hand-written type
+// switch in each of the three Q2 backends.
+#define GGML_RETRO_OUT_PROD_EXTRA_TYPES(X)                                             \
+    X(GGML_TYPE_Q1_0,     block_q1_0,          8,                  q1_0,     q1_0)      \
+    X(GGML_TYPE_Q2_0,     block_q2_0,          4,                  q2_0,     q2_0)      \
+    X(GGML_TYPE_IQ1_S,    block_iq1_s,         GGML_RETRO_NL_256,  iq1_s,    iq1_s)     \
+    X(GGML_TYPE_IQ1_M,    block_iq1_m,         GGML_RETRO_NL_256,  iq1_m,    iq1_m)     \
+    X(GGML_TYPE_NVFP4,    block_nvfp4,         4,                  nvfp4,    nvfp4)
+
+#define GGML_RETRO_OUT_PROD_TYPES(X) \
+    GGML_RETRO_DEQUANT_TYPES(X)      \
+    GGML_RETRO_OUT_PROD_EXTRA_TYPES(X)
+
+#define GGML_RETRO_OUT_PROD_TYPE_COUNT 24
