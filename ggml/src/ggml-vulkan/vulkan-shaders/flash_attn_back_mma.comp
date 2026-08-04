@@ -1,0 +1,281 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+
+// F2: one 256-thread workgroup owns a 16x16 query/KV tile. Subgroup zero
+// computes Q.K^T and dO.V^T through 16x16x16 cooperative matrices with F16
+// operands and F32 accumulation; all invocations then perform the nonlinear
+// attention algebra and gradient accumulation in F32.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+const uint TILE = 16u;
+const uint D = 128u;
+
+layout(push_constant) uniform parameter {
+    uint N; uint KV; uint HSK; uint HSV;
+    uint n_head; uint n_head_kv; uint n_batch;
+    uint q_nb1; uint q_nb2; uint q_nb3;
+    uint off_q; uint off_k; uint off_v; uint off_stats;
+    float scale; float max_bias; float logit_softcap;
+    uint mask_ne1; uint mask_ne2; uint mask_ne3;
+    uint flags;
+    uint KV_GRAD; uint kv_stride; uint kv_stream0;
+} p;
+
+layout(binding = 0) readonly buffer Q      { float     q[]; };
+layout(binding = 1) readonly buffer K      { float16_t k[]; };
+layout(binding = 2) readonly buffer V      { float16_t v[]; };
+layout(binding = 3) readonly buffer Mask   { float16_t mask[]; };
+layout(binding = 4) readonly buffer Out    { float     out_data[]; };
+layout(binding = 5) readonly buffer DOut   { float     dout[]; };
+layout(binding = 6) readonly buffer Sinks  { float     sinks[]; };
+layout(binding = 7) buffer Grad            { float     grad[]; };
+layout(binding = 8) readonly buffer KvIdxs { int       kv_idxs[]; };
+
+const uint FLAG_MASK   = 1u;
+const uint FLAG_SINKS  = 2u;
+const uint FLAG_GRAD_Q = 4u;
+const uint FLAG_GRAD_K = 8u;
+const uint FLAG_GRAD_V = 16u;
+const uint FLAG_WINDOW = 32u;
+
+shared float16_t sq[TILE*D];
+shared float16_t sd[TILE*D];
+shared float16_t sk[TILE*D];
+shared float16_t sv[TILE*D];
+shared float qk[TILE*TILE];
+shared float dov[TILE*TILE];
+shared float row_m[TILE];
+shared float row_l[TILE];
+shared float row_delta[TILE];
+
+float alibi_slope(uint head) {
+    if (p.max_bias <= 0.0f) return 1.0f;
+    uint n = 1u << uint(floor(log2(float(p.n_head))));
+    float base = head < n ? pow(2.0f, -p.max_bias/float(n))
+                          : pow(2.0f, -p.max_bias/(2.0f*float(n)));
+    int exponent = head < n ? int(head + 1u) : int(2u*(head - n) + 1u);
+    return pow(base, float(exponent));
+}
+
+float score_value(float dot, uint key, uint row, uint head, uint batch) {
+    float score = p.logit_softcap != 0.0f
+        ? p.logit_softcap*tanh(dot*p.scale/p.logit_softcap) : dot*p.scale;
+    if ((p.flags & FLAG_MASK) != 0u) {
+        uint mh = head % p.mask_ne2;
+        uint mb = batch % p.mask_ne3;
+        uint mi = key + p.KV*(row + p.mask_ne1*(mh + p.mask_ne2*mb));
+        score += alibi_slope(head)*float(mask[mi]);
+    }
+    return score;
+}
+
+float score_derivative(float dot) {
+    if (p.logit_softcap == 0.0f) return p.scale;
+    float t = tanh(dot*p.scale/p.logit_softcap);
+    return p.scale*(1.0f - t*t);
+}
+
+void mma_qk() {
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    for (uint id = 0u; id < D; id += 16u) {
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
+        coopMatLoad(a, sq, id, D, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(b, sk, id, D, gl_CooperativeMatrixLayoutColumnMajor);
+        c = coopMatMulAdd(a, b, c);
+    }
+    coopMatStore(c, qk, 0u, TILE, gl_CooperativeMatrixLayoutRowMajor);
+}
+
+void mma_dov() {
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    for (uint id = 0u; id < D; id += 16u) {
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
+        coopMatLoad(a, sd, id, D, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(b, sv, id, D, gl_CooperativeMatrixLayoutColumnMajor);
+        c = coopMatMulAdd(a, b, c);
+    }
+    coopMatStore(c, dov, 0u, TILE, gl_CooperativeMatrixLayoutRowMajor);
+}
+
+void main_q() {
+    uint lid = gl_LocalInvocationID.x;
+    uint q0 = gl_WorkGroupID.x*TILE;
+    uint head = gl_WorkGroupID.y;
+    uint batch = gl_WorkGroupID.z;
+    uint kv_head = head/(p.n_head/p.n_head_kv);
+    uint k_head_base = (batch*p.n_head_kv + kv_head)*p.KV*D;
+
+    for (uint idx = lid; idx < TILE*D; idx += 256u) {
+        uint qr = idx/D, id = idx % D, row = q0 + qr;
+        if (row < p.N) {
+            uint qb = batch*p.q_nb3 + head*p.q_nb2 + row*p.q_nb1;
+            uint ob = ((batch*p.N + row)*p.n_head + head)*D;
+            sq[idx] = float16_t(q[qb + id]);
+            sd[idx] = float16_t(dout[ob + id]);
+        } else {
+            sq[idx] = float16_t(0.0); sd[idx] = float16_t(0.0);
+        }
+    }
+    if (lid < TILE) {
+        uint row = q0 + lid;
+        float delta = 0.0;
+        if (row < p.N) {
+            uint ob = ((batch*p.N + row)*p.n_head + head)*D;
+            for (uint id = 0u; id < D; ++id) delta += dout[ob + id]*out_data[ob + id];
+        }
+        row_m[lid] = -3.402823466e+38f;
+        row_l[lid] = 0.0;
+        row_delta[lid] = delta;
+    }
+    barrier();
+
+    for (uint kv0 = 0u; kv0 < p.KV; kv0 += TILE) {
+        for (uint idx = lid; idx < TILE*D; idx += 256u) {
+            uint kr = idx/D, id = idx % D, key = kv0 + kr;
+            sk[idx] = key < p.KV ? k[k_head_base + key*D + id] : float16_t(0.0);
+        }
+        barrier();
+        if (lid < 32u) mma_qk();
+        barrier();
+        if (lid < TILE && q0 + lid < p.N) {
+            float m = row_m[lid], l = row_l[lid];
+            for (uint kr = 0u; kr < TILE && kv0 + kr < p.KV; ++kr) {
+                float s = score_value(qk[lid*TILE + kr], kv0 + kr, q0 + lid, head, batch);
+                if (isinf(s) && s < 0.0) continue;
+                float mn = max(m, s);
+                l = l*exp(m - mn) + exp(s - mn); m = mn;
+            }
+            row_m[lid] = m; row_l[lid] = l;
+        }
+        barrier();
+    }
+    if (lid < TILE && q0 + lid < p.N) {
+        uint si = (batch*p.n_head + head)*p.N + q0 + lid;
+        float l = row_l[lid], m = row_m[lid];
+        if ((p.flags & FLAG_SINKS) != 0u) {
+            float s = sinks[head], mn = max(m, s);
+            l = l*exp(m - mn) + exp(s - mn); m = mn;
+            row_l[lid] = l; row_m[lid] = m;
+        }
+        grad[p.off_stats + si] = m + log(l);
+        grad[p.off_stats + p.N*p.n_head*p.n_batch + si] = row_delta[lid];
+    }
+    barrier();
+    if ((p.flags & FLAG_GRAD_Q) == 0u) return;
+
+    float dq[8];
+    for (uint i = 0u; i < 8u; ++i) dq[i] = 0.0;
+    for (uint kv0 = 0u; kv0 < p.KV; kv0 += TILE) {
+        for (uint idx = lid; idx < TILE*D; idx += 256u) {
+            uint kr = idx/D, id = idx % D, key = kv0 + kr;
+            if (key < p.KV) {
+                sk[idx] = k[k_head_base + key*D + id];
+                sv[idx] = v[k_head_base + key*D + id];
+            } else { sk[idx] = float16_t(0.0); sv[idx] = float16_t(0.0); }
+        }
+        barrier();
+        if (lid < 32u) { mma_qk(); mma_dov(); }
+        barrier();
+        for (uint oi = 0u; oi < 8u; ++oi) {
+            uint idx = lid + oi*256u, qr = idx/D, id = idx % D, row = q0 + qr;
+            if (row >= p.N) continue;
+            for (uint kr = 0u; kr < TILE && kv0 + kr < p.KV; ++kr) {
+                float dot = qk[qr*TILE + kr];
+                float s = score_value(dot, kv0 + kr, row, head, batch);
+                if (isinf(s) && s < 0.0) continue;
+                float prob = exp(s - row_m[qr])/row_l[qr];
+                float ds0 = prob*(dov[qr*TILE + kr] - row_delta[qr])*score_derivative(dot);
+                dq[oi] += ds0*float(sk[kr*D + id]);
+            }
+        }
+        barrier();
+    }
+    for (uint oi = 0u; oi < 8u; ++oi) {
+        uint idx = lid + oi*256u, qr = idx/D, id = idx % D, row = q0 + qr;
+        if (row < p.N) grad[p.off_q + ((batch*p.n_head + head)*p.N + row)*D + id] = dq[oi];
+    }
+}
+
+void main_kv() {
+    uint lid = gl_LocalInvocationID.x;
+    uint j0 = gl_WorkGroupID.x*TILE;
+    uint kv_head = gl_WorkGroupID.y;
+    uint batch = gl_WorkGroupID.z;
+    for (uint idx = lid; idx < TILE*D; idx += 256u) {
+        uint kr = idx/D, id = idx % D, j = j0 + kr;
+        int key_i = int(j);
+        if (j < p.KV_GRAD && (p.flags & FLAG_WINDOW) != 0u)
+            key_i = kv_idxs[batch*p.KV_GRAD + j] - int(p.kv_stride*(p.kv_stream0 + batch));
+        bool valid = j < p.KV_GRAD && key_i >= 0 && uint(key_i) < p.KV;
+        uint key = valid ? uint(key_i) : 0u;
+        uint base = ((batch*p.n_head_kv + kv_head)*p.KV + key)*D;
+        sk[idx] = valid ? k[base + id] : float16_t(0.0);
+        sv[idx] = valid ? v[base + id] : float16_t(0.0);
+    }
+    barrier();
+    float dk[8], dv[8];
+    for (uint i = 0u; i < 8u; ++i) { dk[i] = 0.0; dv[i] = 0.0; }
+    uint ratio = p.n_head/p.n_head_kv;
+    uint nstats = p.N*p.n_head*p.n_batch;
+    for (uint rh = 0u; rh < ratio; ++rh) {
+        uint head = kv_head*ratio + rh;
+        for (uint q0 = 0u; q0 < p.N; q0 += TILE) {
+            for (uint idx = lid; idx < TILE*D; idx += 256u) {
+                uint qr = idx/D, id = idx % D, row = q0 + qr;
+                if (row < p.N) {
+                    uint qb = batch*p.q_nb3 + head*p.q_nb2 + row*p.q_nb1;
+                    uint ob = ((batch*p.N + row)*p.n_head + head)*D;
+                    sq[idx] = float16_t(q[qb + id]); sd[idx] = float16_t(dout[ob + id]);
+                } else { sq[idx] = float16_t(0.0); sd[idx] = float16_t(0.0); }
+            }
+            barrier();
+            if (lid < 32u) { mma_qk(); mma_dov(); }
+            barrier();
+            for (uint oi = 0u; oi < 8u; ++oi) {
+                uint idx = lid + oi*256u, kr = idx/D, id = idx % D, j = j0 + kr;
+                if (j >= p.KV_GRAD) continue;
+                int key_i = int(j);
+                if ((p.flags & FLAG_WINDOW) != 0u)
+                    key_i = kv_idxs[batch*p.KV_GRAD + j] - int(p.kv_stride*(p.kv_stream0 + batch));
+                if (key_i < 0 || uint(key_i) >= p.KV) continue;
+                uint key = uint(key_i);
+                for (uint qr = 0u; qr < TILE && q0 + qr < p.N; ++qr) {
+                    uint row = q0 + qr;
+                    float dot = qk[qr*TILE + kr];
+                    float s = score_value(dot, key, row, head, batch);
+                    uint si = (batch*p.n_head + head)*p.N + row;
+                    float prob = (isinf(s) && s < 0.0) ? 0.0 : exp(s - grad[p.off_stats + si]);
+                    float ds0 = prob*(dov[qr*TILE + kr] - grad[p.off_stats + nstats + si])*
+                                score_derivative(dot);
+                    dk[oi] += ds0*float(sq[qr*D + id]);
+                    dv[oi] += prob*float(sd[qr*D + id]);
+                }
+            }
+            barrier();
+        }
+    }
+    for (uint oi = 0u; oi < 8u; ++oi) {
+        uint idx = lid + oi*256u, kr = idx/D, id = idx % D, j = j0 + kr;
+        if (j < p.KV_GRAD) {
+            uint base = ((batch*p.n_head_kv + kv_head)*p.KV_GRAD + j)*D + id;
+            if ((p.flags & FLAG_GRAD_K) != 0u) grad[p.off_k + base] = dk[oi];
+            if ((p.flags & FLAG_GRAD_V) != 0u) grad[p.off_v + base] = dv[oi];
+        }
+    }
+}
+
+void main() {
+#ifdef FA_BACK_KV_PASS
+    main_kv();
+#else
+    main_q();
+#endif
+}

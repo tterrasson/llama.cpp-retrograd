@@ -2032,10 +2032,9 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_FLASH_ATTN_BACK:
             {
-                int32_t t = ggml_get_op_params_i32(tensor, 0);
-                GGML_ASSERT(t == 0 || t == 1);
-                bool masked = t != 0;
-                ggml_compute_forward_flash_attn_back(params, masked, tensor);
+                // The extended op stores scale/max_bias/softcap in the first
+                // three parameter slots; mask presence is represented by src[3].
+                ggml_compute_forward_flash_attn_back(params, tensor->src[3] != NULL, tensor);
             } break;
         case GGML_OP_SSM_CONV:
             {
@@ -3046,19 +3045,10 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_FLASH_ATTN_BACK:
                     {
-                        const int64_t    D = node->src[0]->ne[0];
-                        const int64_t ne11 = ggml_up(node->src[1]->ne[1], GGML_SOFT_MAX_UNROLL);
-                        const int64_t mxDn = MAX(D, ne11) * 2; // *2 because of S and SM in ggml_compute_forward_flash_attn_back
-                        if (node->src[1]->type == GGML_TYPE_F32) {
-                            cur  = sizeof(float)*mxDn*n_tasks; // TODO: this can become (n_tasks-1)
-                            cur += sizeof(float)*mxDn*n_tasks; // this is overestimated by x2
-                        } else if (node->src[1]->type == GGML_TYPE_F16) {
-                            cur  = sizeof(float)*mxDn*n_tasks; // TODO: this can become (n_tasks-1)
-                            cur += sizeof(float)*mxDn*n_tasks; // this is overestimated by x2
-                        } else if (node->src[1]->type == GGML_TYPE_BF16) {
-                            cur  = sizeof(float)*mxDn*n_tasks; // TODO: this can become (n_tasks-1)
-                            cur += sizeof(float)*mxDn*n_tasks; // this is overestimated by x2
-                        }
+                        // The extended streaming implementation keeps only
+                        // scalar row statistics and head-dimension accumulators
+                        // in ordinary stack storage; the legacy O(n_kv) S/SM
+                        // work buffer is no longer used.
                     } break;
 
                 case GGML_OP_CROSS_ENTROPY_LOSS:

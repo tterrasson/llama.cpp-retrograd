@@ -441,11 +441,16 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
 
     switch (op->op) {
         case GGML_OP_FLASH_ATTN_BACK:
-            // FLASH_ATTN_BACK now implements the extended streaming contract
-            // (Q F32, K/V F16, mask/out/dO sources). Its differentiable kernel
-            // is Vulkan-only; CPU contexts keep Flash Attention disabled and
-            // therefore never construct this op.
-            return false;
+            // Native extended streaming backward (OPTIMS_V4 B): F32 Q/O/dO,
+            // F16 or F32 K/V, optional F16 mask and F32 attention sinks.
+            return src0 && src1 && op->src[2] && op->src[4] && op->src[5] &&
+                src0->type == GGML_TYPE_F32 &&
+                src1->type == op->src[2]->type &&
+                (src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_F32) &&
+                op->src[4]->type == GGML_TYPE_F32 && op->src[5]->type == GGML_TYPE_F32 &&
+                (!op->src[3] || op->src[3]->type == GGML_TYPE_F16) &&
+                (!op->src[6] || op->src[6]->type == GGML_TYPE_F32) &&
+                (!op->src[9] || (op->src[9]->type == GGML_TYPE_I32 && ggml_is_contiguous(op->src[9])));
         case GGML_OP_CPY:
         case GGML_OP_SET_ROWS:
             return

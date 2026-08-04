@@ -1236,6 +1236,8 @@ struct vk_device_struct {
     std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16;
     vk_pipeline pipeline_flash_attn_back_q[FA_BACK_KV_TYPES][FA_BACK_BUCKETS];
     vk_pipeline pipeline_flash_attn_back_kv[FA_BACK_KV_TYPES][FA_BACK_BUCKETS];
+    vk_pipeline pipeline_flash_attn_back_mma_q;
+    vk_pipeline pipeline_flash_attn_back_mma_kv;
 
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
 
@@ -5951,6 +5953,17 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         CREATE_FA_BACK_PIPELINES(FA_BACK_KV_F32, f32, FA_BACK_BUCKET_512, 512);
     }
 #undef CREATE_FA_BACK_PIPELINES
+
+    if (device->fa_back_subgroup32 && device->coopmat_support_16x16x16_f32acc) {
+        ggml_vk_create_pipeline(device, device->pipeline_flash_attn_back_mma_q,
+                "flash_attn_back_mma_q_f32_f16_d128_cm1", flash_attn_back_mma_q_f32_f16_d128_cm1_len,
+                flash_attn_back_mma_q_f32_f16_d128_cm1_data, "main", 9,
+                sizeof(vk_flash_attn_back_push_constants), {256, 1, 1}, {}, 1, true, true, 32);
+        ggml_vk_create_pipeline(device, device->pipeline_flash_attn_back_mma_kv,
+                "flash_attn_back_mma_kv_f32_f16_d128_cm1", flash_attn_back_mma_kv_f32_f16_d128_cm1_len,
+                flash_attn_back_mma_kv_f32_f16_d128_cm1_data, "main", 9,
+                sizeof(vk_flash_attn_back_push_constants), {256, 1, 1}, {}, 1, true, true, 32);
+    }
 
     for (auto &it : device->pipeline_fa_mask_opt) {
         auto BrBc = it.first;
@@ -11981,21 +11994,39 @@ static void ggml_vk_flash_attn_back(
     const vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
     const vk_subbuffer idxs_buf  = kv_idxs ? ggml_vk_tensor_subbuffer(ctx, kv_idxs) : q_buf;
 
-    ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_back_q[kv_variant][bucket], 1);
-    ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_back_kv[kv_variant][bucket], 1);
+    const char * mma_env = getenv("GGML_VK_FA_BACK_MMA");
+    const bool mma_enabled = mma_env == nullptr || std::atoi(mma_env) != 0;
+    const bool use_mma = mma_enabled && k->type == GGML_TYPE_F16 &&
+        q->ne[0] == 128 && v->ne[0] == 128 &&
+        ctx->device->coopmat_support_16x16x16_f32acc &&
+        ctx->device->pipeline_flash_attn_back_mma_q &&
+        ctx->device->pipeline_flash_attn_back_mma_kv;
+    vk_pipeline pipeline_q = use_mma
+        ? ctx->device->pipeline_flash_attn_back_mma_q
+        : ctx->device->pipeline_flash_attn_back_q[kv_variant][bucket];
+    vk_pipeline pipeline_kv = use_mma
+        ? ctx->device->pipeline_flash_attn_back_mma_kv
+        : ctx->device->pipeline_flash_attn_back_kv[kv_variant][bucket];
 
-    ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_back_q[kv_variant][bucket],
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline_q, 1);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline_kv, 1);
+
+    const uint32_t q_dispatch = use_mma
+        ? ((uint32_t) q->ne[1] + 15u)/16u*256u
+        : (uint32_t) q->ne[1]*32u;
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_q,
             { q_buf, k_buf, v_buf, mask_buf, out_buf, dout_buf, sinks_buf, dst_buf, idxs_buf },
-            pc, { (uint32_t) q->ne[1] * 32u, (uint32_t) q->ne[2], (uint32_t) q->ne[3] });
+            pc, { q_dispatch, (uint32_t) q->ne[2], (uint32_t) q->ne[3] });
 
     // The dK/dV pass consumes the per-query LSE and delta written by the dQ
     // pass. Keep both dispatches on device and insert the normal Vulkan buffer
     // dependency used by the other multi-pass training kernels.
     if (grad_mask & (GGML_FLASH_ATTN_BACK_GRAD_K | GGML_FLASH_ATTN_BACK_GRAD_V)) {
         ggml_vk_sync_buffers(ctx, subctx);
-        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_back_kv[kv_variant][bucket],
+        const uint32_t kv_dispatch = use_mma ? (n_kv_grad + 15u)/16u*256u : n_kv_grad*32u;
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_kv,
                 { q_buf, k_buf, v_buf, mask_buf, out_buf, dout_buf, sinks_buf, dst_buf, idxs_buf },
-                pc, { n_kv_grad * 32u, (uint32_t) k->ne[2], (uint32_t) k->ne[3] });
+                pc, { kv_dispatch, (uint32_t) k->ne[2], (uint32_t) k->ne[3] });
     }
 }
 

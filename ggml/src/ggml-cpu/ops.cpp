@@ -9454,7 +9454,7 @@ void ggml_compute_forward_flash_attn_ext(
 
 // ggml_compute_forward_flash_attn_back
 
-static void ggml_compute_forward_flash_attn_back_f32(
+static void ggml_compute_forward_flash_attn_back_f32_legacy(
         const ggml_compute_params * params,
         const bool masked,
               ggml_tensor * dst) {
@@ -9769,23 +9769,219 @@ static void ggml_compute_forward_flash_attn_back_f32(
     }
 }
 
+// retro delta: native CPU implementation of the extended, streaming
+// FLASH_ATTN_BACK contract used by CUDA/Vulkan. Work is owned by
+// (batch, KV-head), so dK/dV never need atomics and repeated executions have a
+// fixed reduction order. Like the GPU F1 compatibility path, it reuses O from
+// the forward pass for D = dot(dO, O) and recomputes only the row LSE.
+static void ggml_compute_forward_flash_attn_back_ext_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * q       = dst->src[0];
+    const ggml_tensor * k       = dst->src[1];
+    const ggml_tensor * v       = dst->src[2];
+    const ggml_tensor * mask    = dst->src[3];
+    const ggml_tensor * out     = dst->src[4];
+    const ggml_tensor * dout    = dst->src[5];
+    const ggml_tensor * sinks   = dst->src[6];
+    const ggml_tensor * kv_idxs = dst->src[9];
+
+    GGML_ASSERT(q && k && v && out && dout);
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && out->type == GGML_TYPE_F32);
+    GGML_ASSERT(dout->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == v->type && (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_F32));
+    GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(!sinks || sinks->type == GGML_TYPE_F32);
+
+    const int64_t hsk    = q->ne[0];
+    const int64_t nq     = q->ne[1];
+    const int64_t nhead  = q->ne[2];
+    const int64_t nbatch = q->ne[3];
+    const int64_t nkv    = k->ne[1];
+    const int64_t nheadk = k->ne[2];
+    const int64_t hsv    = v->ne[0];
+    const int64_t ratio  = nhead/nheadk;
+    GGML_ASSERT(nhead % nheadk == 0 && k->ne[3] == nbatch && v->ne[3] == nbatch);
+
+    float op_params[3];
+    memcpy(op_params, dst->op_params, sizeof(op_params));
+    const float scale   = op_params[0];
+    const float max_bias = op_params[1];
+    const float softcap = op_params[2];
+    const uint32_t nhead_log2 = 1u << (uint32_t) floor(log2((double) nhead));
+    const float m0 = powf(2.0f, -max_bias/(float) nhead_log2);
+    const float m1 = powf(2.0f, -(max_bias/2.0f)/(float) nhead_log2);
+
+    const int32_t grad_mask = ggml_get_op_params_i32(dst, 3);
+    const bool want_dq = (grad_mask & GGML_FLASH_ATTN_BACK_GRAD_Q) != 0;
+    const bool want_dk = (grad_mask & GGML_FLASH_ATTN_BACK_GRAD_K) != 0;
+    const bool want_dv = (grad_mask & GGML_FLASH_ATTN_BACK_GRAD_V) != 0;
+    size_t off_q = 0, off_k = 0, off_v = 0, off_s = 0;
+    ggml_flash_attn_back_offsets(dst, &off_q, &off_k, &off_v, &off_s);
+    float * dq_out = (float *) ((char *) dst->data + off_q);
+    float * dk_out = (float *) ((char *) dst->data + off_k);
+    float * dv_out = (float *) ((char *) dst->data + off_v);
+    float * stats  = (float *) ((char *) dst->data + off_s);
+    const int64_t nstats = nbatch*nhead*nq;
+
+    const ggml_tensor * gk = ggml_flash_attn_back_grad_k(dst);
+    const int64_t nwin = gk->ne[1];
+    const int32_t kv_stride  = ggml_get_op_params_i32(dst, 4);
+    const int32_t kv_stream0 = ggml_get_op_params_i32(dst, 5);
+
+    if (params->ith == 0) {
+        memset(dst->data, 0, ggml_nbytes(dst));
+    }
+    ggml_barrier(params->threadpool);
+
+    auto load_kv = [&](const ggml_tensor * t, int64_t id, int64_t row, int64_t head, int64_t batch) {
+        const char * ptr = (const char *) t->data + id*t->nb[0] + row*t->nb[1] + head*t->nb[2] + batch*t->nb[3];
+        return t->type == GGML_TYPE_F16 ? GGML_FP16_TO_FP32(*(const ggml_fp16_t *) ptr) : *(const float *) ptr;
+    };
+    auto mask_value = [&](int64_t ik, int64_t iq, int64_t ih, int64_t ib) {
+        if (!mask) {
+            return 0.0f;
+        }
+        const int64_t mh = ih % mask->ne[2];
+        const int64_t mb = ib % mask->ne[3];
+        const char * ptr = (const char *) mask->data + ik*mask->nb[0] + iq*mask->nb[1] + mh*mask->nb[2] + mb*mask->nb[3];
+        return GGML_FP16_TO_FP32(*(const ggml_fp16_t *) ptr);
+    };
+    auto slope_for = [&](int64_t ih) {
+        if (max_bias <= 0.0f) {
+            return 1.0f;
+        }
+        return ih < nhead_log2 ? powf(m0, (float) ih + 1.0f)
+                               : powf(m1, (float) (2*(ih - nhead_log2) + 1));
+    };
+    auto dot_qk = [&](int64_t iq, int64_t ih, int64_t ib, int64_t ik, int64_t ikh) {
+        float dot = 0.0f;
+        for (int64_t id = 0; id < hsk; ++id) {
+            const float qv = *(const float *) ((const char *) q->data + id*q->nb[0] + iq*q->nb[1] + ih*q->nb[2] + ib*q->nb[3]);
+            dot += qv*load_kv(k, id, ik, ikh, ib);
+        }
+        return dot;
+    };
+    auto score_from_dot = [&](float dot, int64_t ik, int64_t iq, int64_t ih, int64_t ib) {
+        const float score = softcap != 0.0f ? softcap*tanhf(dot*scale/softcap) : dot*scale;
+        return score + slope_for(ih)*mask_value(ik, iq, ih, ib);
+    };
+    auto window_key = [&](int64_t ib, int64_t j) {
+        if (!kv_idxs) {
+            return j;
+        }
+        const int32_t * idxs = (const int32_t *) kv_idxs->data;
+        return (int64_t) idxs[ib*nwin + j] - kv_stride*(kv_stream0 + ib);
+    };
+
+    const int64_t units = nbatch*nheadk;
+    for (int64_t unit = params->ith; unit < units; unit += params->nth) {
+        const int64_t ib  = unit/nheadk;
+        const int64_t ikh = unit % nheadk;
+
+        // Query-owned phase: LSE/D statistics and dQ.
+        for (int64_t rhead = 0; rhead < ratio; ++rhead) {
+            const int64_t ih = ikh*ratio + rhead;
+            for (int64_t iq = 0; iq < nq; ++iq) {
+                float row_max = -INFINITY;
+                float row_sum = 0.0f;
+                for (int64_t ik = 0; ik < nkv; ++ik) {
+                    const float score = score_from_dot(dot_qk(iq, ih, ib, ik, ikh), ik, iq, ih, ib);
+                    const float next_max = MAX(row_max, score);
+                    row_sum = row_sum*expf(row_max - next_max) + expf(score - next_max);
+                    row_max = next_max;
+                }
+                if (sinks) {
+                    const float sink = *(const float *) ((const char *) sinks->data + ih*sinks->nb[0]);
+                    const float next_max = MAX(row_max, sink);
+                    row_sum = row_sum*expf(row_max - next_max) + expf(sink - next_max);
+                    row_max = next_max;
+                }
+                const float lse = row_sum > 0.0f ? row_max + logf(row_sum) : INFINITY;
+                float delta = 0.0f;
+                for (int64_t id = 0; id < hsv; ++id) {
+                    const float ov = *(const float *) ((const char *) out->data + id*out->nb[0] + ih*out->nb[1] + iq*out->nb[2] + ib*out->nb[3]);
+                    const float dv = *(const float *) ((const char *) dout->data + id*dout->nb[0] + ih*dout->nb[1] + iq*dout->nb[2] + ib*dout->nb[3]);
+                    delta += ov*dv;
+                }
+                const int64_t stat = (ib*nhead + ih)*nq + iq;
+                stats[stat] = lse;
+                stats[nstats + stat] = delta;
+
+                if (want_dq) {
+                    for (int64_t ik = 0; ik < nkv; ++ik) {
+                        const float dot = dot_qk(iq, ih, ib, ik, ikh);
+                        const float prob = expf(score_from_dot(dot, ik, iq, ih, ib) - lse);
+                        float dot_dv = 0.0f;
+                        for (int64_t id = 0; id < hsv; ++id) {
+                            const float dov = *(const float *) ((const char *) dout->data + id*dout->nb[0] + ih*dout->nb[1] + iq*dout->nb[2] + ib*dout->nb[3]);
+                            dot_dv += dov*load_kv(v, id, ik, ikh, ib);
+                        }
+                        float deriv = scale;
+                        if (softcap != 0.0f) {
+                            const float t = tanhf(dot*scale/softcap);
+                            deriv *= 1.0f - t*t;
+                        }
+                        const float ds = prob*(dot_dv - delta)*deriv;
+                        const int64_t qbase = ((ib*nhead + ih)*nq + iq)*hsk;
+                        for (int64_t id = 0; id < hsk; ++id) {
+                            dq_out[qbase + id] += ds*load_kv(k, id, ik, ikh, ib);
+                        }
+                    }
+                }
+            }
+        }
+
+        // KV-owned phase: one fixed-order reduction per output row.
+        for (int64_t j = 0; j < nwin; ++j) {
+            const int64_t ik = window_key(ib, j);
+            if (ik < 0 || ik >= nkv) {
+                continue;
+            }
+            const int64_t kbase = ((ib*nheadk + ikh)*nwin + j)*hsk;
+            const int64_t vbase = ((ib*nheadk + ikh)*nwin + j)*hsv;
+            for (int64_t rhead = 0; rhead < ratio; ++rhead) {
+                const int64_t ih = ikh*ratio + rhead;
+                for (int64_t iq = 0; iq < nq; ++iq) {
+                    const int64_t stat = (ib*nhead + ih)*nq + iq;
+                    const float dot = dot_qk(iq, ih, ib, ik, ikh);
+                    const float prob = expf(score_from_dot(dot, ik, iq, ih, ib) - stats[stat]);
+                    float dot_dv = 0.0f;
+                    for (int64_t id = 0; id < hsv; ++id) {
+                        const float dov = *(const float *) ((const char *) dout->data + id*dout->nb[0] + ih*dout->nb[1] + iq*dout->nb[2] + ib*dout->nb[3]);
+                        dot_dv += dov*load_kv(v, id, ik, ikh, ib);
+                    }
+                    float deriv = scale;
+                    if (softcap != 0.0f) {
+                        const float t = tanhf(dot*scale/softcap);
+                        deriv *= 1.0f - t*t;
+                    }
+                    const float ds = prob*(dot_dv - stats[nstats + stat])*deriv;
+                    if (want_dk) {
+                        for (int64_t id = 0; id < hsk; ++id) {
+                            const float qv = *(const float *) ((const char *) q->data + id*q->nb[0] + iq*q->nb[1] + ih*q->nb[2] + ib*q->nb[3]);
+                            dk_out[kbase + id] += ds*qv;
+                        }
+                    }
+                    if (want_dv) {
+                        for (int64_t id = 0; id < hsv; ++id) {
+                            const float dov = *(const float *) ((const char *) dout->data + id*dout->nb[0] + ih*dout->nb[1] + iq*dout->nb[2] + ib*dout->nb[3]);
+                            dv_out[vbase + id] += prob*dov;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 void ggml_compute_forward_flash_attn_back(
         const ggml_compute_params * params,
         const bool masked,
         ggml_tensor * dst) {
 
-    const ggml_tensor * q = dst->src[0];
-
-    switch (q->type) {
-        case GGML_TYPE_F32:
-            {
-                ggml_compute_forward_flash_attn_back_f32(params, masked, dst);
-            } break;
-        default:
-            {
-                GGML_ABORT("fatal error");
-            }
-    }
+    GGML_UNUSED(masked);
+    ggml_compute_forward_flash_attn_back_ext_f32(params, dst);
 }
 
 // ggml_compute_forward_ssm_conv

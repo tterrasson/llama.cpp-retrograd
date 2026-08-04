@@ -703,6 +703,12 @@ void process_shaders() {
             string_to_spv("flash_attn_back_kv" + suffix, "flash_attn_back_kv.comp", defines);
         }
     }
+    // F2 production shape: F16 KV, head_dim=128, F16 cooperative-matrix
+    // operands with F32 accumulators. Other shapes keep the scalar shaders.
+    string_to_spv("flash_attn_back_mma_q_f32_f16_d128", "flash_attn_back_mma.comp", {},
+                  true, true, false, false);
+    string_to_spv("flash_attn_back_mma_kv_f32_f16_d128", "flash_attn_back_mma.comp",
+                  {{"FA_BACK_KV_PASS", "1"}}, true, true, false, false);
 
     // matmul
     for (const MatMulIdType& matmul_id_type : {MatMulIdType::NONE, MatMulIdType::DEFAULT, MatMulIdType::SUBGROUP}) {
