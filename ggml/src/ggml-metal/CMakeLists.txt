@@ -52,6 +52,7 @@ set(METALLIB_KERNEL_SOURCES
     kernels/pool.metal
     kernels/misc.metal
     kernels/retro.metal # retro delta: fork-owned training kernels
+    kernels/rir.metal # retro delta: fork-owned generated RIR kernels
 )
 
 if (GGML_METAL_EMBED_LIBRARY)

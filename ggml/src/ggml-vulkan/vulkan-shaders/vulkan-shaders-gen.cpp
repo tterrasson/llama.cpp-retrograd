@@ -904,6 +904,18 @@ void process_shaders() {
     string_to_spv("rms_norm_back_f32", "rms_norm_back.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("l2_norm_f32", "l2_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("l2_norm_back_f32", "l2_norm_back.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
+    // retro delta: RIR-generated variants (docs/INT_RIR.md). Each source is a
+    // committed copy of a file under generated/rir/<kernel>/; a parent-repo
+    // test compares them byte for byte, so edit them only via rir-gen.
+    //
+    // One line per *variant*, not per kernel: a (kernel, backend) pair may
+    // publish several lowerings arbitrated per shape, and each is its own
+    // SPIR-V module (docs/INT_RIR_V3.md §R1). The fallback keeps the bare
+    // kernel name; a specialization appends its variant name.
+    string_to_spv("rir_l2_norm_back", "rir_l2_norm_back.comp", {});
+    string_to_spv("rir_cumsum", "rir_cumsum.comp", {});
+    string_to_spv("rir_cumsum_blocked", "rir_cumsum_blocked.comp", {});
+    string_to_spv("rir_cumsum_shared", "rir_cumsum_shared.comp", {});
 
     string_to_spv("cpy_f32_f32", "copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
     string_to_spv("cpy_f32_f16", "copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float16_t"}});

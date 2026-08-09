@@ -27,6 +27,19 @@ int ggml_metal_op_n_nodes(ggml_metal_op_t ctx);
 
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
 
+// retro delta: the device half of the RIR contract for Metal, in the shape
+// ggml_rir_evaluate/ggml_rir_preflight_graph consume (docs/INT_RIR_V2.md §P0).
+// `device_ctx` is a ggml_metal_library_t; returns a ggml_rir_reject.
+int32_t ggml_metal_rir_device_check(void * device_ctx, const struct ggml_tensor * node);
+
+// retro delta: the RIR selection chain for the node at `idx`. Returns the
+// number of nodes it encoded (non-zero) when the registry both registers a
+// dispatchable variant for this (op, backend) and its contract matches, and 0
+// when the native kernel below must run. Every op integrated with RIR opens
+// with `if (const int n = ggml_metal_op_rir_try(ctx, idx)) { return n; }`
+// — that one line is the whole integration (docs/INT_RIR_V2.md §P2).
+int ggml_metal_op_rir_try(ggml_metal_op_t ctx, int idx);
+
 //
 // available ops:
 //

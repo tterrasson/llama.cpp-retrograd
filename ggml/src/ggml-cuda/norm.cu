@@ -1,4 +1,5 @@
 #include "norm.cuh"
+#include "../ggml-rir/ggml-rir.h" // retro delta: RIR policy + counters (docs/INT_RIR.md)
 #include <cstdint>
 
 template <int block_size>
@@ -790,6 +791,21 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
 // retro delta: analytic backward for GGML_OP_L2_NORM
 void ggml_cuda_op_l2_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // retro delta: the AOT registry declares CUDA NativeOnly for this op
+    // (docs/INT_RIR.md §6.3) — there is no RIR emitter/schedule for CUDA and
+    // the specialized kernel keeps priority. Under observe/prefer, count the
+    // native dispatch so hybrid coverage reports include CUDA rather than
+    // inferring the policy from an absence of code.
+    if (ggml_rir_get_mode() != GGML_RIR_MODE_OFF) {
+        ggml_rir_site_begin("GGML_OP_L2_NORM_BACK", RIR_BACKEND_CUDA);
+        ggml_rir_count_seen();
+        ggml_rir_count_reject(GGML_RIR_REJECT_POLICY_NATIVE);
+        ggml_rir_count_native();
+        // The row this leaves behind is the point: a report that shows
+        // GGML_OP_L2_NORM_BACK/cuda with policy_native=N is the test-visible
+        // form of "CUDA is NativeOnly" (§6.3), not an absence of code.
+        ggml_rir_site_end();
+    }
     const ggml_tensor * grad  = dst->src[0]; // gradients
     const ggml_tensor * src0f = dst->src[1]; // src0 from forward pass
 

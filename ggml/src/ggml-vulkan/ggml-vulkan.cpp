@@ -93,6 +93,8 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "ggml-retro-quant.h"
+#include "ggml-rir/ggml-rir.h"  // retro delta: RIR AOT variants (docs/INT_RIR.md)
+#include "ggml-rir/rir_kernel_params.h"  // retro delta: generated constant-buffer bound
 
 #include "ggml-vulkan-shaders.hpp"
 
@@ -1099,6 +1101,18 @@ struct vk_device_struct {
     vk_pipeline pipeline_rms_norm_back_f32;
     vk_pipeline pipeline_l2_norm_f32;
     vk_pipeline pipeline_l2_norm_back_f32; // retro delta
+    // retro delta: RIR-generated variant of L2_NORM_BACK (2D sub-domain).
+    // Null when the mode is off or the device lacks a 32-lane subgroup.
+    vk_pipeline pipeline_rir_l2_norm_back;
+    // retro delta: RIR-generated variants of CUMSUM. Three lowerings of one
+    // kernel, arbitrated per shape by the registry's shape rules: the fallback
+    // scans a row per invocation, `_blocked` cuts the row into 32 lane-sized
+    // chunks recombined by a subgroup prefix and wins while the row count alone
+    // leaves the GPU idle (docs/INT_RIR_V3.md §R1). One pipeline object each —
+    // they are distinct SPIR-V modules.
+    vk_pipeline pipeline_rir_cumsum;
+    vk_pipeline pipeline_rir_cumsum_blocked;
+    vk_pipeline pipeline_rir_cumsum_shared;
 
     // [src/dst 0=fp32,1=fp16]
     vk_pipeline pipeline_exp[2];
@@ -1568,6 +1582,32 @@ struct vk_op_push_constants {
     float param2;
     float param3;
     float param4;
+};
+
+// retro delta: the *native* L2_NORM_BACK kernel. It used vk_op_push_constants,
+// which carries no strides, so it read `x` as a flat contiguous buffer while
+// supports_op only constrained src[0]. A packed-QKV view of `x` therefore
+// produced wrong results rather than a rejection (found by the shared RIR/native
+// matrix, docs/INT_RIR.md §13). The extra fields let it stride x per outer axis.
+struct vk_op_l2_norm_back_push_constants {
+    uint32_t KX;      // ne00
+    uint32_t KY;      // ggml_nrows(src0)
+    float    param1;  // eps
+    uint32_t ne1;     // rows per plane
+    uint32_t ne2;     // planes per batch
+    uint32_t xs1;     // src[1] strides, in elements
+    uint32_t xs2;
+    uint32_t xs3;
+};
+
+// retro delta: constant buffer of a RIR variant. The *layout* is generated —
+// `rir_kernel_params.h` declares one struct per production kernel with its own
+// static_assert — and `ggml_rir_fill_params` places the fields, so nothing here
+// restates it. What is left is a buffer whose used length is only known from
+// the registry row, hence the explicit size (docs/INT_RIR_V2.md §P1).
+struct vk_rir_push_constants {
+    uint32_t data[RIR_MAX_PUSH_CONSTANT_BYTES / 4];
+    size_t   n_bytes;
 };
 
 struct vk_op_fwht_push_constants {
@@ -6023,7 +6063,48 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_back_f32, "rms_norm_back_f32", rms_norm_back_f32_len, rms_norm_back_f32_data, "main", 3, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_l2_norm_f32, "l2_norm_f32", l2_norm_f32_len, l2_norm_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
     // retro delta: analytic backward for GGML_OP_L2_NORM
-    ggml_vk_create_pipeline(device, device->pipeline_l2_norm_back_f32, "l2_norm_back_f32", l2_norm_back_f32_len, l2_norm_back_f32_data, "main", 3, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_l2_norm_back_f32, "l2_norm_back_f32", l2_norm_back_f32_len, l2_norm_back_f32_data, "main", 3, sizeof(vk_op_l2_norm_back_push_constants), {1, 1, 1}, {}, 1);
+    // retro delta: RIR-generated L2_NORM_BACK variant (docs/INT_RIR.md §6.1).
+    // The shader strides its column loop by exactly 32 lanes and reduces with
+    // one subgroupAdd, so it is only correct on a 32-lane subgroup — natively
+    // or through VK_EXT_subgroup_size_control, the same condition as the
+    // FA-back pipelines (fa_back_subgroup32). Created only when a registry
+    // row exists and the mode is not off; a null pipeline keeps the variant
+    // ineligible, it never blocks the native kernel.
+    //
+    // Binding count, constant-buffer size, entrypoint and subgroup width all
+    // come from the registry row rather than from constants written here: the
+    // only per-kernel datum left is the SPIR-V symbol the shader generator
+    // emits (docs/INT_RIR_V2.md §P1). The workgroup denominators stay 1 because
+    // the dispatch geometry already yields workgroup *counts*.
+    if (const rir_variant_desc * v = ggml_rir_get_mode() != GGML_RIR_MODE_OFF && device->fa_back_subgroup32
+            ? ggml_rir_find_variant("l2_norm_back", RIR_BACKEND_VULKAN)
+            : nullptr) {
+        ggml_vk_create_pipeline(device, device->pipeline_rir_l2_norm_back, "rir_l2_norm_back", rir_l2_norm_back_len, rir_l2_norm_back_data, v->entrypoint, v->n_bindings, v->push_constant_bytes, {1, 1, 1}, {}, 1, false, true, v->min_subgroup);
+    }
+    // The fallback scan asks for no collective, so only the mode gates it.
+    if (const rir_variant_desc * v = ggml_rir_get_mode() != GGML_RIR_MODE_OFF
+            ? ggml_rir_find_variant("cumsum", RIR_BACKEND_VULKAN)
+            : nullptr) {
+        ggml_vk_create_pipeline(device, device->pipeline_rir_cumsum, "rir_cumsum", rir_cumsum_len, rir_cumsum_data, v->entrypoint, v->n_bindings, v->push_constant_bytes, {1, 1, 1}, {}, 1, false, false, 0);
+    }
+    // The blocked scan carries a subgroup prefix over exactly 32 lanes, so it
+    // needs the same 32-lane guarantee as the l2_norm_back variant above. When
+    // the device cannot give it, this pipeline stays null and the shape rules
+    // still route those nodes here — which is why the device check refuses a
+    // null pipeline rather than assuming one exists.
+    if (const rir_variant_desc * v = ggml_rir_get_mode() != GGML_RIR_MODE_OFF && device->fa_back_subgroup32
+            ? ggml_rir_find_variant_named("cumsum", "blocked", RIR_BACKEND_VULKAN)
+            : nullptr) {
+        ggml_vk_create_pipeline(device, device->pipeline_rir_cumsum_blocked, "rir_cumsum_blocked", rir_cumsum_blocked_len, rir_cumsum_blocked_data, v->entrypoint, v->n_bindings, v->push_constant_bytes, {1, 1, 1}, {}, 1, false, true, v->min_subgroup);
+    }
+    // SharedTree synchronizes all 256 invocations through workgroup memory; it
+    // deliberately has no subgroup-width requirement.
+    if (const rir_variant_desc * v = ggml_rir_get_mode() != GGML_RIR_MODE_OFF
+            ? ggml_rir_find_variant_named("cumsum", "shared", RIR_BACKEND_VULKAN)
+            : nullptr) {
+        ggml_vk_create_pipeline(device, device->pipeline_rir_cumsum_shared, "rir_cumsum_shared", rir_cumsum_shared_len, rir_cumsum_shared_data, v->entrypoint, v->n_bindings, v->push_constant_bytes, {1, 1, 1}, {}, 1, false, false, 0);
+    }
 
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_f32, "cpy_f32_f32", cpy_f32_f32_len, cpy_f32_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_f16, "cpy_f32_f16", cpy_f32_f16_len, cpy_f32_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
@@ -8659,6 +8740,15 @@ template <typename T> const T *push_constant_data(const std::vector<T> &t) {
 }
 template <typename T, uint32_t N> const T *push_constant_data(const std::array<T, N> &t) {
     return t.data();
+}
+// retro delta: a RIR variant pushes only the prefix its registry row declares,
+// so the length is data, not a type. Non-template overloads, hence preferred
+// over the generic sizeof(T) above.
+static inline size_t push_constant_size(const vk_rir_push_constants &pc) {
+    return pc.n_bytes;
+}
+static inline const void *push_constant_data(const vk_rir_push_constants &pc) {
+    return pc.data;
 }
 
 static void ggml_vk_cmd_label_begin(vk::CommandBuffer buf, const char * name) {
@@ -14962,7 +15052,10 @@ static void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, 
 
 static void ggml_vk_rms_norm_back(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     float * op_params = (float *)dst->op_params;
-    ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_RMS_NORM_BACK, { (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], op_params[0], 0.0f, 0.0f, 0.0f });
+    // retro delta: KY carries ggml_nrows, not ne[1]: it is the shader's
+    // out-of-bounds guard once the grid is split into 512-wide slices
+    // (>512 rows). Same fix as ggml_vk_l2_norm_back.
+    ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_RMS_NORM_BACK, { (uint32_t)src0->ne[0], (uint32_t)ggml_nrows(src0), op_params[0], 0.0f, 0.0f, 0.0f });
 }
 
 static void ggml_vk_l2_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
@@ -14972,10 +15065,175 @@ static void ggml_vk_l2_norm(ggml_backend_vk_context * ctx, vk_context& subctx, c
     ggml_vk_op_f32<vk_op_unary_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_L2_NORM, std::move(p));
 }
 
+// retro delta: RIR dispatch on Vulkan (docs/INT_RIR.md §8). The decision is
+// taken **before** any encoding — after submission there is no safe fallback.
+// The portable half of the contract (element types, rank, agreement of the
+// axis extents, stride alignment, u32 representability) is decided from the
+// registry row by `ggml_rir_evaluate_portable`; what is left below is what
+// needs this device to answer: a built pipeline, a dispatchable grid and
+// descriptor offsets the shader can bind (docs/INT_RIR_V2.md §P1).
+static bool ggml_vk_rir_tensor_offset_ok(ggml_backend_vk_context * ctx, const ggml_tensor * t) {
+    vk_buffer buffer = nullptr;
+    size_t offset = 0;
+    if (ctx->device->uma) {
+        ggml_vk_host_get(ctx->device, t->data, buffer, offset);
+    }
+    if (!buffer) {
+        offset = vk_tensor_offset(t) + t->view_offs;
+    }
+    // The RIR shader has no misalignment push constant: the descriptor offset
+    // must be exact.
+    return (offset & (ctx->device->properties.limits.minStorageBufferOffsetAlignment - 1)) == 0;
+}
+
+// The pipeline of a variant on this device, or nullptr. Keyed on (kernel,
+// variant) and not on the kernel alone: a kernel may publish several lowerings,
+// each its own SPIR-V module, and matching on the kernel name would hand a node
+// the wrong module — the same shader for two schedules. The SPIR-V blob is a
+// per-artifact symbol emitted by the shader generator, so this stays the last
+// per-artifact line on Vulkan.
+static bool ggml_vk_rir_is(const rir_variant_desc * v, const char * kernel, const char * variant) {
+    if (std::strcmp(v->kernel, kernel) != 0) {
+        return false;
+    }
+    return variant == nullptr ? v->variant == nullptr
+                              : (v->variant != nullptr && std::strcmp(v->variant, variant) == 0);
+}
+
+static vk_pipeline ggml_vk_rir_pipeline(ggml_backend_vk_context * ctx, const rir_variant_desc * v) {
+    if (v == nullptr) {
+        return nullptr;
+    }
+    if (ggml_vk_rir_is(v, "l2_norm_back", nullptr)) {
+        return ctx->device->pipeline_rir_l2_norm_back;
+    }
+    if (ggml_vk_rir_is(v, "cumsum", nullptr)) {
+        return ctx->device->pipeline_rir_cumsum;
+    }
+    if (ggml_vk_rir_is(v, "cumsum", "blocked")) {
+        return ctx->device->pipeline_rir_cumsum_blocked;
+    }
+    if (ggml_vk_rir_is(v, "cumsum", "shared")) {
+        return ctx->device->pipeline_rir_cumsum_shared;
+    }
+    return nullptr;
+}
+
+// The device half of the RIR contract for this backend, in the shape
+// ggml_rir_evaluate/ggml_rir_preflight_graph consume. Nothing here names an op:
+// the grid comes from the registry's dispatch geometry and the bindings from
+// its binding table.
+//
+// Pure and counter-free: the same answer serves the require-preflight, which
+// asks about a node it will not encode, and the dispatch site, which is the
+// only one entitled to count (docs/INT_RIR_V2.md §P0).
+static int32_t ggml_vk_rir_device_check(void * device_ctx, const ggml_tensor * node) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) device_ctx;
+
+    // Per node, not per op: the variant whose pipeline and grid are checked
+    // here must be the one the dispatch site will encode, and with more than one
+    // lowering per pair that is a function of this node's shape.
+    const rir_variant_desc * v =
+        ggml_rir_find_variant_for_node(node->op, RIR_BACKEND_VULKAN, node);
+    if (v == nullptr) {
+        return GGML_RIR_REJECT_WRONG_OP;
+    }
+    if (ggml_vk_rir_pipeline(ctx, v) == nullptr) {
+        return GGML_RIR_REJECT_PIPELINE;
+    }
+    uint32_t grid[3];
+    ggml_rir_grid(v, node, grid);
+    for (int d = 0; d < 3; ++d) {
+        if (grid[d] > ctx->device->properties.limits.maxComputeWorkGroupCount[d]) {
+            return GGML_RIR_REJECT_INTEGER_RANGE;
+        }
+    }
+    for (uint32_t b = 0; b < v->n_bindings; ++b) {
+        const ggml_tensor * t = ggml_rir_binding_tensor(v, b, node);
+        if (t == nullptr) {
+            return GGML_RIR_REJECT_WRONG_OP;
+        }
+        if (!ggml_vk_rir_tensor_offset_ok(ctx, t)) {
+            return GGML_RIR_REJECT_STRIDE;
+        }
+    }
+    return GGML_RIR_MATCHED;
+}
+
+static void ggml_vk_rir_dispatch(ggml_backend_vk_context * ctx, vk_context& subctx, const rir_variant_desc * v, const ggml_tensor * node) {
+    vk_pipeline pipeline = ggml_vk_rir_pipeline(ctx, v);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    // Same buffers, same queue, same command buffer as any native op — the
+    // adaptor binds ggml's allocations and view offsets, never a host copy.
+    // Which tensor sits at which binding is the registry's answer, not this
+    // function's.
+    vk_subbuffer bufs[RIR_MAX_BINDINGS];
+    for (uint32_t b = 0; b < v->n_bindings; ++b) {
+        bufs[b] = ggml_vk_tensor_subbuffer(ctx, ggml_rir_binding_tensor(v, b, node));
+    }
+
+    vk_rir_push_constants pc = {};
+    pc.n_bytes = v->push_constant_bytes;
+    if (!ggml_rir_fill_params(v, node, pc.data, pc.n_bytes)) {
+        GGML_ABORT("ggml-rir: %s params layout mismatch (registry says %u bytes)",
+                v->variant_id, v->push_constant_bytes);
+    }
+
+    // The workgroup counts the manifest's dispatch geometry asks for. The
+    // pipeline's wg_denoms are 1, so these pass through unchanged.
+    uint32_t grid[3];
+    ggml_rir_grid(v, node, grid);
+    const std::array<uint32_t, 3> elements = { grid[0], grid[1], grid[2] };
+
+    // `ggml_vk_dispatch_pipeline` takes an initializer_list, which cannot be
+    // built from a loop; the arity is bounded by RIR_MAX_BINDINGS.
+    switch (v->n_bindings) {
+        case 1: ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { bufs[0] }, pc, elements); break;
+        case 2: ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { bufs[0], bufs[1] }, pc, elements); break;
+        case 3: ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { bufs[0], bufs[1], bufs[2] }, pc, elements); break;
+        case 4: ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { bufs[0], bufs[1], bufs[2], bufs[3] }, pc, elements); break;
+        default: GGML_ABORT("ggml-rir: %s has %u bindings", v->variant_id, v->n_bindings);
+    }
+}
+
+// The one line an integrated op adds. The mode, the policy, the site
+// attribution, the counters and the `require` enforcement all live in
+// ggml_rir_dispatch_begin; what stays here is Vulkan's encoding. Returns true
+// when the variant was encoded and the native kernel must not run.
+static bool ggml_vk_rir_try(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * node) {
+    const rir_variant_desc * v = ggml_rir_dispatch_begin(
+            RIR_BACKEND_VULKAN, node, ggml_vk_rir_device_check, ctx);
+    if (v == nullptr) {
+        return false;  // native, already counted
+    }
+    ggml_vk_rir_dispatch(ctx, subctx, v, node);
+    ggml_rir_dispatch_end(v);
+    return true;
+}
+
 // retro delta: analytic backward for GGML_OP_L2_NORM
 static void ggml_vk_l2_norm_back(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     float * op_params = (float *)dst->op_params;
-    ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_L2_NORM_BACK, { (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], op_params[0], 0.0f, 0.0f, 0.0f });
+    // retro delta: RIR selection chain (docs/INT_RIR.md §5).
+    if (ggml_vk_rir_try(ctx, subctx, dst)) {
+        return;
+    }
+    // KY carries ggml_nrows, not ne[1]: it is the shader's out-of-bounds
+    // guard once the grid is split into 512-wide slices (>512 rows).
+    // xs* are x's strides in *elements*; supports_op guarantees nb[0] is the
+    // element size, which is what makes the byte->element division exact.
+    GGML_ASSERT(src1->nb[0] == sizeof(float));
+    ggml_vk_op_f32<vk_op_l2_norm_back_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_L2_NORM_BACK, {
+        (uint32_t)src0->ne[0],
+        (uint32_t)ggml_nrows(src0),
+        op_params[0],
+        (uint32_t)src0->ne[1],
+        (uint32_t)src0->ne[2],
+        (uint32_t)(src1->nb[1]/sizeof(float)),
+        (uint32_t)(src1->nb[2]/sizeof(float)),
+        (uint32_t)(src1->nb[3]/sizeof(float)),
+    });
 }
 
 static void ggml_vk_unary(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
@@ -15539,6 +15797,13 @@ static void ggml_vk_mean(ggml_backend_vk_context * ctx, vk_context& subctx, cons
 }
 
 static void ggml_vk_cumsum(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
+    // retro delta: RIR selection chain (docs/INT_RIR_V2.md §P2). The registry
+    // pins this pair to `observe_generated`, so today the call always measures
+    // and returns false; promoting it to `prefer_generated` is a one-line
+    // change of the integration table, not of this file.
+    if (ggml_vk_rir_try(ctx, subctx, dst)) {
+        return;
+    }
     vk_op_sum_rows_push_constants pc = vk_op_sum_rows_push_constants_init(src0, dst, src0->ne[0]);
     // Use the single pass shader when the rows are small or there are enough rows to fill the GPU.
     // For fewer, larger rows, use the multipass shader to spread each row across SMs.
@@ -19060,6 +19325,21 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
+    // retro delta: under RIR mode `require`, every targeted node must have an
+    // eligible variant *before* anything is encoded — a graph that would fall
+    // back to a native kernel fails here instead (docs/INT_RIR_V2.md §P0).
+    if (!ggml_rir_preflight_graph(RIR_BACKEND_VULKAN, cgraph, ggml_vk_rir_device_check, ctx)) {
+        char msg[512];
+        ggml_rir_violation_format(msg, sizeof(msg));
+        GGML_LOG_ERROR("%s: %s\n", __func__, msg);
+        return GGML_STATUS_FAILED;
+    }
+
+    // retro delta: under RETRO_RIR_CENSUS, rank the ops of the *real* graph by
+    // node count and traffic — including the ones RIR does not cover, which is
+    // the only place they are visible (docs/INT_RIR_V3.md §5).
+    ggml_rir_census_graph(RIR_BACKEND_VULKAN, cgraph);
+
     ctx->device->diag_cgraph = nullptr;
     ctx->device->diag_prev_start = -1;
     ctx->device->diag_prev_end = -1;
@@ -20626,8 +20906,21 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                    op->type == GGML_TYPE_F32;
         case GGML_OP_SILU_BACK:
         case GGML_OP_RMS_NORM_BACK:
+            // retro delta: these shaders index src[1] as a flat contiguous
+            // buffer while carrying no stride for it, so a strided src[1] does
+            // not merely go unaccelerated — it reads the wrong elements.
+            // Upstream only checked src[0]. Announcing the op for a layout the
+            // kernel cannot express is what makes the failure silent, so the
+            // check is on both sources until the shaders carry x's strides
+            // (l2_norm_back below is the one that now does).
+            return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                   op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_L2_NORM_BACK:
-            return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
+            // src[1] may stride its outer axes (the packed-QKV view of a real
+            // training graph); its rows must still be element-contiguous, which
+            // is what lets the host pass strides in elements.
+            return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->nb[0] == ggml_type_size(op->src[1]->type);
         case GGML_OP_SQR:
         case GGML_OP_SQRT:
         case GGML_OP_SIN:

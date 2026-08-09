@@ -3683,6 +3683,59 @@ struct test_rms_norm : public test_case {
     }
 };
 
+// retro delta: GGML_OP_L2_NORM_BACK. Every shape here exercises the RIR
+// variant when RETRO_RIR_MODE=prefer (docs/INT_RIR.md §8), rank 4 included.
+// CPU accumulates in ggml_float (double) while the GPU kernels reduce in F32,
+// so parity is relative, never bitwise.
+//
+// `x_plane_gap` reproduces the only shape the real Qwen3.5 graph sends to this
+// op: `x` is a view inside a packed QKV tensor, so its planes are three times
+// further apart than the rows they contain. No row folding can express that —
+// it is what the kernel's per-argument nb[2]/nb[3] exist for (§11 phase D).
+struct test_l2_norm_back : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    const float eps;
+    const bool x_plane_gap;
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, ne, eps, x_plane_gap);
+    }
+
+    test_l2_norm_back(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne = {64, 5, 4, 3},
+            float eps = 1e-6f,
+            bool x_plane_gap = false)
+        : type(type), ne(ne), eps(eps), x_plane_gap(x_plane_gap) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_name(a, "a"); // dz
+
+        ggml_tensor * b;
+        if (x_plane_gap) {
+            ggml_tensor * packed = ggml_new_tensor_4d(ctx, type, ne[0], ne[1], 3*ne[2], ne[3]);
+            ggml_set_name(packed, "packed");
+            b = ggml_view_4d(ctx, packed, ne[0], ne[1], ne[2], ne[3],
+                             packed->nb[1], 3*packed->nb[2], packed->nb[3], 0);
+        } else {
+            b = ggml_new_tensor(ctx, type, 4, ne.data());
+        }
+        ggml_set_name(b, "b"); // x
+
+        ggml_tensor * out = ggml_l2_norm_back(ctx, a, b, eps);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
+    }
+};
+
 // GGML_OP_RMS_NORM_BACK
 struct test_rms_norm_back : public test_case {
     const ggml_type type;
@@ -9683,6 +9736,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
             test_cases.emplace_back(new test_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, false, eps, true));
             test_cases.emplace_back(new test_rms_norm_back(GGML_TYPE_F32, { n, 5, 4, 3 }, eps));
+            // retro delta: >512 rows crosses the Vulkan grid split (the host
+            // folds the row axis into 512-wide slices), which the shader only
+            // survives with its row >= KY guard.
+            test_cases.emplace_back(new test_rms_norm_back(GGML_TYPE_F32, { 65, 600, 1, 1 }, eps));
+            // retro delta: L2_NORM_BACK — rank 4, unaligned columns, a single
+            // row, a single column, a row count above 512 to cross the native
+            // shader's grid split, and the packed-QKV view geometry of the
+            // real Qwen3.5 graph. All of them are inside the RIR contract.
+            test_cases.emplace_back(new test_l2_norm_back(GGML_TYPE_F32, { n, 5, 4, 3 }, eps));
+            test_cases.emplace_back(new test_l2_norm_back(GGML_TYPE_F32, { 128, 16, 16, 1 }, eps, true));
+            test_cases.emplace_back(new test_l2_norm_back(GGML_TYPE_F32, { n, 5, 1, 1 }, eps));
+            test_cases.emplace_back(new test_l2_norm_back(GGML_TYPE_F32, { 33, 7, 1, 1 }, eps));
+            // ne[0] == 1 is deliberately absent: dx is analytically ~0 there
+            // (dz - x·(x·dz/x²) cancels), so NMSE against the CPU's double
+            // accumulation explodes for every backend, native included.
+            test_cases.emplace_back(new test_l2_norm_back(GGML_TYPE_F32, { 17, 1, 1, 1 }, eps));
+            test_cases.emplace_back(new test_l2_norm_back(GGML_TYPE_F32, { 65, 600, 1, 1 }, eps));
             test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
             test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
             test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false, true));
@@ -11019,6 +11089,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // retro delta: L2_NORM_BACK on the geometry the Qwen3.5 training graph
+    // actually emits — 128 columns, 256 rows over 16 planes, with `x` a view
+    // into a packed QKV tensor. This is the warm harness that decides whether
+    // the RIR variant may be preferred over the native kernel
+    // (docs/INT_RIR.md §11 phase B); run it with and without RETRO_RIR_MODE.
+    test_cases.emplace_back(new test_l2_norm_back(GGML_TYPE_F32, { 128, 16, 16, 1 }, 1e-6f, true));
+    test_cases.emplace_back(new test_l2_norm_back(GGML_TYPE_F32, { 128, 16, 16, 1 }, 1e-6f, false));
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

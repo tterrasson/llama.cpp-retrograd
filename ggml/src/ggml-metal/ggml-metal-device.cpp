@@ -4,6 +4,7 @@
 #include "ggml-metal-tuning.h"
 
 #include "ggml-impl.h"
+#include "ggml-rir/ggml-rir.h" // retro delta: RIR AOT registry (docs/INT_RIR.md)
 
 #include <cassert>
 #include <memory>
@@ -2541,6 +2542,23 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_l2_norm_back(ggm
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
+// retro delta: pipeline of any RIR-generated variant (docs/INT_RIR.md §6.2).
+// The entrypoint comes from the AOT registry (`rir_` namespace), so it can
+// never collide with a native kernel name — and nothing here names a kernel,
+// so promoting a second op adds no getter (docs/INT_RIR_V2.md §P1).
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rir(ggml_metal_library_t lib, const rir_variant_desc * variant) {
+    if (variant == nullptr) {
+        return {};
+    }
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, variant->entrypoint);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, variant->entrypoint, variant->entrypoint, nullptr);
     }
 
     return res;

@@ -1,10 +1,29 @@
 #version 450
 
-#include "generic_head.glsl"
 #include "types.glsl"
 
+#extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_control_flow_attributes : enable
 #define BLOCK_SIZE 512
+
+// retro delta: this shader used generic_head.glsl, whose push constants carry
+// no strides — so `x` was read as data_b[row*KX + col], a flat contiguous
+// buffer. supports_op only ever required src[0] to be contiguous, so a view
+// whose planes sit further apart than the rows they contain (Qwen3.5's packed
+// QKV: nb2 = 3x the packed value) silently read the wrong elements. The
+// dedicated block below carries x's row/plane/batch strides so the native
+// kernel spans the same domain the RIR variant does.
+layout (push_constant) uniform parameter
+{
+    uint  KX;      // ne00: elements per row
+    uint  KY;      // ggml_nrows(src0): out-of-bounds guard for padded grids
+    float param1;  // eps
+    uint  ne1;     // rows per plane, to split `row` back into (i1, i2, i3)
+    uint  ne2;     // planes per batch
+    uint  xs1;     // src[1] strides, in elements
+    uint  xs2;
+    uint  xs3;
+} p;
 
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
@@ -24,12 +43,28 @@ void main() {
     const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
     const uint tid = gl_LocalInvocationID.x;
 
+    // p.KY is the total row count (ggml_nrows). Above 512 rows the host pads
+    // the grid to 512-wide slices, so the tail workgroups must exit before
+    // touching memory — same guard as argmax.comp.
+    if (row >= p.KY) {
+        return;
+    }
+
+    // `row` is the flattened outer index; x may stride each outer axis
+    // independently, so it has to be split back apart. dz and dx are contiguous
+    // (supports_op requires it), hence they keep the flat row*KX form.
+    const uint i1   = row % p.ne1;
+    const uint rest = row / p.ne1;
+    const uint i2   = rest % p.ne2;
+    const uint i3   = rest / p.ne2;
+    const uint x_base = i1*p.xs1 + i2*p.xs2 + i3*p.xs3;
+
     sum_xx[tid] = FLOAT_TYPE(0.0f);
     sum_xg[tid] = FLOAT_TYPE(0.0f);
 
     [[unroll]] for (uint col = tid; col < p.KX; col += BLOCK_SIZE) {
         const FLOAT_TYPE gi = FLOAT_TYPE(data_a[row*p.KX + col]);
-        const FLOAT_TYPE xi = FLOAT_TYPE(data_b[row*p.KX + col]);
+        const FLOAT_TYPE xi = FLOAT_TYPE(data_b[x_base + col]);
         sum_xx[tid] += xi * xi;
         sum_xg[tid] += xi * gi;
     }
@@ -59,6 +94,6 @@ void main() {
     [[unroll]] for (uint col = tid; col < p.KX; col += BLOCK_SIZE) {
         data_d[row*p.KX + col] = D_TYPE(
             scale_g * FLOAT_TYPE(data_a[row*p.KX + col]) +
-            scale_x * FLOAT_TYPE(data_b[row*p.KX + col]));
+            scale_x * FLOAT_TYPE(data_b[x_base + col]));
     }
 }
