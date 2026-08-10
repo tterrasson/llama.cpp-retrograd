@@ -43,6 +43,106 @@ typedef struct rir_cumsum_params {
 } rir_cumsum_params;
 static_assert(sizeof(rir_cumsum_params) == 48, "registre : push_constant_bytes");
 
+typedef struct rir_out_prod_params {
+    uint32_t n_i;
+    uint32_t n_j;
+    uint32_t n_plane;
+    uint32_t n_batch;
+    uint32_t n_k;
+    uint32_t a_nb0;
+    uint32_t a_nb1;
+    uint32_t a_nb2;
+    uint32_t a_nb3;
+    uint32_t b_nb0;
+    uint32_t b_nb1;
+    uint32_t b_nb2;
+    uint32_t b_nb3;
+    uint32_t dst_nb0;
+    uint32_t dst_nb1;
+    uint32_t dst_nb2;
+    uint32_t dst_nb3;
+} rir_out_prod_params;
+static_assert(sizeof(rir_out_prod_params) == 68, "registre : push_constant_bytes");
+
+typedef struct rir_rms_norm_back_params {
+    float    eps;
+    uint32_t n_row;
+    uint32_t n_plane;
+    uint32_t n_batch;
+    uint32_t n_col;
+    uint32_t dz_nb0;
+    uint32_t dz_nb1;
+    uint32_t dz_nb2;
+    uint32_t dz_nb3;
+    uint32_t x_nb0;
+    uint32_t x_nb1;
+    uint32_t x_nb2;
+    uint32_t x_nb3;
+    uint32_t dx_nb0;
+    uint32_t dx_nb1;
+    uint32_t dx_nb2;
+    uint32_t dx_nb3;
+} rir_rms_norm_back_params;
+static_assert(sizeof(rir_rms_norm_back_params) == 68, "registre : push_constant_bytes");
+
+typedef struct rir_add_params {
+    uint32_t n_col;
+    uint32_t n_row;
+    uint32_t n_plane;
+    uint32_t n_batch;
+    uint32_t a_nb0;
+    uint32_t a_nb1;
+    uint32_t a_nb2;
+    uint32_t a_nb3;
+    uint32_t b_nb0;
+    uint32_t b_nb1;
+    uint32_t b_nb2;
+    uint32_t b_nb3;
+    uint32_t dst_nb0;
+    uint32_t dst_nb1;
+    uint32_t dst_nb2;
+    uint32_t dst_nb3;
+} rir_add_params;
+static_assert(sizeof(rir_add_params) == 64, "registre : push_constant_bytes");
+
+typedef struct rir_mul_params {
+    uint32_t n_col;
+    uint32_t n_row;
+    uint32_t n_plane;
+    uint32_t n_batch;
+    uint32_t a_nb0;
+    uint32_t a_nb1;
+    uint32_t a_nb2;
+    uint32_t a_nb3;
+    uint32_t b_nb0;
+    uint32_t b_nb1;
+    uint32_t b_nb2;
+    uint32_t b_nb3;
+    uint32_t dst_nb0;
+    uint32_t dst_nb1;
+    uint32_t dst_nb2;
+    uint32_t dst_nb3;
+} rir_mul_params;
+static_assert(sizeof(rir_mul_params) == 64, "registre : push_constant_bytes");
+
+typedef struct rir_scale_params {
+    float    scale;
+    float    bias;
+    uint32_t n_col;
+    uint32_t n_row;
+    uint32_t n_plane;
+    uint32_t n_batch;
+    uint32_t a_nb0;
+    uint32_t a_nb1;
+    uint32_t a_nb2;
+    uint32_t a_nb3;
+    uint32_t dst_nb0;
+    uint32_t dst_nb1;
+    uint32_t dst_nb2;
+    uint32_t dst_nb3;
+} rir_scale_params;
+static_assert(sizeof(rir_scale_params) == 56, "registre : push_constant_bytes");
+
 // Largest constant buffer among the production kernels, so a generic
 // adapter can hold one without knowing which variant it is encoding.
 #define RIR_MAX_PUSH_CONSTANT_BYTES 68

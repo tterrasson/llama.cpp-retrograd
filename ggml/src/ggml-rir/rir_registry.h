@@ -4,10 +4,10 @@
 #pragma once
 #include <stdint.h>
 
-#define RIR_REGISTRY_SCHEMA 7
+#define RIR_REGISTRY_SCHEMA 11
 #define RIR_MAX_BINDINGS 4
 #define RIR_MAX_PARAMS 2
-#define RIR_MAX_AXES 4
+#define RIR_MAX_AXES 5
 #define RIR_MAX_SHAPE_RULES 2
 
 typedef enum rir_backend {
@@ -91,6 +91,13 @@ typedef struct rir_variant_desc {
     // must hold a per-variant object (a Vulkan pipeline, a SPIR-V blob) can key
     // it on the registry rather than on a name it invents.
     const char * variant;
+    // Name the generated artifact carries in the fork: the shader file, the
+    // SPIR-V symbol, the Metal entrypoint prefix. Published rather than rebuilt
+    // from `kernel` and `variant` by each backend, so no consumer has to know
+    // the naming convention — which is what lets a backend look a blob up by
+    // walking this table instead of naming one symbol per kernel
+    // (docs/INT_RIR_V3.md §R0).
+    const char * artifact;
     uint8_t      backend;      // rir_backend
     uint8_t      priority;     // higher wins among eligible variants
     // Shapes this variant claims. Zero rules = every shape (the fallback).
@@ -110,6 +117,14 @@ typedef struct rir_variant_desc {
     // stride and every addressed byte offset must be representable in it, or
     // the kernel would address the wrong bytes.
     uint8_t      index_bits;
+    // Elements one invocation covers on the contiguous axis. 1 is the scalar
+    // lowering. Above one, the shader reads and writes `vector_width`
+    // consecutive elements at a time, which is only meaningful when the
+    // contiguous stride *is* one element — so this field is also a **claim**:
+    // `ggml_rir_variant_fits_layout` refuses the variant for a node whose
+    // nb[0] is anything else, and the pair's scalar fallback takes that node
+    // (docs/INT_RIR_V4.md §P1).
+    uint8_t      vector_width;
     uint8_t      max_rank;          // maximum effective ggml rank accepted
     uint8_t      requires_subgroup; // 1 = needs the 32-lane collective below
     uint32_t     min_subgroup;
@@ -123,6 +138,22 @@ typedef struct rir_op_policy {
     const char * ggml_op;
     uint8_t      backend; // rir_backend
     uint8_t      policy;  // rir_policy
+    // The parts of this op's ggml domain the RIR kernel does **not** claim,
+    // as a bitmask of `ggml_rir_reject` values (1u << GGML_RIR_REJECT_DTYPE,
+    // ...). Zero means the kernel claims the op entirely.
+    //
+    // This is what turns a native fallback from observed into *published*
+    // (docs/INT_RIR_V4.md §P4). A rejection whose bit is set here is the
+    // declared restriction doing its job, and §11 allows the native kernel to
+    // be kept for it. A rejection whose bit is *clear* is a node the kernel
+    // said it would serve and did not — a defect, and the lane fails on it.
+    //
+    // The granularity is the *category*, not the node: this says "some dtypes
+    // are out of scope", never which. A narrowing inside a category already
+    // named here is invisible to it, and is caught instead by the claimed-node
+    // count recorded in scripts/rir-domain-baseline.tsv. The two are
+    // complementary; neither replaces the other.
+    uint32_t     assumed_domain;
 } rir_op_policy;
 
 #ifdef __cplusplus

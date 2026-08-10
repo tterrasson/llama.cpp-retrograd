@@ -37,10 +37,12 @@ void main() {
         return;
     }
     float scan5_v3 = 0.0;
+    const uint base_v7 = row_v0 * pc.x_nb1 + plane_v1 * pc.x_nb2 + batch_v2 * pc.x_nb3;
+    const uint base_v8 = row_v0 * pc.y_nb1 + plane_v1 * pc.y_nb2 + batch_v2 * pc.y_nb3;
     for (uint col_v4 = 0u; col_v4 < pc.n_col; ++col_v4) {
-        const float t_v5 = x[(col_v4 * pc.x_nb0 + row_v0 * pc.x_nb1 + plane_v1 * pc.x_nb2 + batch_v2 * pc.x_nb3) / 4u];
+        const float t_v5 = x[(col_v4 * pc.x_nb0 + base_v7) / 4u];
         scan5_v3 += t_v5;
         const float s5_v6 = scan5_v3;
-        y[(col_v4 * pc.y_nb0 + row_v0 * pc.y_nb1 + plane_v1 * pc.y_nb2 + batch_v2 * pc.y_nb3) / 4u] = s5_v6;
+        y[(col_v4 * pc.y_nb0 + base_v8) / 4u] = s5_v6;
     }
 }

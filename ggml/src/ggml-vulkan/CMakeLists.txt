@@ -61,6 +61,10 @@ if (Vulkan_FOUND)
 
     ggml_add_backend_library(ggml-vulkan
                              ggml-vulkan.cpp
+                             # retro delta: the only unit that sees the RIR
+                             # shader blobs (docs/INT_RIR_V3.md §R0)
+                             ggml-vulkan-rir.cpp
+                             ggml-vulkan-rir.h
                              ../../include/ggml-vulkan.h
                             )
 
@@ -198,6 +202,9 @@ if (Vulkan_FOUND)
     set (_ggml_vk_genshaders_dir "${CMAKE_BINARY_DIR}/$<CONFIG>")
     set (_ggml_vk_genshaders_cmd "${_ggml_vk_genshaders_dir}/vulkan-shaders-gen${_ggml_vk_host_suffix}")
     set (_ggml_vk_header     "${CMAKE_CURRENT_BINARY_DIR}/ggml-vulkan-shaders.hpp")
+    # retro delta: the RIR shaders declare themselves apart, so adding a
+    # generated kernel leaves ggml-vulkan.cpp untouched (docs/INT_RIR_V3.md §R0)
+    set (_ggml_vk_rir_header "${CMAKE_CURRENT_BINARY_DIR}/ggml-vulkan-rir-shaders.hpp")
     set (_ggml_vk_input_dir  "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders")
     set (_ggml_vk_output_dir "${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders.spv")
     set (_ggml_vk_generated_shader_files ${_ggml_vk_header})
@@ -215,15 +222,16 @@ if (Vulkan_FOUND)
                                 "${_ggml_vk_input_dir}/*.h")
 
     add_custom_command(
-        OUTPUT ${_ggml_vk_header}
+        OUTPUT ${_ggml_vk_header} ${_ggml_vk_rir_header}
         COMMAND ${_ggml_vk_genshaders_cmd}
             --output-dir ${_ggml_vk_output_dir}
             --target-hpp ${_ggml_vk_header}
+            --target-rir-hpp ${_ggml_vk_rir_header}
         DEPENDS ${_ggml_vk_shaders_gen_sources}
                 vulkan-shaders-gen
         COMMENT "Generate vulkan shaders header"
     )
-    target_sources(ggml-vulkan PRIVATE ${_ggml_vk_header})
+    target_sources(ggml-vulkan PRIVATE ${_ggml_vk_header} ${_ggml_vk_rir_header})
 
     foreach (file_full ${_ggml_vk_shader_files})
         get_filename_component(file ${file_full} NAME)
@@ -237,6 +245,7 @@ if (Vulkan_FOUND)
                 --source     ${file_full}
                 --output-dir ${_ggml_vk_output_dir}
                 --target-hpp ${_ggml_vk_header}
+                --target-rir-hpp ${_ggml_vk_rir_header}
                 --target-cpp ${_ggml_vk_target_cpp}
             DEPENDS ${file_full}
                     ${_ggml_vk_shaders_gen_sources}

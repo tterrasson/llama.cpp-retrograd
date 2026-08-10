@@ -10,7 +10,6 @@
 #include "ggml-metal-fusion.h"
 #include "ggml-metal-tuning.h"
 #include "ggml-rir/ggml-rir.h" // retro delta: RIR variants (docs/INT_RIR.md)
-#include "ggml-rir/rir_kernel_params.h" // retro delta: generated constant-buffer bound
 
 #include <cassert>
 #include <algorithm>
@@ -854,6 +853,13 @@ int ggml_metal_op_acc(ggml_metal_op_t ctx, int idx) {
 
 int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
+
+    // retro delta: RIR selection chain (docs/INT_RIR_V3.md §R2). This encoder
+    // serves a dozen ops; only GGML_OP_SCALE has a registry row, and every
+    // other one leaves here with no variant found and no site counted.
+    if (const int n = ggml_metal_op_rir_try(ctx, idx)) {
+        return n;
+    }
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
@@ -4150,6 +4156,20 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
         }
     }
 
+    // retro delta: RIR selection chain (docs/INT_RIR_V3.md §R2). Placed *after*
+    // the fusion lookahead rather than at the top of the encoder, and the guard
+    // is the point: a generated variant computes one node, so taking a node
+    // that starts a chain of `n_fuse` ADDs would silently trade a fused
+    // dispatch for `n_fuse` separate ones. The lookahead above only reads the
+    // graph and fills `args.o1`, so running it first costs nothing when RIR
+    // does take over. SUB and DIV reach this encoder too and have no registry
+    // row; they leave with no variant found and no site counted.
+    if (n_fuse == 1) {
+        if (const int n = ggml_metal_op_rir_try(ctx, idx)) {
+            return n;
+        }
+    }
+
     // the offsets of src1 and all fused buffers are relative to the start of the src1 buffer
     bid_src1.offs = 0;
 
@@ -5815,6 +5835,11 @@ int ggml_metal_op_rms_norm_back(ggml_metal_op_t ctx, int idx) {
     float eps;
     memcpy(&eps, op->op_params, sizeof(float));
 
+    // retro delta: RIR selection chain (docs/INT_RIR.md §5).
+    if (const int n = ggml_metal_op_rir_try(ctx, idx)) {
+        return n;
+    }
+
     auto pipeline = ggml_metal_library_get_pipeline_rms_norm_back(lib, op);
 
     ggml_metal_kargs_rms_norm_back args = {
@@ -5907,7 +5932,9 @@ static int ggml_metal_op_rir_dispatch(ggml_metal_op_t ctx, int idx, const rir_va
     // The generated header bounds the buffer and pins each layout with its own
     // static_assert; the filler places the fields. Both come from the manifest,
     // so no field of this struct is named here.
-    alignas(16) char args[RIR_MAX_PUSH_CONSTANT_BYTES];
+    // Capacity published by ggml-rir.h, checked there against the generated
+    // maximum (docs/INT_RIR_V3.md §R0).
+    alignas(16) char args[RIR_PUSH_CONSTANT_CAPACITY];
     if (!ggml_rir_fill_params(v, op, args, v->push_constant_bytes)) {
         GGML_ABORT("ggml-rir: %s params layout mismatch (registry says %u bytes)",
                 v->variant_id, v->push_constant_bytes);
@@ -6058,6 +6085,14 @@ int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
     // F32 src0 indexes in elements; quantized src0 can't (block layout),
     // so its kernel takes s01/s02/s03 in bytes instead.
     const int64_t es0 = op->src[0]->type == GGML_TYPE_F32 ? es : 1;
+
+    // retro delta: RIR selection chain (docs/INT_RIR.md §5). The generated
+    // variant claims only the F32, non-broadcast sub-domain; a quantized src0
+    // or a shape where src0 is broadcast over ne2/ne3 fails the portable
+    // contract and falls through to the native kernel below.
+    if (const int n = ggml_metal_op_rir_try(ctx, idx)) {
+        return n;
+    }
 
     auto pipeline = ggml_metal_library_get_pipeline_out_prod(lib, op);
 

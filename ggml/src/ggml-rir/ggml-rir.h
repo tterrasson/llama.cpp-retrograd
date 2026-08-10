@@ -77,9 +77,11 @@ typedef enum ggml_rir_reject {
     GGML_RIR_REJECT_MISSING_FEATURE = 8,
     GGML_RIR_REJECT_PIPELINE      = 9,
     GGML_RIR_REJECT_POLICY_NATIVE = 10,
+    GGML_RIR_REJECT_DEVICE_GRID   = 11,
+    GGML_RIR_REJECT_DEVICE_ALIGNMENT = 12,
 } ggml_rir_reject;
 
-#define GGML_RIR_REJECT_COUNT 11
+#define GGML_RIR_REJECT_COUNT 13
 
 // Monotonic process-wide counters; one struct, every backend accumulates.
 typedef struct ggml_rir_counters {
@@ -88,7 +90,7 @@ typedef struct ggml_rir_counters {
     uint64_t rir_dispatched;     // RIR pipeline actually encoded
     uint64_t native_dispatched;  // native kernel ran for an op with a variant
     uint64_t fallback_contract;  // reject: dtype/rank/shape/stride/range
-    uint64_t fallback_feature;   // reject: missing device feature
+    uint64_t fallback_feature;   // reject: missing feature or device limit
     uint64_t fallback_pipeline;  // reject: pipeline absent/not built
     // Same rejections, one bucket per ggml_rir_reject. The three aggregates
     // above answer "how much fell back"; this answers "widen what first",
@@ -231,6 +233,14 @@ const rir_variant_desc * ggml_rir_find_variant_for_node(int32_t ggml_op, rir_bac
 // which variant a node would use before it can check that object exists.
 bool ggml_rir_variant_fits_shape(const rir_variant_desc * v, const struct ggml_tensor * node);
 
+// Whether the *layout* a variant needs holds for `node`. Today that is the
+// vector width: a variant reading four elements at a time only accepts a
+// tensor whose contiguous stride is one element. It is a claim in the same
+// sense as a shape rule — evaluated before a variant is selected, so a
+// permuted view falls to the pair's scalar fallback instead of falling out of
+// RIR entirely (docs/INT_RIR_V4.md §P1).
+bool ggml_rir_variant_fits_layout(const rir_variant_desc * v, const struct ggml_tensor * node);
+
 // The registry's policy for `(op, backend)`: NATIVE_ONLY when the pair is
 // pinned or simply absent. Resolved once, like the selection above.
 //
@@ -240,6 +250,26 @@ bool ggml_rir_variant_fits_shape(const rir_variant_desc * v, const struct ggml_t
 // native kernel — the measurement a promotion decision needs. It can only raise
 // observe to prefer; a NATIVE_ONLY pair has no pipeline and stays unreachable.
 rir_policy ggml_rir_op_policy(int32_t ggml_op, rir_backend backend);
+
+// The parts of this op's ggml domain the RIR kernel does **not** claim, as a
+// bitmask of `ggml_rir_reject` values — `rir_op_policy.assumed_domain`
+// (docs/INT_RIR_V4.md §P4).
+//
+// This is what makes a native fallback *checkable* rather than merely counted.
+// A pair's `reject_by_reason` must be a subset of this mask: a bit that is set
+// is a restriction the registry published and §11 lets the native kernel be
+// kept for, a bit that is clear is a node the kernel said it would serve and
+// did not. The lane and the real-graph test both assert exactly that, per site.
+//
+// The granularity is the category, not the node — "some dtypes are out of
+// scope", never which — so a narrowing *inside* a declared category does not
+// show up here. `scripts/rir-domain-baseline.tsv` records the claimed-node
+// count per pair for that; the two checks are complementary.
+//
+// Keyed by the registry's `"GGML_OP_*"` spelling rather than by the enum,
+// because that is what a *site row* carries: the two consumers that need this
+// are both reporting on a site they have already attributed.
+uint32_t ggml_rir_op_assumed_domain(const char * ggml_op_spelling, rir_backend backend);
 
 // Whether `(op, backend)` is *targeted*: a variant exists **and** its policy is
 // PREFER_GENERATED, i.e. this pair is one whose native kernel RIR intends to
@@ -306,6 +336,15 @@ int32_t ggml_rir_evaluate(uint8_t backend, const struct ggml_tensor * node,
 // What a backend still owns is its queue, its buffers and its pipeline object.
 // The constant buffer and the grid are pure functions of the registry row, so
 // they are computed here once instead of being retyped in every adapter.
+
+// Capacity of the buffer a backend stages a constant buffer in before a
+// dispatch. Fixed here rather than read from the generated
+// `RIR_MAX_PUSH_CONSTANT_BYTES`, so that adding a kernel — which may raise that
+// maximum — does not recompile the backend translation units for a number they
+// only use as a bound (docs/INT_RIR_V3.md §R0). `ggml-rir.cpp` includes the
+// generated header and static_asserts that the real maximum still fits, so the
+// two cannot drift apart silently.
+#define RIR_PUSH_CONSTANT_CAPACITY 256
 
 // Fills `out` — exactly `v->push_constant_bytes` — in the layout the generated
 // shader declares: kernel params read from `node->op_params`, then one axis

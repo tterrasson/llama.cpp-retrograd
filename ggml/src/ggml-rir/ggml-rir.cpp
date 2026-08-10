@@ -1,6 +1,11 @@
 // retro delta: RIR integration support — see ggml-rir.h.
 #include "ggml-rir.h"
 
+// The generated constant-buffer layouts, included *here* and nowhere in a
+// backend: this is the unit that owns the check that the capacity the
+// backends stage into still holds every kernel (docs/INT_RIR_V3.md §R0).
+#include "rir_kernel_params.h"
+
 #include "ggml-impl.h"
 
 #include <algorithm>
@@ -9,6 +14,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+
+static_assert(RIR_MAX_PUSH_CONSTANT_BYTES <= RIR_PUSH_CONSTANT_CAPACITY,
+              "un kernel demande plus de constantes que la capacité publiée par ggml-rir.h");
 
 namespace {
 std::atomic<bool> g_force_native{false};
@@ -190,6 +198,12 @@ template <typename Pick> void bump(Pick pick) {
 // is one place, and the census table is the last thing it prints.
 void census_print(std::FILE * out);
 
+// Declared here, defined with the rest of the registry lookups below: the site
+// lines publish the declared domain next to the rejects it explains, and that
+// printing happens before the lookup is defined.
+uint32_t assumed_domain_of(const rir_op_policy * policies, uint32_t n_policies,
+                           const char * ggml_op_spelling, uint8_t backend);
+
 // RETRO_RIR_STATS=1 prints the counters at process exit — the cheap
 // observability path while the FFI report is not wired yet. Never a
 // substitute for asserting executed_impl in tests, but enough to see that
@@ -257,6 +271,37 @@ struct stats_printer {
                 if (row.counters.reject_by_reason[i] != 0) {
                     std::fprintf(stderr, " %s=%llu", ggml_rir_reject_name(i),
                         (unsigned long long) row.counters.reject_by_reason[i]);
+                }
+            }
+            // The coverage rate and the domain that explains it, on the same
+            // line as the counters that produced them (docs/INT_RIR_V4.md §P4).
+            //
+            // Printed per site and never derived from the aggregate, which
+            // cannot answer this question: a shared encoder — Metal's
+            // `ggml_metal_op_unary` serves a dozen ops, `ggml_metal_op_bin`
+            // takes SUB and DIV too — pushes nodes of *unregistered* ops
+            // through `ops_seen` with no site to attribute them to. A rate
+            // computed from the total would count those against a kernel that
+            // was never asked about them.
+            const uint64_t seen = row.counters.ops_seen;
+            std::fprintf(stderr, " coverage=%llu/%llu",
+                (unsigned long long) row.counters.rir_dispatched,
+                (unsigned long long) seen);
+            const uint32_t domain =
+                assumed_domain_of(rir_op_policies, rir_op_policy_count,
+                                  row.ggml_op ? row.ggml_op : "", row.backend);
+            std::fprintf(stderr, " domain=");
+            if (domain == 0) {
+                // "none" rather than an empty field: a consumer must be able to
+                // tell "claims the whole op" from "this build prints no domain".
+                std::fprintf(stderr, "none");
+            } else {
+                const char * sep = "";
+                for (int i = 0; i < GGML_RIR_REJECT_COUNT; ++i) {
+                    if (domain & (1u << i)) {
+                        std::fprintf(stderr, "%s%s", sep, ggml_rir_reject_name(i));
+                        sep = "|";
+                    }
                 }
             }
             std::fprintf(stderr, "\n");
@@ -394,6 +439,8 @@ void ggml_rir_count_reject(ggml_rir_reject why) {
     }
     switch (why) {
         case GGML_RIR_REJECT_MISSING_FEATURE:
+        case GGML_RIR_REJECT_DEVICE_GRID:
+        case GGML_RIR_REJECT_DEVICE_ALIGNMENT:
             bump([](counters & c) -> std::atomic<uint64_t> & { return c.fallback_feature; });
             break;
         case GGML_RIR_REJECT_PIPELINE:
@@ -412,7 +459,7 @@ const char * ggml_rir_reject_name(int32_t reject) {
     static const char * names[GGML_RIR_REJECT_COUNT] = {
         "matched", "wrong_op", "dtype", "rank", "shape", "stride",
         "quant_block", "integer_range", "missing_feature", "pipeline",
-        "policy_native",
+        "policy_native", "device_grid", "device_alignment",
     };
     if (reject < 0 || reject >= GGML_RIR_REJECT_COUNT) {
         return "unknown";
@@ -521,6 +568,20 @@ rir_policy policy_of(const rir_op_policy * policies, uint32_t n_policies,
     }
     // A pair absent from the table is native-only by definition (rir_registry.h).
     return RIR_POLICY_NATIVE_ONLY;
+}
+
+// The declared domain of the same row. Absent from the table means no claim was
+// made at all, and an empty mask is then the honest answer: nothing is
+// published, so nothing is excused.
+uint32_t assumed_domain_of(const rir_op_policy * policies, uint32_t n_policies,
+                           const char * ggml_op_spelling, uint8_t backend) {
+    for (uint32_t i = 0; i < n_policies; ++i) {
+        const rir_op_policy & p = policies[i];
+        if (p.backend == backend && std::strcmp(p.ggml_op, ggml_op_spelling) == 0) {
+            return p.assumed_domain;
+        }
+    }
+    return 0;
 }
 
 // Whether `name` appears in a comma-separated list ("CUMSUM,L2_NORM_BACK").
@@ -659,7 +720,8 @@ const rir_variant_desc * ggml_rir_select_variant(
         // not fit this node is not a worse candidate, it is not a candidate:
         // its schedule was measured on the shapes it claims and loses — often
         // by a factor of several — everywhere else (docs/INT_RIR_V3.md §R1).
-        if (node != nullptr && !ggml_rir_variant_fits_shape(&v, node)) {
+        if (node != nullptr
+                && (!ggml_rir_variant_fits_shape(&v, node) || !ggml_rir_variant_fits_layout(&v, node))) {
             continue;
         }
         // Strictly greater: the first row wins a tie, so the table order is
@@ -805,7 +867,8 @@ const rir_variant_desc * ggml_rir_find_variant_for_node(int32_t ggml_op, rir_bac
     // answers "a variant". That property is checked at generation
     // (`check_schedule_table`), not hoped for here.
     for (uint32_t i = 0; i < sel.n_candidates; ++i) {
-        if (ggml_rir_variant_fits_shape(sel.candidates[i], node)) {
+        if (ggml_rir_variant_fits_shape(sel.candidates[i], node)
+                && ggml_rir_variant_fits_layout(sel.candidates[i], node)) {
             return sel.candidates[i];
         }
     }
@@ -818,6 +881,14 @@ rir_policy ggml_rir_op_policy(int32_t ggml_op, rir_backend backend) {
     }
     std::call_once(g_selection_once, build_selection);
     return g_selection[ggml_op][(int) backend].policy;
+}
+
+uint32_t ggml_rir_op_assumed_domain(const char * ggml_op_spelling, rir_backend backend) {
+    if (ggml_op_spelling == nullptr || (int) backend >= RIR_N_BACKENDS) {
+        return 0;
+    }
+    return assumed_domain_of(rir_op_policies, rir_op_policy_count, ggml_op_spelling,
+                             (uint8_t) backend);
 }
 
 bool ggml_rir_op_is_targeted(int32_t ggml_op, rir_backend backend) {
@@ -904,6 +975,38 @@ bool ggml_rir_variant_fits_shape(const rir_variant_desc * v, const struct ggml_t
     return true;
 }
 
+bool ggml_rir_variant_fits_layout(const rir_variant_desc * v, const struct ggml_tensor * node) {
+    if (v == nullptr || node == nullptr) {
+        return false;
+    }
+    if (v->vector_width <= 1) {
+        return true;  // the scalar lowering accepts any stride the contract does
+    }
+    // The vectorized axis is the one walking grid dimension x — the contiguous
+    // one, by construction of the lowering. Only the bindings this axis indexes
+    // *at dimension 0* are read in vectors; a binding it indexes elsewhere (or
+    // not at all) is read scalar and broadcast, and its stride is free.
+    const int8_t a = v->dispatch[0].axis;
+    if (a < 0 || (uint32_t) a >= v->n_axes) {
+        return false;
+    }
+    for (uint32_t b = 0; b < v->n_bindings; ++b) {
+        if (v->axes[a].dim[b] != 0) {
+            continue;
+        }
+        const ggml_tensor * t = ggml_rir_binding_tensor(v, b, node);
+        if (t == nullptr) {
+            return false;
+        }
+        // `w` consecutive elements have to be `w` consecutive addresses, which
+        // is exactly what a unit contiguous stride says and nothing else does.
+        if (v->bindings[b].elem_bytes == 0 || t->nb[0] != v->bindings[b].elem_bytes) {
+            return false;
+        }
+    }
+    return true;
+}
+
 int32_t ggml_rir_evaluate_portable(const rir_variant_desc * v, const struct ggml_tensor * node) {
     if (v == nullptr || node == nullptr) {
         return GGML_RIR_REJECT_WRONG_OP;
@@ -945,6 +1048,13 @@ int32_t ggml_rir_evaluate_portable(const rir_variant_desc * v, const struct ggml
         if (ggml_rir_max_byte_offset(t) > index_max) {
             return GGML_RIR_REJECT_INTEGER_RANGE;
         }
+    }
+
+    // The layout half of a variant's claim. Reached only when selection handed
+    // this row a node it does not fit — a shape-blind lookup, or a caller
+    // naming the variant — and it must say `stride` rather than run.
+    if (!ggml_rir_variant_fits_layout(v, node)) {
+        return GGML_RIR_REJECT_STRIDE;
     }
 
     // One extent is passed per axis, for every binding that indexes it: the

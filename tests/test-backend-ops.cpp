@@ -9740,6 +9740,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             // folds the row axis into 512-wide slices), which the shader only
             // survives with its row >= KY guard.
             test_cases.emplace_back(new test_rms_norm_back(GGML_TYPE_F32, { 65, 600, 1, 1 }, eps));
+            // retro delta: few rows and a wide one — the domain the RIR
+            // `shared_reduce` variant claims (docs/INT_RIR_V4.md §P3), and the
+            // destination shape the Qwen3.5 backward graph emits most often.
+            // Without it the whole eval matrix sits on the 32-lane fallback and
+            // the arbitrated variant is never exercised on a device.
+            test_cases.emplace_back(new test_rms_norm_back(GGML_TYPE_F32, { 1024, 16, 1, 1 }, eps));
             // retro delta: L2_NORM_BACK — rank 4, unaligned columns, a single
             // row, a single column, a row count above 512 to cross the native
             // shader's grid split, and the packed-QKV view geometry of the
@@ -11097,6 +11103,68 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // (docs/INT_RIR.md §11 phase B); run it with and without RETRO_RIR_MODE.
     test_cases.emplace_back(new test_l2_norm_back(GGML_TYPE_F32, { 128, 16, 16, 1 }, 1e-6f, true));
     test_cases.emplace_back(new test_l2_norm_back(GGML_TYPE_F32, { 128, 16, 16, 1 }, 1e-6f, false));
+
+    // retro delta: OUT_PROD on the destination shapes the Qwen3.5 backward graph
+    // actually emits (docs/INT_RIR_V3.md §R2 census): [1024,16] dominates at 976
+    // nodes, then [3584,16] and [2048,16] at 168 each, and the two degenerate
+    // ones the LoRA rank produces — a single column and a single row.
+    //
+    // `bs = nr = {1,1}` on purpose: `nr > 1` is the broadcast of src0 over ne2/ne3,
+    // which the RIR variant does not claim, and timing a shape it declines would
+    // compare the native kernel to itself. The contraction length is swept rather
+    // than read off the census, which records destinations only.
+    for (int64_t k : {128, 2048}) {
+        test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32, 1024, 16, k, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32, 3584,   16, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32, 2048,   16, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32, 1024,    1, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32,    1, 4096, 2048, {1, 1}, {1, 1}));
+
+    // retro delta: RMS_NORM_BACK on the destination shapes the two censused
+    // backward graphs actually emit (docs/INT_RIR_V3.md §R2). Qwen3.5:
+    // [1024,16,1,1] at 336 nodes, [128,16,16,1] at 120, [256,8,16,1] at 48,
+    // [256,2,16,1] at 40. gemma-3-270m: [640,16,1,1] at 576, [256,4,16,1] at 144.
+    // Two row widths, two occupancies each — which is exactly the axis a
+    // per-row subgroup reduction is decided on.
+    for (float eps : {1e-6f}) {
+        test_cases.emplace_back(new test_rms_norm_back(GGML_TYPE_F32, { 1024, 16, 1, 1 }, eps));
+        test_cases.emplace_back(new test_rms_norm_back(GGML_TYPE_F32, {  640, 16, 1, 1 }, eps));
+        test_cases.emplace_back(new test_rms_norm_back(GGML_TYPE_F32, {  128, 16, 16, 1 }, eps));
+        test_cases.emplace_back(new test_rms_norm_back(GGML_TYPE_F32, {  256,  8, 16, 1 }, eps));
+        test_cases.emplace_back(new test_rms_norm_back(GGML_TYPE_F32, {  256,  4, 16, 1 }, eps));
+    }
+
+    // retro delta: the elementwise band — ADD, MUL, SCALE — on the destination
+    // shapes the censused Qwen3.5 backward graph emits, ranked by node count
+    // (docs/INT_RIR_V3.md §R2). ADD: [1024,16,1,1] at 1744 nodes, [16,16,1,1]
+    // at 288, [4096,16,1,1] at 96. MUL: [1024,16,1,1] at 1120, [128,16,16,1]
+    // at 936, [16,16,1,1] at 528, [2048,16,1,1] at 288. SCALE: [4096,16,1,1]
+    // at 192, [2048,144,1,1] at 120, [256,8,16,1] at 48.
+    //
+    // `nr = {1,1,1,1}` throughout, and deliberately: a repeated src1 is the
+    // sub-domain the generated variant declines, so timing one would compare
+    // the native kernel against itself. The two extremes matter as much as the
+    // bulk — [16,16,1,1] is 256 elements, small enough that the launch
+    // dominates, and [2048,144,1,1] is where bandwidth alone decides.
+    //
+    // `ADD` and `MUL` share one lowering, so they are also swept over the same
+    // row length — 16, 1024, 2048, 4096 at 16 rows. That column is not padding:
+    // the band's whole question is where a scalar-per-thread kernel falls
+    // behind a native one that loads float4, and a sweep says it where a single
+    // point could only assert it.
+    test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {1024,  16, 1, 1}, {1, 1, 1, 1}));
+    test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {2048,  16, 1, 1}, {1, 1, 1, 1}));
+    test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {4096,  16, 1, 1}, {1, 1, 1, 1}));
+    test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {  16,  16, 1, 1}, {1, 1, 1, 1}));
+    test_cases.emplace_back(new test_bin_bcast(ggml_mul, GGML_TYPE_F32, {1024,  16, 1, 1}, {1, 1, 1, 1}));
+    test_cases.emplace_back(new test_bin_bcast(ggml_mul, GGML_TYPE_F32, {2048,  16, 1, 1}, {1, 1, 1, 1}));
+    test_cases.emplace_back(new test_bin_bcast(ggml_mul, GGML_TYPE_F32, {4096,  16, 1, 1}, {1, 1, 1, 1}));
+    test_cases.emplace_back(new test_bin_bcast(ggml_mul, GGML_TYPE_F32, { 128,  16, 16, 1}, {1, 1, 1, 1}));
+    test_cases.emplace_back(new test_bin_bcast(ggml_mul, GGML_TYPE_F32, {  16,  16, 1, 1}, {1, 1, 1, 1}));
+    test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {4096,  16,  1, 1}, 2.0f, 0.5f));
+    test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {2048, 144,  1, 1}, 2.0f, 0.5f));
+    test_cases.emplace_back(new test_scale(GGML_TYPE_F32, { 256,   8, 16, 1}, 2.0f, 0.5f));
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

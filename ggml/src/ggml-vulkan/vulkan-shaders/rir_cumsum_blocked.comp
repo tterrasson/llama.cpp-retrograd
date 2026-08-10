@@ -39,23 +39,26 @@ void main() {
     }
     const uint lane_v3 = gl_LocalInvocationID.x;
     float part5_v4 = 0.0;
+    const uint base_v12 = row_v0 * pc.x_nb1 + plane_v1 * pc.x_nb2 + batch_v2 * pc.x_nb3;
     const uint chunk_col_v5 = (pc.n_col + 32u - 1u) / 32u;
     const uint beg_col_v5 = min(lane_v3 * chunk_col_v5, pc.n_col);
     const uint end_col_v5 = min((lane_v3 + 1u) * chunk_col_v5, pc.n_col);
     for (uint col_v5 = beg_col_v5; col_v5 < end_col_v5; ++col_v5) {
-        const float t_v6 = x[(col_v5 * pc.x_nb0 + row_v0 * pc.x_nb1 + plane_v1 * pc.x_nb2 + batch_v2 * pc.x_nb3) / 4u];
+        const float t_v6 = x[(col_v5 * pc.x_nb0 + base_v12) / 4u];
         part5_v4 += t_v6;
     }
     const float off5_v7 = subgroupExclusiveAdd(part5_v4);
     float scan5_v9 = 0.0;
     scan5_v9 += off5_v7;
+    const uint base_v13 = row_v0 * pc.x_nb1 + plane_v1 * pc.x_nb2 + batch_v2 * pc.x_nb3;
+    const uint base_v14 = row_v0 * pc.y_nb1 + plane_v1 * pc.y_nb2 + batch_v2 * pc.y_nb3;
     const uint chunk_col_v8 = (pc.n_col + 32u - 1u) / 32u;
     const uint beg_col_v8 = min(lane_v3 * chunk_col_v8, pc.n_col);
     const uint end_col_v8 = min((lane_v3 + 1u) * chunk_col_v8, pc.n_col);
     for (uint col_v8 = beg_col_v8; col_v8 < end_col_v8; ++col_v8) {
-        const float t_v10 = x[(col_v8 * pc.x_nb0 + row_v0 * pc.x_nb1 + plane_v1 * pc.x_nb2 + batch_v2 * pc.x_nb3) / 4u];
+        const float t_v10 = x[(col_v8 * pc.x_nb0 + base_v13) / 4u];
         scan5_v9 += t_v10;
         const float s5_v11 = scan5_v9;
-        y[(col_v8 * pc.y_nb0 + row_v0 * pc.y_nb1 + plane_v1 * pc.y_nb2 + batch_v2 * pc.y_nb3) / 4u] = s5_v11;
+        y[(col_v8 * pc.y_nb0 + base_v14) / 4u] = s5_v11;
     }
 }
