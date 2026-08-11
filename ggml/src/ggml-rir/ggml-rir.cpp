@@ -8,6 +8,10 @@
 
 #include "ggml-impl.h"
 
+// The canonical quantized-format table, for the one thing this unit needs from
+// it: the ggml_type a registry dtype spelling denotes.
+#include "ggml-retro-quant.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -44,7 +48,14 @@ std::atomic<bool> g_mode_latched{false};
 
 ggml_rir_mode mode_from_env() {
     const char * v = std::getenv("RETRO_RIR_MODE");
-    if (v == nullptr || std::strcmp(v, "off") == 0) {
+    // Absent is `prefer` since docs/INT_RIR_V4.md §P6: the promoted pairs are
+    // the build's own dispatch path, not an opt-in experiment. `off` stays a
+    // spelling, so the bench and the diagnostic keep their native run — for the
+    // pairs that still have a native kernel to run.
+    if (v == nullptr) {
+        return GGML_RIR_MODE_PREFER;
+    }
+    if (std::strcmp(v, "off") == 0) {
         return GGML_RIR_MODE_OFF;
     }
     if (std::strcmp(v, "observe") == 0) {
@@ -459,7 +470,7 @@ const char * ggml_rir_reject_name(int32_t reject) {
     static const char * names[GGML_RIR_REJECT_COUNT] = {
         "matched", "wrong_op", "dtype", "rank", "shape", "stride",
         "quant_block", "integer_range", "missing_feature", "pipeline",
-        "policy_native", "device_grid", "device_alignment",
+        "policy_native", "device_grid", "device_alignment", "op_variant",
     };
     if (reject < 0 || reject >= GGML_RIR_REJECT_COUNT) {
         return "unknown";
@@ -478,9 +489,21 @@ const char * ggml_rir_backend_name(uint8_t backend) {
 }
 
 uint64_t ggml_rir_max_byte_offset(const struct ggml_tensor * t) {
+    // Dimension 0 of a quantized tensor advances by **block**, not by element:
+    // `ne[0]` counts logical elements while `nb[0]` is the block size. The
+    // largest index that multiplies `nb[0]` is therefore `ne[0]/blck - 1`, and
+    // using `ne[0] - 1` overstated the span by a factor of `block_elements` —
+    // enough to refuse a perfectly addressable q4_K row with `integer_range`.
+    // Unreachable until §P5 gave a quantized binding to the portable contract,
+    // which is why it stood.
+    const int64_t blck = ggml_blck_size(t->type);
     uint64_t last = 0;
     for (int d = 0; d < GGML_MAX_DIMS; ++d) {
-        const uint64_t n = t->ne[d] > 0 ? (uint64_t) (t->ne[d] - 1) : 0;
+        int64_t units = t->ne[d];
+        if (d == 0 && blck > 1) {
+            units = (units + blck - 1) / blck;
+        }
+        const uint64_t n = units > 0 ? (uint64_t) (units - 1) : 0;
         last += n*(uint64_t) t->nb[d];
     }
     return last + ggml_type_size(t->type);
@@ -530,10 +553,16 @@ constexpr int RIR_N_BACKENDS = 4;  // rir_backend is dense: cuda/vulkan/metal/cp
 // which is what the mode, the policy and the pipeline-creation paths ask.
 //
 // `candidates` is what a *node* is resolved against, in descending priority so
-// the per-node choice is a scan that stops at the first fit. It is small by
-// construction: a pair publishes one lowering per shape regime, not one per
-// shape.
-constexpr uint32_t RIR_MAX_PAIR_VARIANTS = 4;
+// the per-node choice is a scan that stops at the first fit. It is bounded by
+// construction: a pair publishes one lowering per shape regime and one per
+// `src0` dtype it can read (docs/INT_RIR_V4.md §P5), not one per shape.
+//
+// Sixteen and not eight since FUTURE V1 §5: `OUT_PROD` reads the ten standard
+// quantized formats plus two, and its F32 fallback, which is thirteen rows for
+// one pair. The bound is still a bound and still aborts rather than dropping a
+// row — a variant the table cannot hold is one that would never be selected,
+// which is worse than a loud failure at startup.
+constexpr uint32_t RIR_MAX_PAIR_VARIANTS = 32;
 
 struct op_selection {
     const rir_variant_desc * variant = nullptr;  // null when unregistered
@@ -716,12 +745,14 @@ const rir_variant_desc * ggml_rir_select_variant(
         if (policy_of(policies, n_policies, v.ggml_op, backend) == RIR_POLICY_NATIVE_ONLY) {
             continue;  // the policy table vetoes, whatever the row says
         }
-        // The shape filter, when a node is in hand. A specialization that does
+        // The claim filters, when a node is in hand. A specialization that does
         // not fit this node is not a worse candidate, it is not a candidate:
         // its schedule was measured on the shapes it claims and loses — often
-        // by a factor of several — everywhere else (docs/INT_RIR_V3.md §R1).
+        // by a factor of several — everywhere else (docs/INT_RIR_V3.md §R1),
+        // and a row whose dtype does not match would reinterpret the bytes.
         if (node != nullptr
-                && (!ggml_rir_variant_fits_shape(&v, node) || !ggml_rir_variant_fits_layout(&v, node))) {
+                && (!ggml_rir_variant_fits_shape(&v, node) || !ggml_rir_variant_fits_layout(&v, node)
+                    || !ggml_rir_variant_fits_dtype(&v, node))) {
             continue;
         }
         // Strictly greater: the first row wins a tie, so the table order is
@@ -805,6 +836,7 @@ uint32_t ggml_rir_selftest_selection(void) {
         rir_variant_desc v = row(id, priority, backend);
         v.n_bindings = 1;
         v.bindings[0].source = -1;  // the dst tensor
+        v.bindings[0].dtype  = "f32";
         v.n_axes  = 1;
         v.axes[0] = {"row", {1, -1, -1, -1}};
         v.n_shape_rules = n_rules;
@@ -817,7 +849,8 @@ uint32_t ggml_rir_selftest_selection(void) {
     };
 
     ggml_tensor probe = {};
-    probe.op = (enum ggml_op) op;
+    probe.op   = (enum ggml_op) op;
+    probe.type = GGML_TYPE_F32;
     for (int d = 0; d < GGML_MAX_DIMS; ++d) {
         probe.ne[d] = 1;
     }
@@ -839,6 +872,115 @@ uint32_t ggml_rir_selftest_selection(void) {
     // bit 10: with no node, the shape filter is skipped and the shape-blind
     // answer is the highest priority — the question pipeline creation asks.
     if (!is(picked(arbitrated, 2, prefer, 1), "special")) { failures |= 1u << 10; }
+
+    // --- per-dtype arbitration (docs/INT_RIR_V4.md §P5) ---------------------
+    //
+    // The same mechanism, on the third claim: `OUT_PROD` publishes one row per
+    // `src0` dtype it can read, and what picks between them is the node's own
+    // type. Exercised synthetically for the reason the shape rules were — with
+    // the shipped table alone, "the dtype was checked" and "the F32 row
+    // happened to come first" are indistinguishable.
+    auto typed = [&](const char * id, const char * dtype) {
+        rir_variant_desc v = row(id, 80, backend);
+        v.n_bindings = 1;
+        v.bindings[0].source = -1;
+        v.bindings[0].dtype  = dtype;
+        return v;
+    };
+    // Deliberately in this order and at equal priority: the quantized row comes
+    // first, so anything picking it for an F32 node is the dtype filter missing
+    // and not the table order saving us.
+    const rir_variant_desc by_dtype[] = {typed("quant", "q4_0"), typed("plain", "f32")};
+    auto picked_type = [&](ggml_type t) {
+        probe.type  = t;
+        probe.ne[1] = 1;
+        const rir_variant_desc * v = ggml_rir_select_variant(
+                by_dtype, 2, prefer, 1, op, backend, &probe);
+        return v ? v->variant_id : nullptr;
+    };
+    // bit 11: an F32 node takes the F32 row, past a higher-placed quantized one.
+    if (!is(picked_type(GGML_TYPE_F32), "plain")) { failures |= 1u << 11; }
+    // bit 12: a quantized node takes the row that claims its format.
+    if (!is(picked_type(GGML_TYPE_Q4_0), "quant")) { failures |= 1u << 12; }
+    // bit 13: a format no row claims selects nothing here — the caller's own
+    // fallback then takes it and the contract rejects it with `dtype`, which is
+    // the one outcome that must never be a reinterpreted read.
+    if (picked_type(GGML_TYPE_Q6_K) != nullptr) { failures |= 1u << 13; }
+    probe.type = GGML_TYPE_F32;
+
+    // --- the vectorized fold claim (docs/FUTURE_V1.md §6) -------------------
+    //
+    // The fourth claim, and the only one that is a *relation* between two axes:
+    // a vec4 variant reading an operand through a fold needs that fold to be
+    // the identity **and** that operand's own contiguous stride to be one
+    // element. Both halves are exercised here rather than on the shipped table,
+    // for the reason the shape rules were: with `add`/`add_repeat` alone,
+    // "the claim was evaluated" and "the claim happened to hold" look alike.
+    //
+    // Two axes: `col` (vectorized, read from dim 0 of src0) and `col_b`
+    // (dim 0 of src1, folded into `col`).
+    auto folded = [&](const char * id, uint8_t width) {
+        rir_variant_desc v = row(id, width > 1 ? 90 : 80, backend);
+        v.n_bindings = 2;
+        v.bindings[0].source = 0;
+        v.bindings[0].dtype  = "f32";
+        v.bindings[0].rank   = 1;
+        v.bindings[0].elem_bytes = 4;
+        v.bindings[1].source = 1;
+        v.bindings[1].dtype  = "f32";
+        v.bindings[1].rank   = 1;
+        v.bindings[1].elem_bytes = 4;
+        v.n_axes  = 2;
+        v.axes[0] = {"col",   {0, -1, -1, -1}, -1};
+        v.axes[1] = {"col_b", {-1, 0, -1, -1},  0};
+        v.dispatch[0] = {0, 1};
+        v.vector_width = width;
+        return v;
+    };
+    const rir_variant_desc by_fold[] = {folded("vec4", 4), folded("scalar", 1)};
+
+    ggml_tensor src0 = {};
+    ggml_tensor src1 = {};
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        src0.ne[d] = 1;
+        src1.ne[d] = 1;
+        src0.nb[d] = 4;
+        src1.nb[d] = 4;
+    }
+    src0.type = GGML_TYPE_F32;
+    src1.type = GGML_TYPE_F32;
+    src0.ne[0] = 8;
+    ggml_tensor folded_node = {};
+    folded_node.op   = (enum ggml_op) op;
+    folded_node.type = GGML_TYPE_F32;
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        folded_node.ne[d] = 1;
+    }
+    folded_node.ne[0] = 8;
+    folded_node.src[0] = &src0;
+    folded_node.src[1] = &src1;
+    auto picked_fold = [&]() {
+        const rir_variant_desc * v = ggml_rir_select_variant(
+                by_fold, 2, prefer, 1, op, backend, &folded_node);
+        return v ? v->variant_id : nullptr;
+    };
+
+    // bit 14: the fold is the identity and src1 is contiguous — the vectorized
+    // row is selected, which is what makes the claim worth publishing at all.
+    src1.ne[0] = 8;
+    src1.nb[0] = 4;
+    if (!is(picked_fold(), "vec4")) { failures |= 1u << 14; }
+    // bit 15: a real repeat on the contiguous axis. Four consecutive indices
+    // are no longer four consecutive addresses, so the scalar row must take it.
+    src1.ne[0] = 2;
+    if (!is(picked_fold(), "scalar")) { failures |= 1u << 15; }
+    // bit 16: the same extent, but a **permuted** src1. This is the half a
+    // fold-only check misses: the operand is indexed by `col_b`, so the stride
+    // test on `col` never looks at it, and the vec4 row would read four
+    // consecutive addresses against a stride that is not one element.
+    src1.ne[0] = 8;
+    src1.nb[0] = 8;
+    if (!is(picked_fold(), "scalar")) { failures |= 1u << 16; }
 
     return failures;
 }
@@ -867,8 +1009,18 @@ const rir_variant_desc * ggml_rir_find_variant_for_node(int32_t ggml_op, rir_bac
     // answers "a variant". That property is checked at generation
     // (`check_schedule_table`), not hoped for here.
     for (uint32_t i = 0; i < sel.n_candidates; ++i) {
+        // `fits_axes` is here since FUTURE V1 §6, and it is what makes two
+        // kernels of one op selectable by *shape*. Until then no two variants
+        // of a pair disagreed about which extents must match, so the shape half
+        // of the contract could wait for `evaluate_portable`. Now `mul` claims
+        // three equal shapes and `mul_repeat` claims a divisor: a repeated node
+        // that reached `mul` would be refused with `shape` and leave for the
+        // native kernel, never trying the variant written for it.
         if (ggml_rir_variant_fits_shape(sel.candidates[i], node)
-                && ggml_rir_variant_fits_layout(sel.candidates[i], node)) {
+                && ggml_rir_variant_fits_axes(sel.candidates[i], node)
+                && ggml_rir_variant_fits_layout(sel.candidates[i], node)
+                && ggml_rir_variant_fits_dtype(sel.candidates[i], node)
+                && ggml_rir_variant_fits_op_variant(sel.candidates[i], node)) {
             return sel.candidates[i];
         }
     }
@@ -896,6 +1048,50 @@ bool ggml_rir_op_is_targeted(int32_t ggml_op, rir_backend backend) {
         && ggml_rir_op_policy(ggml_op, backend) == RIR_POLICY_PREFER_GENERATED;
 }
 
+bool ggml_rir_op_native_retired(const char * ggml_op_spelling, rir_backend backend) {
+    if (ggml_op_spelling == nullptr || (int) backend >= RIR_N_BACKENDS) {
+        return false;
+    }
+    // Both spellings are accepted, and deliberately: the registry writes
+    // "GGML_OP_ADD", a site row carries the same string, and a dispatch site
+    // holds `ggml_op_name`, which is "ADD". One lookup for all three beats
+    // three call sites remembering which one they have.
+    const char * want = strip_ggml_op_prefix(ggml_op_spelling);
+    for (uint32_t i = 0; i < rir_op_policy_count; ++i) {
+        const rir_op_policy & p = rir_op_policies[i];
+        if (p.backend == (uint8_t) backend &&
+                std::strcmp(strip_ggml_op_prefix(p.ggml_op), want) == 0) {
+            return p.native_retired != 0;
+        }
+    }
+    return false;
+}
+
+bool ggml_rir_supports_op(uint8_t backend, const struct ggml_tensor * node) {
+    if (node == nullptr || backend >= RIR_N_BACKENDS) {
+        return false;
+    }
+    // The configured mode, not the dispatch mode: `ggml_rir_set_force_native`
+    // is a probe knob that lowers what a *site* may encode, and letting it move
+    // `supports_op` would move the graph split under a running probe — the node
+    // would leave the backend instead of taking its native path. A pair whose
+    // native is retired has no native path to force, and that is refused where
+    // the forcing is asked for, not silently here.
+    if (ggml_rir_get_mode() < GGML_RIR_MODE_PREFER) {
+        return false;
+    }
+    if (ggml_rir_op_policy((int32_t) node->op, (rir_backend) backend)
+            != RIR_POLICY_PREFER_GENERATED) {
+        return false;
+    }
+    const rir_variant_desc * v =
+        ggml_rir_find_variant_for_node((int32_t) node->op, (rir_backend) backend, node);
+    if (v == nullptr) {
+        return false;
+    }
+    return ggml_rir_evaluate_portable(v, node) == GGML_RIR_MATCHED;
+}
+
 // --- the portable half of the contract --------------------------------------
 
 const struct ggml_tensor * ggml_rir_binding_tensor(const rir_variant_desc * v, uint32_t i,
@@ -918,9 +1114,17 @@ namespace {
 ggml_type ggml_type_of_dtype(const char * dtype) {
     if (dtype == nullptr)                    { return GGML_TYPE_COUNT; }
     if (std::strcmp(dtype, "f32")  == 0)     { return GGML_TYPE_F32;  }
-    if (std::strcmp(dtype, "f16")  == 0)     { return GGML_TYPE_F16;  }
     if (std::strcmp(dtype, "bf16") == 0)     { return GGML_TYPE_BF16; }
     if (std::strcmp(dtype, "i32")  == 0)     { return GGML_TYPE_I32;  }
+    // The quantized spellings are **expanded from the canonical table**, not
+    // restated: `ggml_type_name(q4_K)` is what the registry prints, and the
+    // same header generates both sides (docs/INT_RIR.md §7.2). Writing the
+    // list here is how a format ends up known to one side and not the other.
+    // F16 is a row of that table, so it needs no line of its own.
+#define RIR_DTYPE_ROW(TYPE, BLK, NL, NAME, VKNAME) \
+    if (std::strcmp(dtype, #NAME) == 0) { return TYPE; }
+    GGML_RETRO_OUT_PROD_TYPES(RIR_DTYPE_ROW)
+#undef RIR_DTYPE_ROW
     return GGML_TYPE_COUNT;
 }
 
@@ -990,21 +1194,125 @@ bool ggml_rir_variant_fits_layout(const rir_variant_desc * v, const struct ggml_
     if (a < 0 || (uint32_t) a >= v->n_axes) {
         return false;
     }
-    for (uint32_t b = 0; b < v->n_bindings; ++b) {
-        if (v->axes[a].dim[b] != 0) {
+    // `w` consecutive elements have to be `w` consecutive addresses, which is
+    // exactly what a unit contiguous stride says and nothing else does.
+    auto unit_stride_at_dim0 = [&](uint32_t axis) {
+        for (uint32_t b = 0; b < v->n_bindings; ++b) {
+            if (v->axes[axis].dim[b] != 0) {
+                continue;
+            }
+            const ggml_tensor * t = ggml_rir_binding_tensor(v, b, node);
+            if (t == nullptr) {
+                return false;
+            }
+            if (v->bindings[b].elem_bytes == 0 || t->nb[0] != v->bindings[b].elem_bytes) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!unit_stride_at_dim0(a)) {
+        return false;
+    }
+    // The operand read through a **fold** owes both halves of that sentence
+    // (docs/FUTURE_V1.md §6). An axis folded into the vectorized one replays
+    // index `i` as `i % extent`, so it is read in vectors too — which needs the
+    // fold to be the identity *and* its own binding to have a unit contiguous
+    // stride. The first alone is not enough: a `src1` with the same `ne0` but a
+    // permuted `nb[0]` is indexed by the folded axis, not by `a`, so the loop
+    // above never looks at it and four consecutive indices would be read as
+    // four consecutive addresses against its stride.
+    for (uint32_t f = 0; f < v->n_axes; ++f) {
+        if (v->axes[f].folded_of != (int8_t) a) {
             continue;
         }
-        const ggml_tensor * t = ggml_rir_binding_tensor(v, b, node);
-        if (t == nullptr) {
+        if (axis_extent(v, f, node) != axis_extent(v, a, node)) {
             return false;
         }
-        // `w` consecutive elements have to be `w` consecutive addresses, which
-        // is exactly what a unit contiguous stride says and nothing else does.
-        if (v->bindings[b].elem_bytes == 0 || t->nb[0] != v->bindings[b].elem_bytes) {
+        if (!unit_stride_at_dim0(f)) {
             return false;
         }
     }
     return true;
+}
+
+bool ggml_rir_variant_fits_axes(const rir_variant_desc * v, const struct ggml_tensor * node) {
+    if (v == nullptr || node == nullptr) {
+        return false;
+    }
+    for (uint32_t a = 0; a < v->n_axes; ++a) {
+        // A **folded** axis is the divisor of a repeat (docs/FUTURE_V1.md §6),
+        // not a shared extent: what it owes is divisibility, which is
+        // `ggml_can_repeat` and is checked just below. Requiring agreement here
+        // would refuse the very shapes the repeating kernel exists to serve.
+        const int8_t folded = v->axes[a].folded_of;
+        if (folded >= 0) {
+            if ((uint32_t) folded >= v->n_axes) {
+                return false;  // a relation the registry could not resolve
+            }
+            const int64_t under = axis_extent(v, (uint32_t) folded, node);
+            const int64_t over  = axis_extent(v, a, node);
+            if (over <= 0 || under % over != 0) {
+                return false;
+            }
+            continue;
+        }
+        int64_t extent = -1;
+        for (uint32_t b = 0; b < v->n_bindings; ++b) {
+            const int8_t dim = v->axes[a].dim[b];
+            if (dim < 0) {
+                continue;
+            }
+            const ggml_tensor * t = ggml_rir_binding_tensor(v, b, node);
+            if (t == nullptr) {
+                return false;
+            }
+            if (extent < 0) {
+                extent = t->ne[dim];
+            } else if (t->ne[dim] != extent) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool ggml_rir_variant_fits_dtype(const rir_variant_desc * v, const struct ggml_tensor * node) {
+    if (v == nullptr || node == nullptr) {
+        return false;
+    }
+    for (uint32_t b = 0; b < v->n_bindings; ++b) {
+        const ggml_tensor * t = ggml_rir_binding_tensor(v, b, node);
+        if (t == nullptr || t->type != ggml_type_of_dtype(v->bindings[b].dtype)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ggml_rir_variant_fits_op_variant(const rir_variant_desc * v, const struct ggml_tensor * node) {
+    if (v == nullptr || node == nullptr) {
+        return false;
+    }
+    // A variant that claims no member serves every node of its op — which is
+    // every op that is not a family, and is what keeps this check free for them.
+    if (v->ggml_op_variant == nullptr) {
+        return true;
+    }
+    if (node->op != GGML_OP_UNARY) {
+        // The only family today. A registry row claiming a member on any other
+        // op is a generator bug, and answering "no" is what turns it into a
+        // published refusal instead of a wrong function silently computed.
+        return false;
+    }
+    static const char prefix[] = "GGML_UNARY_OP_";
+    const size_t n = sizeof(prefix) - 1;
+    const char * want = std::strncmp(v->ggml_op_variant, prefix, n) == 0
+                      ? v->ggml_op_variant + n : v->ggml_op_variant;
+    // Compared against ggml's own spelling rather than a numeric value copied
+    // into the registry: the enum belongs to ggml.h, and a second copy of it
+    // would compile whichever way it drifted.
+    return std::strcmp(want, ggml_unary_op_name(ggml_get_unary_op(node))) == 0;
 }
 
 int32_t ggml_rir_evaluate_portable(const rir_variant_desc * v, const struct ggml_tensor * node) {
@@ -1026,6 +1334,16 @@ int32_t ggml_rir_evaluate_portable(const rir_variant_desc * v, const struct ggml
         }
         if (ggml_n_dims(t) > (int) v->max_rank) {
             return GGML_RIR_REJECT_RANK;
+        }
+        // A quantized binding is addressed by block: the generated code reads
+        // `i / block_elements` and `i % block_elements`, so a row that is not a
+        // whole number of blocks would send its tail into the next block. The
+        // portable oracle already refuses this (`RejectReason::QuantBlock`);
+        // saying it here is what makes the two sides agree on the same node
+        // (docs/INT_RIR_V4.md §P5).
+        if (v->bindings[b].block_elements > 1
+                && t->ne[0] % (int64_t) v->bindings[b].block_elements != 0) {
+            return GGML_RIR_REJECT_QUANT_BLOCK;
         }
         // Dimensions the binding publishes no stride for are not addressed, so
         // they must be degenerate; otherwise the kernel would read one plane
@@ -1053,6 +1371,16 @@ int32_t ggml_rir_evaluate_portable(const rir_variant_desc * v, const struct ggml
     // The layout half of a variant's claim. Reached only when selection handed
     // this row a node it does not fit — a shape-blind lookup, or a caller
     // naming the variant — and it must say `stride` rather than run.
+    // **After** the bindings, and the order is the reason attributed to a node
+    // rather than an accident (docs/FUTURE_V1.md §7). When no variant of the
+    // family fits, selection hands back the pair's fallback — some *other*
+    // member — so an F16 node would be refused as "wrong member" when what is
+    // actually out of scope is its dtype. Checking the bindings first makes each
+    // node carry the restriction that really excludes it, which is what the
+    // declared-domain check compares against.
+    if (!ggml_rir_variant_fits_op_variant(v, node)) {
+        return GGML_RIR_REJECT_OP_VARIANT;
+    }
     if (!ggml_rir_variant_fits_layout(v, node)) {
         return GGML_RIR_REJECT_STRIDE;
     }
@@ -1060,20 +1388,8 @@ int32_t ggml_rir_evaluate_portable(const rir_variant_desc * v, const struct ggml
     // One extent is passed per axis, for every binding that indexes it: the
     // shape half of the contract is exactly that agreement. It subsumes the
     // hand-written "same shape as dst" checks, and says *why* they were needed.
-    for (uint32_t a = 0; a < v->n_axes; ++a) {
-        int64_t extent = -1;
-        for (uint32_t b = 0; b < v->n_bindings; ++b) {
-            const int8_t dim = v->axes[a].dim[b];
-            if (dim < 0) {
-                continue;
-            }
-            const ggml_tensor * t = ggml_rir_binding_tensor(v, b, node);
-            if (extent < 0) {
-                extent = t->ne[dim];
-            } else if (t->ne[dim] != extent) {
-                return GGML_RIR_REJECT_SHAPE;
-            }
-        }
+    if (!ggml_rir_variant_fits_axes(v, node)) {
+        return GGML_RIR_REJECT_SHAPE;
     }
 
     // The grid the dispatcher will ask for, in the same integers.
@@ -1186,6 +1502,19 @@ const rir_variant_desc * ggml_rir_dispatch_begin(uint8_t backend, const struct g
     if (mode == GGML_RIR_MODE_OFF || node == nullptr) {
         // Nothing is measured under `off`: the site would report a variant the
         // build may not even have created a pipeline for.
+        //
+        // A pair whose native is retired cannot legitimately be here under
+        // `off`: `ggml_rir_supports_op` answers on the RIR contract alone for
+        // it, so the scheduler placed the node on another backend long before a
+        // site was reached. Arriving anyway means something lowered the mode
+        // *after* the split — the force-native probe knob is the only thing
+        // that can — and the honest answer is to say so, not to return nullptr
+        // and let the caller invoke a kernel that no longer exists.
+        if (node != nullptr && ggml_rir_op_native_retired(ggml_op_name(node->op), (rir_backend) backend)) {
+            GGML_ABORT("ggml-rir: %s/%s a été dispatché sous mode=off alors que son natif "
+                       "est retiré (docs/INT_RIR_V4.md §P6)",
+                    ggml_op_name(node->op), ggml_rir_backend_name(backend));
+        }
         return nullptr;
     }
     const rir_variant_desc * variant =
@@ -1221,6 +1550,18 @@ const rir_variant_desc * ggml_rir_dispatch_begin(uint8_t backend, const struct g
                     ggml_op_name(node->op), ggml_rir_reject_name(why),
                     msg[0] ? msg : "no preflight violation recorded");
         }
+    }
+    // Same reasoning as the `off` branch above, on the other exit. There is no
+    // native kernel to count here, so counting one would be a lie the coverage
+    // report would then publish. What produced this is either a device-half
+    // rejection — a build that cannot run on this machine, never a domain (§P4)
+    // — or a portable rejection on a pair that declared no restriction at all,
+    // which is the defect `assumed_domain` exists to make visible.
+    if (ggml_rir_op_native_retired(ggml_op_name(node->op), (rir_backend) backend)) {
+        GGML_ABORT("ggml-rir: %s/%s reject=%s et le natif est retiré : aucun repli "
+                   "(docs/INT_RIR_V4.md §P6)",
+                ggml_op_name(node->op), ggml_rir_backend_name(backend),
+                ggml_rir_reject_name(why));
     }
     ggml_rir_count_native();
     ggml_rir_site_end();

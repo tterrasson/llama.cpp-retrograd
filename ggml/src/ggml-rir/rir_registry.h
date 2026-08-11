@@ -4,10 +4,13 @@
 #pragma once
 #include <stdint.h>
 
-#define RIR_REGISTRY_SCHEMA 11
+#define RIR_REGISTRY_SCHEMA 15
 #define RIR_MAX_BINDINGS 4
 #define RIR_MAX_PARAMS 2
-#define RIR_MAX_AXES 5
+// Nine and not five since FUTURE V1 §6: a kernel that repeats one operand under
+// another declares four extra axes, one per folded dimension, carrying nothing
+// but the extent the fold divides by.
+#define RIR_MAX_AXES 9
 #define RIR_MAX_SHAPE_RULES 2
 
 typedef enum rir_backend {
@@ -37,9 +40,20 @@ typedef struct rir_binding_desc {
     const char * name;
     int8_t       source;
     uint8_t      access;      // rir_access
-    const char * dtype;       // element type spelling ("f32", ...)
+    // Element type spelling ("f32", "q4_K", ...). It is also a **claim**: a
+    // node whose tensor is of another type is not a candidate for this variant
+    // at all, which is what lets one ggml op carry one kernel per src0 dtype
+    // (docs/INT_RIR_V4.md §P5).
+    const char * dtype;
     uint8_t      rank;        // number of nb[] this binding publishes
-    uint8_t      elem_bytes;  // element size; every stride must be a multiple
+    // Bytes of one `nb[0]` stride unit: the element size, or a quantized
+    // format's block size. Every stride must be a multiple of it.
+    uint8_t      elem_bytes;
+    // Logical elements those bytes hold: 1, or a quantized format's block
+    // size. A row that is not a whole number of blocks is rejected — the
+    // generated code addresses `i / block_elements` and would read the wrong
+    // block for the tail.
+    uint16_t     block_elements;
 } rir_binding_desc;
 
 typedef struct rir_param_desc {
@@ -55,6 +69,17 @@ typedef struct rir_param_desc {
 typedef struct rir_axis_desc {
     const char * name;
     int8_t       dim[RIR_MAX_BINDINGS];
+    // Set when this axis is the **divisor of a fold** (docs/FUTURE_V1.md §6):
+    // the index of the axis whose position is replayed modulo this one's
+    // extent, or -1. It is `ggml_can_repeat` written as a relation between two
+    // axes, so the contract can require divisibility on exactly the dimensions
+    // the kernel folds — and on no others.
+    //
+    // It is also what keeps `folded_of` out of the axis-agreement loop below:
+    // an axis carrying a fold is deliberately *not* required to match the one
+    // it divides, which is the whole difference between the repeating kernel of
+    // a pair and its contiguous twin.
+    int8_t       folded_of;
 } rir_axis_desc;
 
 // One grid dimension: the axis it walks, and how many of that axis's indices a
@@ -84,6 +109,18 @@ typedef struct rir_shape_rule {
 typedef struct rir_variant_desc {
     const char * kernel;       // RIR kernel name
     const char * ggml_op;      // "GGML_OP_*" — resolve to the enum once at init
+    // The **member** of an op family this variant writes ("GGML_UNARY_OP_SILU"),
+    // or NULL when the op is not a family (docs/FUTURE_V1.md §7).
+    //
+    // It is a *claim*, exactly like `bindings[].dtype`: a node whose member
+    // differs is not a candidate for this variant at all. Without it the
+    // selection would fall back to the pair's shape-blind variant, which for
+    // `GGML_OP_UNARY` computes a **different function** and would pass every
+    // counter the lane checks.
+    //
+    // A spelling and not a number, for the reason `ggml_op` is one: the value
+    // belongs to ggml's header. Resolve it once against `ggml_unary_op_name`.
+    const char * ggml_op_variant;
     const char * variant_id;   // stable identity, distinct from the dtype
     const char * entrypoint;   // SPIR-V module entry / Metal library symbol
     // Variant name within the (kernel, backend) pair, NULL for the fallback.
@@ -154,6 +191,18 @@ typedef struct rir_op_policy {
     // count recorded in scripts/rir-domain-baseline.tsv. The two are
     // complementary; neither replaces the other.
     uint32_t     assumed_domain;
+    // 1 when the **native kernel of this op no longer exists** on this backend
+    // (docs/INT_RIR_V4.md §P6). Only ever set on a pair whose `assumed_domain`
+    // is zero: a pair with a published restriction keeps its native kernel for
+    // that restriction, which is what §11 allows it to be kept for.
+    //
+    // Two consumers read it, and neither could derive it. `supports_op` answers
+    // on the RIR contract alone for such a pair, so a node the contract declines
+    // leaves the backend for the CPU instead of reaching a kernel that is gone;
+    // and a dispatch site that finds no variant aborts with the reason rather
+    // than calling a function that no longer exists. It also tells the lane to
+    // stop asking for a native/RIR differential it can no longer measure.
+    uint8_t      native_retired;
 } rir_op_policy;
 
 #ifdef __cplusplus

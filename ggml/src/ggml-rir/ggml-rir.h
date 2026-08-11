@@ -18,9 +18,16 @@ extern "C" {
 #endif
 
 // RETRO_RIR_MODE=off|observe|prefer|require, read once before any backend
-// context is created. `observe` computes eligibility and counts it but always
+// context is created. **Absent is `prefer`** (docs/INT_RIR_V4.md §P6): a pair
+// the registry promoted is what this build dispatches, and asking for it is not
+// the caller's job. `observe` computes eligibility and counts it but always
 // runs the native kernel; `prefer` dispatches the RIR variant when its
 // contract matches and falls back to native *before* launch otherwise.
+//
+// `off` still means off, and it is still what the differential bench runs — but
+// only where a native kernel remains. A pair whose native has been retired
+// (`rir_op_policy.native_retired`) has nothing to fall back to, so under `off`
+// it leaves `supports_op` entirely and the scheduler places it on the CPU.
 // `require` is `prefer` plus a graph preflight: every node whose (op, backend)
 // is integrated must be eligible before anything is encoded, and a node that is
 // not turns the whole graph_compute into GGML_STATUS_FAILED instead of a silent
@@ -79,9 +86,14 @@ typedef enum ggml_rir_reject {
     GGML_RIR_REJECT_POLICY_NATIVE = 10,
     GGML_RIR_REJECT_DEVICE_GRID   = 11,
     GGML_RIR_REJECT_DEVICE_ALIGNMENT = 12,
+    // The node names a **member of an op family** no registered kernel writes
+    // (docs/FUTURE_V1.md §7). A portable-contract reason, appended rather than
+    // inserted: 2–7 and 13 are the contract, 8–12 are the device, and the
+    // numbers are ABI — `rir-gen` checks each name against its value here.
+    GGML_RIR_REJECT_OP_VARIANT    = 13,
 } ggml_rir_reject;
 
-#define GGML_RIR_REJECT_COUNT 13
+#define GGML_RIR_REJECT_COUNT 14
 
 // Monotonic process-wide counters; one struct, every backend accumulates.
 typedef struct ggml_rir_counters {
@@ -126,9 +138,20 @@ void ggml_rir_site_begin(const char * ggml_op, uint8_t backend);
 void ggml_rir_site_end(void);
 
 #define GGML_RIR_MAX_SITES 32
-// Variants dispatched *at one site*. One per priority level in practice; the
-// cap only bounds the row, and an overflow is reported rather than dropped.
-#define GGML_RIR_MAX_SITE_VARIANTS 4
+// Variants dispatched *at one site*. One per priority level and one per `src0`
+// dtype in practice; the cap only bounds the row, and an overflow is reported
+// rather than dropped.
+//
+// Sixteen since FUTURE V1 §5: `OUT_PROD` reads ten standard quantized formats
+// plus two, and its F32 fallback — thirteen at one site. The cap that used to
+// hold them turned three of the twelve into `[overflow]`, which is the lane
+// refusing to call a report complete rather than folding them into a neighbour.
+// Thirty-two since FUTURE V1 §7: `GGML_OP_UNARY` is a family of fourteen
+// kernels behind one op and one dispatch site, and each publishes two workgroup
+// widths — twenty-eight rows for one pair. A site that cannot hold its variants
+// reports `[overflow]`, which the lane refuses to count; the cap said so, out
+// loud, at the first node.
+#define GGML_RIR_MAX_SITE_VARIANTS 32
 
 typedef struct ggml_rir_site_counters {
     const char *      ggml_op;
@@ -233,6 +256,18 @@ const rir_variant_desc * ggml_rir_find_variant_for_node(int32_t ggml_op, rir_bac
 // which variant a node would use before it can check that object exists.
 bool ggml_rir_variant_fits_shape(const rir_variant_desc * v, const struct ggml_tensor * node);
 
+// Whether the *axis* half of a variant's contract holds for `node`: every
+// binding sharing an axis agrees on its extent, and every **folded** axis
+// divides the extent it is replayed under (`ggml_can_repeat`,
+// docs/FUTURE_V1.md §6).
+//
+// A fourth claim of the same family, and the one that lets two kernels of the
+// same op be told apart by shape: `mul` claims three equal shapes, `mul_repeat`
+// claims a divisor. Evaluated before selection for that reason — a repeated node
+// that reached `mul` would be refused with `shape` and would never try the
+// kernel written for it.
+bool ggml_rir_variant_fits_axes(const rir_variant_desc * v, const struct ggml_tensor * node);
+
 // Whether the *layout* a variant needs holds for `node`. Today that is the
 // vector width: a variant reading four elements at a time only accepts a
 // tensor whose contiguous stride is one element. It is a claim in the same
@@ -240,6 +275,32 @@ bool ggml_rir_variant_fits_shape(const rir_variant_desc * v, const struct ggml_t
 // permuted view falls to the pair's scalar fallback instead of falling out of
 // RIR entirely (docs/INT_RIR_V4.md §P1).
 bool ggml_rir_variant_fits_layout(const rir_variant_desc * v, const struct ggml_tensor * node);
+
+// Whether the *dtypes* a variant declares hold for `node`, binding by binding.
+//
+// A third claim of the same family as the two above, and the one that lets a
+// single ggml op be served by several kernels: `OUT_PROD` publishes an F32 row
+// and one row per quantized `src0` format lowering can decode, and what picks
+// between them is the node's own type (docs/INT_RIR_V4.md §P5). Evaluated
+// before selection, so a type no row claims falls to the pair's fallback and
+// leaves through the portable contract with `dtype` — never onto a row that
+// would reinterpret its bytes.
+bool ggml_rir_variant_fits_dtype(const rir_variant_desc * v, const struct ggml_tensor * node);
+
+// Whether the **member of an op family** a variant declares is the node's own
+// (docs/FUTURE_V1.md §7).
+//
+// The fourth claim of the same family, and the one that makes `GGML_OP_UNARY`
+// integrable at all: it is not one op but twenty-two functions behind one
+// `ggml_op`, chosen by an integer in `op_params`. A variant claiming no member
+// (`ggml_op_variant == NULL`) serves every node of its op, which is every other
+// op in the registry.
+//
+// Without it, a node whose member no kernel writes would reach the pair's
+// shape-blind fallback and be encoded by a kernel computing a *different
+// function* — the one failure mode every other check in this file would have
+// called green.
+bool ggml_rir_variant_fits_op_variant(const rir_variant_desc * v, const struct ggml_tensor * node);
 
 // The registry's policy for `(op, backend)`: NATIVE_ONLY when the pair is
 // pinned or simply absent. Resolved once, like the selection above.
@@ -277,6 +338,41 @@ uint32_t ggml_rir_op_assumed_domain(const char * ggml_op_spelling, rir_backend b
 // that is registered for observation only would fail graphs over a variant no
 // mode is ever allowed to encode.
 bool ggml_rir_op_is_targeted(int32_t ggml_op, rir_backend backend);
+
+// Whether the **native kernel of this pair no longer exists** in this build:
+// `rir_op_policy.native_retired` (docs/INT_RIR_V4.md §P6). The registry only
+// ever sets it on a pair whose `assumed_domain` is empty, because §11 lets a
+// native kernel be kept for a published restriction — and therefore only lets
+// it be removed when there is none.
+//
+// It is the fact that makes `off` incomplete for a pair rather than merely
+// slower: there is nothing to fall back to. Three consumers read it and none
+// could derive it — `supports_op` (below), the dispatch site (which aborts
+// instead of calling a function that is gone), and the lane (which stops asking
+// for a differential it can no longer measure).
+// Keyed by spelling, and either spelling: the registry and a site row carry
+// "GGML_OP_ADD", a dispatch site holds `ggml_op_name`'s "ADD".
+bool ggml_rir_op_native_retired(const char * ggml_op_spelling, rir_backend backend);
+
+// The answer a backend's `supports_op` owes for a node RIR may serve: the pair
+// is promoted, the mode allows encoding, and the **portable** contract matches
+// this node (docs/INT_RIR_V4.md §P6).
+//
+// The device half is deliberately *not* evaluated here. `supports_op` is asked
+// on a device, before any context, queue or pipeline exists, so a check needing
+// one would either lie or force a context into existence at graph-split time.
+// What that leaves is exactly the half the registry publishes and every backend
+// evaluates identically — which is also the half that decides a *domain*. A
+// device rejection is never a domain (§P4), so a pair that reaches its dispatch
+// site and fails the device half is a build that cannot run here, and the site
+// says so rather than quietly answering elsewhere.
+//
+// A backend whose native kernel is still there ORs this with its own condition:
+// the union is the domain the op announces, and it is wider than either side —
+// the RIR contract accepts the packed-QKV view the native Vulkan `l2_norm_back`
+// failed on (docs/INT_RIR.md §11 phase F). A backend whose native is retired
+// returns this and nothing else.
+bool ggml_rir_supports_op(uint8_t backend, const struct ggml_tensor * node);
 
 // The selection rule itself, over an explicit table: among the rows matching
 // `(ggml_op, backend)` whose policy is not NATIVE_ONLY **and whose shape rules

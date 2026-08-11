@@ -8998,6 +8998,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
                 test_cases.emplace_back(new test_unary((ggml_unary_op) op, type, { 128, 2, 2, 2 }, v));
                 test_cases.emplace_back(new test_unary((ggml_unary_op) op, type, { 5, 7, 11, 13 }, v));
+                // retro delta: une ligne **longue** (docs/FUTURE_V1.md §7). Les
+                // deux formes ci-dessus ont `ne[0] <= 256`, or c'est exactement
+                // la borne où RIR arbitre entre ses deux largeurs de workgroup :
+                // sans une ligne au-dessus, la variante large est déclarée et
+                // jamais dispatchée, et la lane le refuse — à raison. 1025 et
+                // pas 1024, pour que la queue scalaire du corps vectorisé soit
+                // exercée par la même forme.
+                test_cases.emplace_back(new test_unary((ggml_unary_op) op, type, { 1025, 2, 1, 1 }, v));
             }
         }
     }
@@ -10265,9 +10273,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // Exercise every K-quant, including multiple blocks per src0 row.
+    // retro delta: one entry per format the RIR compiler generates an `out_prod`
+    // kernel for, including multiple blocks per src0 row. `base_types` above
+    // covers three of them incidentally; the promotion lane's rule is that every
+    // variant the registry declares must have been dispatched, so the list that
+    // decides it is this one and it follows generated/rir/out_prod_*
+    // (docs/FUTURE_V1.md §5.5).
     for (ggml_type type_a : {
-            GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+            GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0,
+            GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
+            GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS}) {
         test_cases.emplace_back(new test_out_prod(type_a, GGML_TYPE_F32, 256, 7, 5, {2, 1}, {1, 1}));
         test_cases.emplace_back(new test_out_prod(type_a, GGML_TYPE_F32, 512, 3, 7, {1, 1}, {1, 1}));
     }
@@ -11121,6 +11136,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32, 1024,    1, 2048, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32,    1, 4096, 2048, {1, 1}, {1, 1}));
 
+    // retro delta: the same destinations with a **quantized** src0, which is
+    // what 552 of the 736 OUT_PROD nodes of a real LoRA backward graph carry —
+    // the frozen weight (docs/INT_RIR_V4.md §P4, §P5). Timing only the F32
+    // shapes above measured a quarter of the traffic and called it the op.
+    //
+    // One entry per format RIR generates a kernel for, so this list follows the
+    // registry rather than repeating it. Since FUTURE V1 F1 that is the ten
+    // standard formats plus the two the shared IQ4 table made almost free, and
+    // the list is here rather than derived from a single GGUF on purpose: a
+    // census of one model never sees ten formats, so the bench needs a source of
+    // shapes **per format** (docs/FUTURE_V1.md §5.5). The two heaviest census
+    // destinations, replayed for each declared format. `m` is a multiple of 256
+    // for all of them, which every quantized row is anyway.
+    for (ggml_type type_a : {GGML_TYPE_Q4_0,  GGML_TYPE_Q4_1, GGML_TYPE_Q5_0,
+                             GGML_TYPE_Q5_1,  GGML_TYPE_Q8_0, GGML_TYPE_Q2_K,
+                             GGML_TYPE_Q3_K,  GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
+                             GGML_TYPE_Q6_K,  GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS}) {
+        test_cases.emplace_back(new test_out_prod(type_a, GGML_TYPE_F32, 1024, 16, 2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_out_prod(type_a, GGML_TYPE_F32, 2048, 16, 2048, {1, 1}, {1, 1}));
+    }
+
     // retro delta: RMS_NORM_BACK on the destination shapes the two censused
     // backward graphs actually emit (docs/INT_RIR_V3.md §R2). Qwen3.5:
     // [1024,16,1,1] at 336 nodes, [128,16,16,1] at 120, [256,8,16,1] at 48,
@@ -11165,6 +11201,47 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {4096,  16,  1, 1}, 2.0f, 0.5f));
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {2048, 144,  1, 1}, 2.0f, 0.5f));
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, { 256,   8, 16, 1}, 2.0f, 0.5f));
+
+    // retro delta: RMS_NORM **avant** (docs/FUTURE_V1.md §7), sur les
+    // destinations que les deux graphes recensés émettent — les mêmes que
+    // RMS_NORM_BACK, dont c'est le symétrique et dont il partage la table de
+    // schedules. `v = false` : la vue non contiguë est une forme d'évaluation,
+    // pas une forme de trafic.
+    for (float eps : {1e-6f}) {
+        test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, { 1024, 16,  1, 1 }, false, eps));
+        test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {  640, 16,  1, 1 }, false, eps));
+        test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {  128, 16, 16, 1 }, false, eps));
+        test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {  256,  8, 16, 1 }, false, eps));
+        test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {  256,  4, 16, 1 }, false, eps));
+    }
+
+    // retro delta: la famille UNARY (docs/FUTURE_V1.md §7). Trois membres et
+    // non quinze, et c'est délibéré : les quinze partagent **un** abaissement —
+    // quatre axes parallèles, une lecture, une écriture, aucun collectif — donc
+    // ce qui varie d'un membre à l'autre est le corps arithmétique et rien de
+    // ce que le schedule décide. Ce que le banc doit séparer est le coût de ce
+    // corps : `relu` est un select, `silu` une exponentielle, `tanh` une
+    // transcendante « precise:: ». Les trois bornes suffisent à dire si le ratio
+    // suit la forme ou la formule. (`gelu` serait le quatrième point, et il est
+    // hors de la table : son natif Metal n'est pas départageable du seuil NMSE
+    // du banc — docs/FUTURE_V1.md §7.)
+    //
+    // Les formes sont celles de la bande élémentaire, qui a le même patron
+    // d'accès : deux largeurs de ligne et deux occupations.
+    for (ggml_unary_op op : {GGML_UNARY_OP_RELU, GGML_UNARY_OP_SILU, GGML_UNARY_OP_TANH}) {
+        test_cases.emplace_back(new test_unary(op, GGML_TYPE_F32, { 4096,  16, 1, 1 }));
+        test_cases.emplace_back(new test_unary(op, GGML_TYPE_F32, { 1024,  16, 1, 1 }));
+        test_cases.emplace_back(new test_unary(op, GGML_TYPE_F32, {  128,  16, 16, 1 }));
+    }
+
+    // retro delta: la moitié **F16** de la bande élémentaire (docs/FUTURE_V1.md
+    // §8), sur les mêmes destinations que sa moitié F32 — c'est la seule façon
+    // de lire les deux colonnes l'une contre l'autre, et la question de F4 est
+    // exactement celle-là : ce qu'un second type d'élément coûte au même kernel.
+    test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F16, {1024,  16, 1, 1}, {1, 1, 1, 1}));
+    test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F16, {4096,  16, 1, 1}, {1, 1, 1, 1}));
+    test_cases.emplace_back(new test_bin_bcast(ggml_mul, GGML_TYPE_F16, {1024,  16, 1, 1}, {1, 1, 1, 1}));
+    test_cases.emplace_back(new test_bin_bcast(ggml_mul, GGML_TYPE_F16, { 128,  16, 16, 1}, {1, 1, 1, 1}));
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

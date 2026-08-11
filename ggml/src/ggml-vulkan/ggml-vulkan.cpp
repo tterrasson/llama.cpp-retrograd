@@ -1103,9 +1103,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_rms_norm_mul_partials_f32;
     vk_pipeline pipeline_rms_norm_mul_rope_f32_f32;
     vk_pipeline pipeline_rms_norm_mul_rope_f32_f16;
-    vk_pipeline pipeline_rms_norm_back_f32;
     vk_pipeline pipeline_l2_norm_f32;
-    vk_pipeline pipeline_l2_norm_back_f32; // retro delta
     // retro delta: RIR-generated variants, one pipeline object per *artifact*
     // — they are distinct SPIR-V modules — keyed by the name the registry
     // publishes. A map rather than a member per kernel: nothing in this unit
@@ -1581,22 +1579,6 @@ struct vk_op_push_constants {
     float param2;
     float param3;
     float param4;
-};
-
-// retro delta: the *native* L2_NORM_BACK kernel. It used vk_op_push_constants,
-// which carries no strides, so it read `x` as a flat contiguous buffer while
-// supports_op only constrained src[0]. A packed-QKV view of `x` therefore
-// produced wrong results rather than a rejection (found by the shared RIR/native
-// matrix, docs/INT_RIR.md §13). The extra fields let it stride x per outer axis.
-struct vk_op_l2_norm_back_push_constants {
-    uint32_t KX;      // ne00
-    uint32_t KY;      // ggml_nrows(src0)
-    float    param1;  // eps
-    uint32_t ne1;     // rows per plane
-    uint32_t ne2;     // planes per batch
-    uint32_t xs1;     // src[1] strides, in elements
-    uint32_t xs2;
-    uint32_t xs3;
 };
 
 // retro delta: constant buffer of a RIR variant. The *layout* is generated —
@@ -6063,10 +6045,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_rope_f32_f16, "rms_norm_mul_rope_f32_f16", rms_norm_mul_rope_f32_f16_len, rms_norm_mul_rope_f32_f16_data, "main", 7, sizeof(vk_op_rms_norm_mul_rope_push_constants), {1, 1, 1}, {0, 1}, 1, true);
     }
 
-    ggml_vk_create_pipeline(device, device->pipeline_rms_norm_back_f32, "rms_norm_back_f32", rms_norm_back_f32_len, rms_norm_back_f32_data, "main", 3, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_l2_norm_f32, "l2_norm_f32", l2_norm_f32_len, l2_norm_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
-    // retro delta: analytic backward for GGML_OP_L2_NORM
-    ggml_vk_create_pipeline(device, device->pipeline_l2_norm_back_f32, "l2_norm_back_f32", l2_norm_back_f32_len, l2_norm_back_f32_data, "main", 3, sizeof(vk_op_l2_norm_back_push_constants), {1, 1, 1}, {}, 1);
     // retro delta: every RIR variant this build carries, created from the
     // registry alone (docs/INT_RIR_V3.md §R0).
     //
@@ -12400,19 +12379,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->fused_rms_norm_mode == RMS_NORM_MUL ? ctx->device->pipeline_rms_norm_mul_f32 : ctx->device->pipeline_rms_norm_f32;
         }
         return nullptr;
-    case GGML_OP_RMS_NORM_BACK:
-        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
-            return ctx->device->pipeline_rms_norm_back_f32;
-        }
-        return nullptr;
     case GGML_OP_L2_NORM:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_l2_norm_f32;
-        }
-        return nullptr;
-    case GGML_OP_L2_NORM_BACK:
-        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
-            return ctx->device->pipeline_l2_norm_back_f32;
         }
         return nullptr;
     case GGML_OP_UNARY:
@@ -13103,9 +13072,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
 
     switch (op) {
     case GGML_OP_NORM:
-    case GGML_OP_RMS_NORM_BACK:
     case GGML_OP_L2_NORM:
-    case GGML_OP_L2_NORM_BACK:
     case GGML_OP_SOFT_MAX:
     case GGML_OP_SOFT_MAX_BACK:
     case GGML_OP_SUM_ROWS:
@@ -13653,9 +13620,12 @@ static void ggml_vk_add(ggml_backend_vk_context * ctx, vk_context& subctx, const
 }
 
 static void ggml_vk_out_prod(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    // retro delta: RIR selection chain (docs/INT_RIR_V3.md §R2). The generated
-    // variant claims the F32, non-broadcast sub-domain only; anything else
-    // fails the portable contract and reaches the native shader below.
+    // retro delta: RIR selection chain (docs/INT_RIR_V3.md §R2). One generated
+    // variant per src0 dtype since §P5 — F32, plus each quantized format whose
+    // decoder lowering can expand — and the node's own type picks between them
+    // (docs/INT_RIR_V4.md §P5). What is left is the broadcast over ne2/ne3 and
+    // the formats with no portable decoder: both fail the portable contract and
+    // reach the native shader below.
     if (ggml_vk_rir_try(ctx, subctx, dst)) {
         return;
     }
@@ -14910,6 +14880,19 @@ static void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, 
     ggml_tensor * rms = cgraph->nodes[node_idx];
     const ggml_tensor * src0 = rms->src[0];
 
+    // retro delta: RIR selection chain (docs/FUTURE_V1.md §7), guarded by both
+    // of this encoder's other jobs - for the same reason Metal guards its own
+    // on `n_fuse == 1`. A generated variant computes one node in one dispatch,
+    // so taking a node that starts a fused RMS_NORM chain (MUL, ADD, ROPE,
+    // SET_ROWS) would trade one dispatch for several; and under
+    // `do_add_rms_partials` this pipeline also consumes the partial sums the
+    // preceding ADD wrote, which is a correctness condition the generated
+    // kernel knows nothing about.
+    if (ctx->num_additional_fused_ops == 0 && !ctx->do_add_rms_partials
+            && ggml_vk_rir_try(ctx, subctx, rms)) {
+        return;
+    }
+
     if (ctx->fused_rms_norm_mode == RMS_NORM_VIEW_SET_ROWS) {
         GGML_ASSERT(ctx->num_additional_fused_ops == 2);
         ggml_tensor * set_rows = cgraph->nodes[node_idx + 2];
@@ -15080,18 +15063,6 @@ static void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, 
     ggml_vk_rms_norm_finish(ctx, src0);
 }
 
-static void ggml_vk_rms_norm_back(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    // retro delta: RIR selection chain (docs/INT_RIR_V3.md §R2).
-    if (ggml_vk_rir_try(ctx, subctx, dst)) {
-        return;
-    }
-    float * op_params = (float *)dst->op_params;
-    // retro delta: KY carries ggml_nrows, not ne[1]: it is the shader's
-    // out-of-bounds guard once the grid is split into 512-wide slices
-    // (>512 rows). Same fix as ggml_vk_l2_norm_back.
-    ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_RMS_NORM_BACK, { (uint32_t)src0->ne[0], (uint32_t)ggml_nrows(src0), op_params[0], 0.0f, 0.0f, 0.0f });
-}
-
 static void ggml_vk_l2_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
     const float * op_params = (const float *)dst->op_params;
     vk_op_unary_push_constants p = vk_op_unary_push_constants_init(src0, dst);
@@ -15230,31 +15201,35 @@ static bool ggml_vk_rir_try(ggml_backend_vk_context * ctx, vk_context& subctx, c
     return true;
 }
 
-// retro delta: analytic backward for GGML_OP_L2_NORM
-static void ggml_vk_l2_norm_back(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    float * op_params = (float *)dst->op_params;
-    // retro delta: RIR selection chain (docs/INT_RIR.md §5).
-    if (ggml_vk_rir_try(ctx, subctx, dst)) {
-        return;
+// retro delta: the whole encoder of a pair whose native kernel has been retired
+// (docs/INT_RIR_V4.md §P6). RMS_NORM_BACK and L2_NORM_BACK both route here and
+// neither adds a line: the generated variant is the only implementation, so
+// there is no second branch to write and no push-constant struct to keep in
+// step with a shader.
+//
+// It cannot fail silently. `ggml_rir_supports_op` is what admitted this node
+// and it evaluated the same portable contract; the only ways to arrive and be
+// refused are a device-half rejection — this build cannot run on this machine —
+// or a mode lowered after the graph split, and both abort inside
+// `ggml_rir_dispatch_begin` naming the op and the reason.
+static void ggml_vk_rir_only(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * node) {
+    if (!ggml_vk_rir_try(ctx, subctx, node)) {
+        GGML_ABORT("ggml-rir: %s sans variante dispatchée et sans natif (vulkan)",
+                ggml_op_name(node->op));
     }
-    // KY carries ggml_nrows, not ne[1]: it is the shader's out-of-bounds
-    // guard once the grid is split into 512-wide slices (>512 rows).
-    // xs* are x's strides in *elements*; supports_op guarantees nb[0] is the
-    // element size, which is what makes the byte->element division exact.
-    GGML_ASSERT(src1->nb[0] == sizeof(float));
-    ggml_vk_op_f32<vk_op_l2_norm_back_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_L2_NORM_BACK, {
-        (uint32_t)src0->ne[0],
-        (uint32_t)ggml_nrows(src0),
-        op_params[0],
-        (uint32_t)src0->ne[1],
-        (uint32_t)src0->ne[2],
-        (uint32_t)(src1->nb[1]/sizeof(float)),
-        (uint32_t)(src1->nb[2]/sizeof(float)),
-        (uint32_t)(src1->nb[3]/sizeof(float)),
-    });
 }
 
 static void ggml_vk_unary(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
+    // retro delta: RIR selection chain (docs/FUTURE_V1.md §7). The family is
+    // selected by `op_params`, not by the op, so the registry row carries a
+    // `ggml_op_variant` and `ggml_rir_variant_fits_op_variant` is what keeps a
+    // node from being encoded by an arbitrary member. The eight members RIR
+    // does not declare, and F16, fail the portable contract and reach the
+    // native pipeline below on their own. No fusion guard: this encoder looks
+    // at one node.
+    if (ggml_vk_rir_try(ctx, subctx, dst)) {
+        return;
+    }
     ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_UNARY, vk_op_unary_push_constants_init(src0, dst));
 }
 
@@ -17519,16 +17494,18 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     case GGML_OP_RMS_NORM:
         ggml_vk_rms_norm(ctx, compute_ctx, cgraph, node_idx, (float *)node->op_params);
         break;
+    // retro delta: natif retiré (docs/INT_RIR_V4.md §P6)
     case GGML_OP_RMS_NORM_BACK:
-        ggml_vk_rms_norm_back(ctx, compute_ctx, src0, src1, node);
+        ggml_vk_rir_only(ctx, compute_ctx, node);
 
         break;
     case GGML_OP_L2_NORM:
         ggml_vk_l2_norm(ctx, compute_ctx, src0, node);
 
         break;
+    // retro delta: natif retiré (docs/INT_RIR_V4.md §P6)
     case GGML_OP_L2_NORM_BACK:
-        ggml_vk_l2_norm_back(ctx, compute_ctx, src0, src1, node);
+        ggml_vk_rir_only(ctx, compute_ctx, node);
 
         break;
     case GGML_OP_UNARY:
@@ -20923,22 +20900,28 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_I32 &&
                    op->type == GGML_TYPE_F32;
         case GGML_OP_SILU_BACK:
-        case GGML_OP_RMS_NORM_BACK:
-            // retro delta: these shaders index src[1] as a flat contiguous
+            // retro delta: this shader indexes src[1] as a flat contiguous
             // buffer while carrying no stride for it, so a strided src[1] does
             // not merely go unaccelerated — it reads the wrong elements.
             // Upstream only checked src[0]. Announcing the op for a layout the
             // kernel cannot express is what makes the failure silent, so the
-            // check is on both sources until the shaders carry x's strides
-            // (l2_norm_back below is the one that now does).
+            // check is on both sources.
             return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
                    op->src[0]->type == GGML_TYPE_F32;
+        // retro delta: the two backward reductions whose native Vulkan kernel is
+        // retired (docs/INT_RIR_V4.md §P6). The two cases above them were a
+        // hand-written restatement of a contract, and the *history of this very
+        // spot* is the argument for not writing it twice: the native
+        // `rms_norm_back` shader still reads a flat `src[1]`, the native
+        // `l2_norm_back` was corrected to carry x's strides only after the
+        // shared RIR/native matrix caught it reading the wrong elements on a
+        // packed-QKV view, and the two lines had drifted apart accordingly.
+        // The generated variant carries one `nb[]` per binding per dimension by
+        // construction, so the contract the registry publishes is both the
+        // answer and the only place it is written.
+        case GGML_OP_RMS_NORM_BACK:
         case GGML_OP_L2_NORM_BACK:
-            // src[1] may stride its outer axes (the packed-QKV view of a real
-            // training graph); its rows must still be element-contiguous, which
-            // is what lets the host pass strides in elements.
-            return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32 &&
-                   op->src[1]->nb[0] == ggml_type_size(op->src[1]->type);
+            return ggml_rir_supports_op(RIR_BACKEND_VULKAN, op);
         case GGML_OP_SQR:
         case GGML_OP_SQRT:
         case GGML_OP_SIN:

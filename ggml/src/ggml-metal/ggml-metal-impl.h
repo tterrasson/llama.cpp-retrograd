@@ -1448,25 +1448,6 @@ typedef struct {
     int64_t ne;
 } ggml_metal_kargs_silu_back;
 
-// retro delta: RMS-norm backward (LoRA training on Metal)
-typedef struct {
-     int32_t ne00;
-     float   eps;
-    uint64_t nb01; uint64_t nb02; uint64_t nb03; // src0 = dz (grad)
-    uint64_t nb11; uint64_t nb12; uint64_t nb13; // src1 = x  (forward input)
-    uint64_t nb1;  uint64_t nb2;  uint64_t nb3;  // dst
-} ggml_metal_kargs_rms_norm_back;
-
-// retro delta: L2-norm backward (LoRA training on Metal; Qwen3.5 gated delta
-// net k/q normalization)
-typedef struct {
-     int32_t ne00;
-     float   eps;
-    uint64_t nb01; uint64_t nb02; uint64_t nb03; // src0 = dz (grad)
-    uint64_t nb11; uint64_t nb12; uint64_t nb13; // src1 = x  (forward input)
-    uint64_t nb1;  uint64_t nb2;  uint64_t nb3;  // dst
-} ggml_metal_kargs_l2_norm_back;
-
 // retro delta: out-prod / weight-gradient GEMM (LoRA training on Metal)
 // src1/dst strides are in ELEMENTS (host divides byte strides by sizeof(float));
 // s00=s0=1. src0 strides s01/s02/s03 are in elements for the F32 kernel but in

@@ -520,13 +520,14 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_opt_step_sgd(ctx, idx);
             } break;
+        // retro delta: the two pairs whose native kernel is retired
+        // (docs/INT_RIR_V4.md §P6). They add no op-specific code at all: the
+        // generated variant is the only implementation, and a node that reaches
+        // here is one `ggml_rir_supports_op` already admitted.
         case GGML_OP_RMS_NORM_BACK: // retro delta
-            {
-                n_fuse = ggml_metal_op_rms_norm_back(ctx, idx);
-            } break;
         case GGML_OP_L2_NORM_BACK: // retro delta
             {
-                n_fuse = ggml_metal_op_l2_norm_back(ctx, idx);
+                n_fuse = ggml_metal_op_rir_only(ctx, idx);
             } break;
         case GGML_OP_OUT_PROD: // retro delta
             {
@@ -4444,6 +4445,20 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
         }
     }
 
+    // retro delta: RIR selection chain (docs/FUTURE_V1.md §7). Placed *after* the
+    // fusion lookahead and guarded on it, for the reason the elementwise band
+    // already established: a generated variant computes one node, so taking a
+    // node that starts a NORM+MUL+ADD chain would trade one dispatch for three.
+    // The lookahead above only reads the graph and fills `args`, so running it
+    // first costs nothing when RIR does take over. GGML_OP_NORM reaches this
+    // encoder too and has no registry row; it leaves with no variant found and
+    // no site counted.
+    if (n_fuse == 1) {
+        if (const int n = ggml_metal_op_rir_try(ctx, idx)) {
+            return n;
+        }
+    }
+
     if (n_fuse > 1) {
         bid_dst = ggml_metal_get_buffer_id(ctx->node(idx + n_fuse - 1));
 
@@ -5819,65 +5834,10 @@ int ggml_metal_op_opt_step_sgd(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-// retro delta: RMS-norm backward. One threadgroup per row; mirrors the forward
-// kernel_rms_norm dispatch (threads-per-row doubles from a SIMD width up to ne00).
-int ggml_metal_op_rms_norm_back(ggml_metal_op_t ctx, int idx) {
-    ggml_tensor * op = ctx->node(idx);
-
-    ggml_metal_library_t lib = ctx->lib;
-    ggml_metal_encoder_t enc = ctx->enc;
-
-    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
-    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
-    GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
-    GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
-
-    float eps;
-    memcpy(&eps, op->op_params, sizeof(float));
-
-    // retro delta: RIR selection chain (docs/INT_RIR.md §5).
-    if (const int n = ggml_metal_op_rir_try(ctx, idx)) {
-        return n;
-    }
-
-    auto pipeline = ggml_metal_library_get_pipeline_rms_norm_back(lib, op);
-
-    ggml_metal_kargs_rms_norm_back args = {
-        /*.ne00 =*/ ne00,
-        /*.eps  =*/ eps,
-        /*.nb01 =*/ nb01, /*.nb02 =*/ nb02, /*.nb03 =*/ nb03,
-        /*.nb11 =*/ nb11, /*.nb12 =*/ nb12, /*.nb13 =*/ nb13,
-        /*.nb1  =*/ nb1,  /*.nb2  =*/ nb2,  /*.nb3  =*/ nb3,
-    };
-
-    // nth stays a power of two (>= one simdgroup): the kernel's final
-    // cross-simdgroup reduction reads one partial per simdgroup from lanes of
-    // simdgroup 0, which requires every simdgroup to be fully populated.
-    // (Clamping nth to ne00 here previously created a partial trailing
-    // simdgroup and produced wrong sums for row widths like 33.)
-    int nth = 32;
-    while (nth < ne00 && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
-        nth *= 2;
-    }
-    nth = std::min(nth, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
-
-    ggml_metal_encoder_set_pipeline(enc, pipeline);
-    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
-
-    ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
-
-    return 1;
-}
-
-// retro delta: L2-norm backward. One threadgroup per row; mirrors
-// ggml_metal_op_rms_norm_back's dispatch.
-// retro delta: RIR variant of L2_NORM_BACK (docs/INT_RIR.md §6.2). The
-// constant-buffer layout is no longer retyped here: `rir_l2_norm_back_params`
-// is generated from the same `shader_params_layout` that produced the MSL
-// struct, so the two cannot drift (docs/INT_RIR_V2.md §P1).
+// retro delta: the RIR dispatch path (docs/INT_RIR.md §6.2). No
+// constant-buffer layout is retyped here: the generated params struct comes
+// from the same `shader_params_layout` that produced the MSL one, so the two
+// cannot drift (docs/INT_RIR_V2.md §P1).
 
 // The device half of the RIR contract for this backend, in the shape
 // ggml_rir_evaluate and ggml_rir_preflight_graph consume.
@@ -5973,50 +5933,22 @@ int ggml_metal_op_rir_try(ggml_metal_op_t ctx, int idx) {
     return n;
 }
 
-int ggml_metal_op_l2_norm_back(ggml_metal_op_t ctx, int idx) {
-    ggml_tensor * op = ctx->node(idx);
-
-    ggml_metal_library_t lib = ctx->lib;
-    ggml_metal_encoder_t enc = ctx->enc;
-
-    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
-    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
-    GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
-    GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
-
-    float eps;
-    memcpy(&eps, op->op_params, sizeof(float));
-
-    // retro delta: RIR selection chain (docs/INT_RIR.md §5).
-    if (const int n = ggml_metal_op_rir_try(ctx, idx)) {
-        return n;
+// The whole encoder of a pair whose native kernel has been retired
+// (docs/INT_RIR_V4.md §P6): there is no second branch, and that is the shape a
+// finished promotion has. Two ops share it and neither adds a line.
+//
+// It cannot return 0. `ggml_rir_supports_op` is what admitted this node, and it
+// evaluated the same portable contract the site re-evaluates; the only ways to
+// arrive and be refused are a device-half rejection — a build that cannot run
+// on this machine — or a mode lowered after the graph split. Both abort inside
+// `ggml_rir_dispatch_begin`, with the op and the reason.
+int ggml_metal_op_rir_only(ggml_metal_op_t ctx, int idx) {
+    const int n = ggml_metal_op_rir_try(ctx, idx);
+    if (n == 0) {
+        GGML_ABORT("ggml-rir: %s sans variante dispatchée et sans natif (metal)",
+                ggml_op_name(ctx->node(idx)->op));
     }
-
-    auto pipeline = ggml_metal_library_get_pipeline_l2_norm_back(lib, op);
-
-    ggml_metal_kargs_l2_norm_back args = {
-        /*.ne00 =*/ ne00,
-        /*.eps  =*/ eps,
-        /*.nb01 =*/ nb01, /*.nb02 =*/ nb02, /*.nb03 =*/ nb03,
-        /*.nb11 =*/ nb11, /*.nb12 =*/ nb12, /*.nb13 =*/ nb13,
-        /*.nb1  =*/ nb1,  /*.nb2  =*/ nb2,  /*.nb3  =*/ nb3,
-    };
-
-    int nth = 32;
-    while (nth < ne00 && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
-        nth *= 2;
-    }
-    nth = std::min(nth, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
-
-    ggml_metal_encoder_set_pipeline(enc, pipeline);
-    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
-
-    ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
-
-    return 1;
+    return n;
 }
 
 // retro delta: repeat backward -- reduce a broadcast input's gradient back onto
@@ -6086,10 +6018,12 @@ int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
     // so its kernel takes s01/s02/s03 in bytes instead.
     const int64_t es0 = op->src[0]->type == GGML_TYPE_F32 ? es : 1;
 
-    // retro delta: RIR selection chain (docs/INT_RIR.md §5). The generated
-    // variant claims only the F32, non-broadcast sub-domain; a quantized src0
-    // or a shape where src0 is broadcast over ne2/ne3 fails the portable
-    // contract and falls through to the native kernel below.
+    // retro delta: RIR selection chain (docs/INT_RIR.md §5). One generated
+    // variant per src0 dtype since §P5 — F32, plus each quantized format whose
+    // decoder lowering can expand — and the node's own type picks between them
+    // (docs/INT_RIR_V4.md §P5). What is left is the broadcast over ne2/ne3 and
+    // the formats with no portable decoder: both fail the portable contract and
+    // fall through to the native kernel below.
     if (const int n = ggml_metal_op_rir_try(ctx, idx)) {
         return n;
     }

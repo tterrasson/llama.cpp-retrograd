@@ -5,7 +5,7 @@
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 shared float rir_shared_tile_a_v12[1024];
-shared float rir_shared_tile_b_v17[256];
+shared float rir_shared_tile_b_v19[256];
 
 layout(std430, binding = 0) readonly buffer Buf0 { float a[]; };
 layout(std430, binding = 1) readonly buffer Buf1 { float b[]; };
@@ -44,41 +44,51 @@ void main() {
     const uint blk_v7 = j_v1 / 16u;
     const uint org_v8 = blk_v7 * 16u;
     const uint loc_v9 = j_v1 % 16u;
-    const uint base_v32 = i_v0 * pc.dst_nb0 + j_v1 * pc.dst_nb1 + plane_v2 * pc.dst_nb2;
+    const uint base_v36 = i_v0 * pc.dst_nb0 + j_v1 * pc.dst_nb1 + plane_v2 * pc.dst_nb2;
     for (uint batch_v3 = 0u; batch_v3 < pc.n_batch; ++batch_v3) {
         vec4 acc8_v10 = vec4(0.0);
-        const uint base_v30 = plane_v2 * pc.a_nb2 + batch_v3 * pc.a_nb3;
-        const uint base_v31 = plane_v2 * pc.b_nb2 + batch_v3 * pc.b_nb3;
+        const uint base_v34 = plane_v2 * pc.a_nb2 + batch_v3 * pc.a_nb3;
+        const uint base_v35 = plane_v2 * pc.b_nb2 + batch_v3 * pc.b_nb3;
         for (uint k0_v11 = 0u; k0_v11 < pc.n_k; k0_v11 += 16u) {
             barrier();
             for (uint l_tile_a_v12 = gl_LocalInvocationIndex; l_tile_a_v12 < 1024u; l_tile_a_v12 += 256u) {
+                const uint a_at_v17 = l_tile_a_v12;
                 const uint a_r_v13 = l_tile_a_v12 % 64u;
                 const uint a_d_v14 = l_tile_a_v12 / 64u;
                 const uint a_m_v15 = org_v5 + a_r_v13;
                 const uint a_k_v16 = k0_v11 + a_d_v14;
-                rir_shared_tile_a_v12[l_tile_a_v12] = (a_m_v15 < pc.n_i && a_k_v16 < pc.n_k) ? a[(a_m_v15 * pc.a_nb0 + a_k_v16 * pc.a_nb1 + base_v30) / 4u] : 0.0;
+                rir_shared_tile_a_v12[l_tile_a_v12] = 0.0;
+                if (a_m_v15 < pc.n_i && a_k_v16 < pc.n_k) {
+                    const float t_v18 = a[(a_m_v15 * pc.a_nb0 + a_k_v16 * pc.a_nb1 + base_v34) / 4u];
+                    rir_shared_tile_a_v12[a_at_v17] = t_v18;
+                }
             }
-            for (uint l_tile_b_v17 = gl_LocalInvocationIndex; l_tile_b_v17 < 256u; l_tile_b_v17 += 256u) {
-                const uint b_r_v18 = l_tile_b_v17 % 16u;
-                const uint b_d_v19 = l_tile_b_v17 / 16u;
-                const uint b_m_v20 = org_v8 + b_r_v18;
-                const uint b_k_v21 = k0_v11 + b_d_v19;
-                rir_shared_tile_b_v17[l_tile_b_v17] = (b_m_v20 < pc.n_j && b_k_v21 < pc.n_k) ? b[(b_m_v20 * pc.b_nb0 + b_k_v21 * pc.b_nb1 + base_v31) / 4u] : 0.0;
+            for (uint l_tile_b_v19 = gl_LocalInvocationIndex; l_tile_b_v19 < 256u; l_tile_b_v19 += 256u) {
+                const uint b_at_v24 = l_tile_b_v19;
+                const uint b_r_v20 = l_tile_b_v19 % 16u;
+                const uint b_d_v21 = l_tile_b_v19 / 16u;
+                const uint b_m_v22 = org_v8 + b_r_v20;
+                const uint b_k_v23 = k0_v11 + b_d_v21;
+                rir_shared_tile_b_v19[l_tile_b_v19] = 0.0;
+                if (b_m_v22 < pc.n_j && b_k_v23 < pc.n_k) {
+                    const float t_v25 = b[(b_m_v22 * pc.b_nb0 + b_k_v23 * pc.b_nb1 + base_v35) / 4u];
+                    rir_shared_tile_b_v19[b_at_v24] = t_v25;
+                }
             }
             barrier();
-            for (uint kk_v22 = 0u; kk_v22 < 16u; ++kk_v22) {
-                const uint row_v23 = kk_v22 * 64u;
-                const uint at_v24 = row_v23 + loc_v6;
-                const vec4 t_v25 = vec4(rir_shared_tile_a_v12[at_v24], rir_shared_tile_a_v12[at_v24 + 1u], rir_shared_tile_a_v12[at_v24 + 2u], rir_shared_tile_a_v12[at_v24 + 3u]);
-                const uint row_v26 = kk_v22 * 16u;
-                const uint at_v27 = row_v26 + loc_v9;
-                const float t_v28 = rir_shared_tile_b_v17[at_v27];
-                const vec4 t_v29 = t_v25 * t_v28;
-                acc8_v10 += t_v29;
+            for (uint kk_v26 = 0u; kk_v26 < 16u; ++kk_v26) {
+                const uint row_v27 = kk_v26 * 64u;
+                const uint at_v28 = row_v27 + loc_v6;
+                const vec4 t_v29 = vec4(rir_shared_tile_a_v12[at_v28], rir_shared_tile_a_v12[at_v28 + 1u], rir_shared_tile_a_v12[at_v28 + 2u], rir_shared_tile_a_v12[at_v28 + 3u]);
+                const uint row_v30 = kk_v26 * 16u;
+                const uint at_v31 = row_v30 + loc_v9;
+                const float t_v32 = rir_shared_tile_b_v19[at_v31];
+                const vec4 t_v33 = t_v29 * t_v32;
+                acc8_v10 += t_v33;
             }
         }
         if (j_v1 < pc.n_j) {
-            const uint acc8_v10_o = (batch_v3 * pc.dst_nb3 + base_v32) / 4u;
+            const uint acc8_v10_o = (batch_v3 * pc.dst_nb3 + base_v36) / 4u;
             if (i_v0 + 4u <= pc.n_i) {
                 dst[acc8_v10_o + 0u] = acc8_v10.x;
                 dst[acc8_v10_o + 1u] = acc8_v10.y;

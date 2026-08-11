@@ -2511,42 +2511,6 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_silu_back(ggml_m
     return res;
 }
 
-// retro delta: RMS-norm backward pipeline (LoRA training on Metal)
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rms_norm_back(ggml_metal_library_t lib, const ggml_tensor * op) {
-    assert(op->op == GGML_OP_RMS_NORM_BACK);
-
-    char base[256];
-    char name[256];
-
-    snprintf(base, 256, "kernel_rms_norm_back_%s", ggml_type_name(op->src[0]->type));
-    snprintf(name, 256, "%s", base);
-
-    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
-    if (!res.pipeline) {
-        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
-    }
-
-    return res;
-}
-
-// retro delta: L2-norm backward pipeline (LoRA training on Metal)
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_l2_norm_back(ggml_metal_library_t lib, const ggml_tensor * op) {
-    assert(op->op == GGML_OP_L2_NORM_BACK);
-
-    char base[256];
-    char name[256];
-
-    snprintf(base, 256, "kernel_l2_norm_back_%s", ggml_type_name(op->src[0]->type));
-    snprintf(name, 256, "%s", base);
-
-    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
-    if (!res.pipeline) {
-        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
-    }
-
-    return res;
-}
-
 // retro delta: pipeline of any RIR-generated variant (docs/INT_RIR.md §6.2).
 // The entrypoint comes from the AOT registry (`rir_` namespace), so it can
 // never collide with a native kernel name — and nothing here names a kernel,
