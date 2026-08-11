@@ -1735,6 +1735,7 @@ extern "C" {
             uint32_t                  n_tokens,
             size_t                    n_seq_ids,
             uint32_t                  n_sequences,
+            uint32_t                  accumulation_steps,
             ggml_opt_epoch_callback   callback);
 
     // retro delta: monotonic wall-clock counters for optimizer graph work.

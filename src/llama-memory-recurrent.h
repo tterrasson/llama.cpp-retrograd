@@ -147,8 +147,9 @@ public:
 
     // used to create a batch processing context from a batch
     llama_memory_recurrent_context(
-            llama_memory_recurrent * mem,
-            std::vector<llama_ubatch> ubatches);
+        llama_memory_recurrent * mem,
+        std::vector<llama_ubatch> ubatches,
+        bool indexed = false);
 
     virtual ~llama_memory_recurrent_context();
 
@@ -178,6 +179,7 @@ public:
     int32_t s_copy(int i) const;
 
 private:
+    bool indexed = false;
     const llama_memory_status status;
 
     llama_memory_recurrent * mem;

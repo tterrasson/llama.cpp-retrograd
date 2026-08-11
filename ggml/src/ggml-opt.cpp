@@ -68,6 +68,10 @@ struct ggml_opt_context {
     bool cache_dynamic_graph     = false;
     bool eval_ready              = false;
     std::vector<struct ggml_tensor *> grad_accs;
+    // Persistent accumulators must follow parameter identity, because dynamic
+    // graphs can assign different node indices to the same parameter.
+    std::map<std::string, struct ggml_tensor *> grad_acc_by_name;
+    struct ggml_tensor * loss_acc = nullptr;
     std::vector<struct ggml_tensor *> grad_m;
     std::vector<struct ggml_tensor *> grad_v;
     // Forward tensors retained across the backward pass. Empty preserves the
@@ -583,7 +587,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         return;
     }
 
-    if (opt_ctx->grad_accs.empty()) {
+    if (opt_ctx->grad_acc_by_name.empty() && !opt_ctx->loss_acc) {
         GGML_ASSERT(opt_ctx->build_type_alloc >= GGML_OPT_BUILD_TYPE_GRAD);
 
         const int n_nodes = opt_ctx->gf->n_nodes;
@@ -592,6 +596,12 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             ggml_tensor * node = opt_ctx->gf->nodes[i];
             if ((accumulate && (node->flags & GGML_TENSOR_FLAG_PARAM)) || (node->flags & GGML_TENSOR_FLAG_LOSS)) {
                 opt_ctx->grad_accs[i] = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
+                if (node->flags & GGML_TENSOR_FLAG_PARAM) {
+                    opt_ctx->grad_acc_by_name[node->name] = opt_ctx->grad_accs[i];
+                } else {
+                    GGML_ASSERT(!opt_ctx->loss_acc);
+                    opt_ctx->loss_acc = opt_ctx->grad_accs[i];
+                }
             } else {
                 opt_ctx->grad_accs[i] = nullptr;
             }
@@ -613,6 +623,24 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
                     opt_ctx->grad_m[i] = nullptr;
                     opt_ctx->grad_v[i] = nullptr;
                 }
+            }
+        }
+    } else {
+        // Rebuild the graph-indexed view after a topology change (for example,
+        // standard preflight followed by shared-prefix packed training).
+        opt_ctx->grad_accs.assign(opt_ctx->gf->n_nodes, nullptr);
+        for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
+            ggml_tensor * node = opt_ctx->gf->nodes[i];
+            if (accumulate && (node->flags & GGML_TENSOR_FLAG_PARAM)) {
+                const auto slot = opt_ctx->grad_acc_by_name.find(node->name);
+                GGML_ASSERT(slot != opt_ctx->grad_acc_by_name.end() &&
+                        "optimizer parameter has no gradient accumulator");
+                GGML_ASSERT(ggml_are_same_shape(slot->second, node) &&
+                        "optimizer parameter changed shape between graph builds");
+                opt_ctx->grad_accs[i] = slot->second;
+            } else if (node->flags & GGML_TENSOR_FLAG_LOSS) {
+                GGML_ASSERT(opt_ctx->loss_acc && ggml_are_same_shape(opt_ctx->loss_acc, node));
+                opt_ctx->grad_accs[i] = opt_ctx->loss_acc;
             }
         }
     }
@@ -833,6 +861,29 @@ void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer) {
     } else {
         ggml_graph_reset(opt_ctx->gb_grad);
     }
+}
+
+bool ggml_opt_set_period(ggml_opt_context_t opt_ctx, int32_t opt_period) {
+    if (!opt_ctx || opt_period < 1 || opt_ctx->eval_ready || opt_ctx->opt_i != 0) {
+        return false;
+    }
+    opt_ctx->opt_period = opt_period;
+    return true;
+}
+
+bool ggml_opt_abort_accumulation(ggml_opt_context_t opt_ctx) {
+    if (!opt_ctx || opt_ctx->eval_ready) {
+        return false;
+    }
+    for (const auto & item : opt_ctx->grad_acc_by_name) {
+        ggml_set_zero(item.second);
+    }
+    if (opt_ctx->loss_acc) {
+        ggml_set_zero(opt_ctx->loss_acc);
+    }
+    opt_ctx->opt_i = 0;
+    opt_ctx->opt_period = 1;
+    return true;
 }
 
 bool ggml_opt_static_graphs(ggml_opt_context_t opt_ctx) {

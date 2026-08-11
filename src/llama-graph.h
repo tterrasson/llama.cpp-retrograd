@@ -170,6 +170,19 @@ public:
     const uint32_t n_pos_per_embd = 1;
 };
 
+// Logical predecessor rows for recurrent convolutions in a packed batch.
+// Unlike attention, ShortConv used to infer these edges from physical
+// adjacency, which is wrong once several branches share the same prompt.
+class llm_graph_input_conv_idx : public llm_graph_input_i {
+public:
+    explicit llm_graph_input_conv_idx(uint32_t l_cache) : l_cache(l_cache) {}
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * idx = nullptr; // I32 [l_cache * n_tokens]
+    const uint32_t l_cache;
+};
+
 // temperature tuning, used by llama4
 class llm_graph_input_attn_temp : public llm_graph_input_i {
 public:

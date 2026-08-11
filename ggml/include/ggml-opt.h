@@ -180,6 +180,13 @@ extern "C" {
 
     // set gradients to zero, initialize loss, and optionally reset the optimizer
     GGML_API void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer);
+    // Change the number of physical graphs in the next logical update. This
+    // is legal only at an update boundary; dynamic graphs are rebuilt with the
+    // corresponding GRAD/OPT topology on each evaluation.
+    GGML_API bool ggml_opt_set_period(ggml_opt_context_t opt_ctx, int32_t opt_period);
+    // Abandons an incomplete accumulation period without applying an optimizer
+    // step. Persistent momenta and the published iteration are unchanged.
+    GGML_API bool ggml_opt_abort_accumulation(ggml_opt_context_t opt_ctx);
 
     GGML_API bool ggml_opt_static_graphs(ggml_opt_context_t opt_ctx); // whether the graphs are allocated_statically
 
