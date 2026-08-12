@@ -2649,6 +2649,19 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
+    // retro delta: a reserve graph is a worst-case graph, not the decode that
+    // serves a pending target log-probability request, and its n_outputs is
+    // unrelated to the request's. decode() sets tlp.active before it calls
+    // sched_reserve()/memory_update(), so a reserve reached from there would
+    // otherwise hand build_target_logprobs the previous ubatch's (or an empty)
+    // index vector and trip its size assertion. Size the gather for the graph
+    // being reserved instead: the values do not matter here (a reserve never
+    // runs set_input), only that the buffers reserved include the gather.
+    // decode() rebuilds tlp.idx for every ubatch before the graph it computes.
+    if (tlp.active) {
+        tlp.idx.assign(n_outputs, 0);
+    }
+
     const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
 
     res->reset();
