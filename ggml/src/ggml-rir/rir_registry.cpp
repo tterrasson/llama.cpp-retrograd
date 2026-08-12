@@ -1070,9 +1070,9 @@ const rir_op_policy rir_op_policies[] = {
     {"GGML_OP_CUMSUM", RIR_BACKEND_VULKAN, RIR_POLICY_OBSERVE_GENERATED, 0, 0},
     {"GGML_OP_CUMSUM", RIR_BACKEND_METAL, RIR_POLICY_OBSERVE_GENERATED, 0, 0},
     {"GGML_OP_CUMSUM", RIR_BACKEND_CPU, RIR_POLICY_NATIVE_ONLY, 0, 0},
-    // GGML_OP_OUT_PROD hors domaine — dtype (out_prod): src0 quantifié : servi par les variantes out_prod_<format>, pas par celle-ci — la sélection se fait sur le dtype du nœud
-    // GGML_OP_OUT_PROD hors domaine — shape (out_prod): src0 diffusé sur ne2/ne3 ; même absence d'arithmétique d'indice que la diffusion de la bande élémentaire. Aucun nœud du graphe réel
-    // GGML_OP_OUT_PROD hors domaine — dtype (out_prod_q4_0): src0 F32 : servi par la variante de repli, pas par celle-ci ; et les formats sans décodeur portable (les native_intrinsic, mxfp4 dont l'échelle E8M0 est refusée avec sa raison) et F16
+    // GGML_OP_OUT_PROD outside domain — dtype (out_prod): quantized src0: served by out_prod_<format> variants, not this one — selection uses the node dtype
+    // GGML_OP_OUT_PROD outside domain — shape (out_prod): src0 broadcast over ne2/ne3; same lack of index arithmetic as the elementwise-strip broadcast. No real-graph node
+    // GGML_OP_OUT_PROD outside domain — dtype (out_prod_q4_0): F32 src0: served by the fallback variant, not this one; plus formats without a portable decoder (native_intrinsic and mxfp4, whose E8M0 scale is rejected with its reason) and F16
     {"GGML_OP_OUT_PROD", RIR_BACKEND_CUDA, RIR_POLICY_NATIVE_ONLY, 20, 0},
     {"GGML_OP_OUT_PROD", RIR_BACKEND_VULKAN, RIR_POLICY_PREFER_GENERATED, 20, 0},
     {"GGML_OP_OUT_PROD", RIR_BACKEND_METAL, RIR_POLICY_PREFER_GENERATED, 20, 0},
@@ -1081,17 +1081,17 @@ const rir_op_policy rir_op_policies[] = {
     {"GGML_OP_RMS_NORM_BACK", RIR_BACKEND_VULKAN, RIR_POLICY_PREFER_GENERATED, 0, 1},
     {"GGML_OP_RMS_NORM_BACK", RIR_BACKEND_METAL, RIR_POLICY_PREFER_GENERATED, 0, 1},
     {"GGML_OP_RMS_NORM_BACK", RIR_BACKEND_CPU, RIR_POLICY_NATIVE_ONLY, 0, 0},
-    // GGML_OP_ADD natif conservé — exception choisie : le natif de la bande sert quatre chemins qu'un kernel RIR ne peut pas exprimer — un nœud, un dispatch : les chaînes d'ADD fusionnées, la fusion RMS_NORM+MUL+ADD, la fusion snake de Metal, et do_add_rms_partials sur Vulkan, qui est une correction. Sur Metal il n'y a de surcroît pas de kernel à retirer : un seul patron sert ADD/SUB/MUL/DIV et ACC. Exception native choisie, pas un retrait manqué (docs/FUTURE_V1.md §16)
+    // GGML_OP_ADD native kernel retained — selected exception: the native strip serves four paths a RIR kernel cannot express — one node, one dispatch: fused ADD chains, RMS_NORM+MUL+ADD fusion, Metal snake fusion, and do_add_rms_partials on Vulkan, which is a correctness path. On Metal there is also no kernel to remove: one pattern serves ADD/SUB/MUL/DIV and ACC. Deliberate native exception, not a missed removal (docs/FUTURE_V1.md §16)
     {"GGML_OP_ADD", RIR_BACKEND_CUDA, RIR_POLICY_NATIVE_ONLY, 0, 0},
     {"GGML_OP_ADD", RIR_BACKEND_VULKAN, RIR_POLICY_PREFER_GENERATED, 0, 0},
     {"GGML_OP_ADD", RIR_BACKEND_METAL, RIR_POLICY_PREFER_GENERATED, 0, 0},
     {"GGML_OP_ADD", RIR_BACKEND_CPU, RIR_POLICY_NATIVE_ONLY, 0, 0},
-    // GGML_OP_MUL natif conservé — exception choisie : le natif de la bande sert quatre chemins qu'un kernel RIR ne peut pas exprimer — un nœud, un dispatch : les chaînes d'ADD fusionnées, la fusion RMS_NORM+MUL+ADD, la fusion snake de Metal, et do_add_rms_partials sur Vulkan, qui est une correction. Sur Metal il n'y a de surcroît pas de kernel à retirer : un seul patron sert ADD/SUB/MUL/DIV et ACC. Exception native choisie, pas un retrait manqué (docs/FUTURE_V1.md §16)
+    // GGML_OP_MUL native kernel retained — selected exception: the native strip serves four paths a RIR kernel cannot express — one node, one dispatch: fused ADD chains, RMS_NORM+MUL+ADD fusion, Metal snake fusion, and do_add_rms_partials on Vulkan, which is a correctness path. On Metal there is also no kernel to remove: one pattern serves ADD/SUB/MUL/DIV and ACC. Deliberate native exception, not a missed removal (docs/FUTURE_V1.md §16)
     {"GGML_OP_MUL", RIR_BACKEND_CUDA, RIR_POLICY_NATIVE_ONLY, 0, 0},
     {"GGML_OP_MUL", RIR_BACKEND_VULKAN, RIR_POLICY_PREFER_GENERATED, 0, 0},
     {"GGML_OP_MUL", RIR_BACKEND_METAL, RIR_POLICY_PREFER_GENERATED, 0, 0},
     {"GGML_OP_MUL", RIR_BACKEND_CPU, RIR_POLICY_NATIVE_ONLY, 0, 0},
-    // GGML_OP_SCALE hors domaine — dtype: F16 : les deux natifs GPU l'acceptent, ggml_compute_forward_scale non — un membre F16 serait une variante qu'aucun banc ne peut juger (docs/FUTURE_V1.md §8)
+    // GGML_OP_SCALE outside domain — dtype: F16: both native GPU kernels accept it, ggml_compute_forward_scale does not — an F16 member would be a variant no benchmark can judge (docs/FUTURE_V1.md §8)
     {"GGML_OP_SCALE", RIR_BACKEND_CUDA, RIR_POLICY_NATIVE_ONLY, 4, 0},
     {"GGML_OP_SCALE", RIR_BACKEND_VULKAN, RIR_POLICY_PREFER_GENERATED, 4, 0},
     {"GGML_OP_SCALE", RIR_BACKEND_METAL, RIR_POLICY_PREFER_GENERATED, 4, 0},
@@ -1100,8 +1100,8 @@ const rir_op_policy rir_op_policies[] = {
     {"GGML_OP_RMS_NORM", RIR_BACKEND_VULKAN, RIR_POLICY_OBSERVE_GENERATED, 0, 0},
     {"GGML_OP_RMS_NORM", RIR_BACKEND_METAL, RIR_POLICY_OBSERVE_GENERATED, 0, 0},
     {"GGML_OP_RMS_NORM", RIR_BACKEND_CPU, RIR_POLICY_NATIVE_ONLY, 0, 0},
-    // GGML_OP_UNARY hors domaine — dtype (unary_abs): les deux natifs acceptent F16 pour cette famille ; les quatorze membres écrits sont typés F32. La fermer coûterait quatorze kernels de plus pour un dtype qu'aucun des deux recensements ne produit sur un UNARY
-    // GGML_OP_UNARY hors domaine — op_variant (unary_abs): les huit membres que RIR ne déclare pas : softplus et gelu_erf demandent log et erf, floor/ceil/round/trunc un arrondi dirigé, xielu ses propres scalaires dans op_params — et gelu, écrit et exact, est retiré par la mesure : sur Metal le natif lui-même sort la NMSE à 1,00-1,14e-7 contre un seuil de 1,0e-7
+    // GGML_OP_UNARY outside domain — dtype (unary_abs): both native kernels accept F16 for this family; all fourteen written members are typed F32. Closing it would cost fourteen more kernels for a dtype produced by neither census on a UNARY
+    // GGML_OP_UNARY outside domain — op_variant (unary_abs): the eight members RIR does not declare: softplus and gelu_erf need log and erf, floor/ceil/round/trunc need directed rounding, xielu carries its own scalars in op_params — and gelu, written and exact, is removed by measurement: on Metal native itself yields NMSE of 1.00-1.14e-7 against a 1.0e-7 threshold
     {"GGML_OP_UNARY", RIR_BACKEND_CUDA, RIR_POLICY_NATIVE_ONLY, 8196, 0},
     {"GGML_OP_UNARY", RIR_BACKEND_VULKAN, RIR_POLICY_PREFER_GENERATED, 8196, 0},
     {"GGML_OP_UNARY", RIR_BACKEND_METAL, RIR_POLICY_PREFER_GENERATED, 8196, 0},
