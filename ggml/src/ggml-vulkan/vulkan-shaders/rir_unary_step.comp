@@ -39,8 +39,6 @@ void main() {
     const float c_v11 = 0.0;
     const float c_v13 = 1.0;
     const uint base_v17 = col_v0 * pc.x_nb0 + row_v1 * pc.x_nb1 + plane_v2 * pc.x_nb2;
-    const float c_v5 = 0.0;
-    const float c_v7 = 1.0;
     const uint base_v18 = col_v0 * pc.dst_nb0 + row_v1 * pc.dst_nb1 + plane_v2 * pc.dst_nb2;
     for (uint batch_v3 = 0u; batch_v3 < pc.n_batch; ++batch_v3) {
         const uint base_v15 = row_v1 * pc.x_nb1 + plane_v2 * pc.x_nb2 + batch_v3 * pc.x_nb3;
@@ -48,8 +46,8 @@ void main() {
         if (col_v0 + 4u <= pc.n_col) {
             const uint t_v4_i = (batch_v3 * pc.x_nb3 + base_v17) / 4u;
             const vec4 t_v4 = vec4(x[t_v4_i], x[t_v4_i + 1u], x[t_v4_i + 2u], x[t_v4_i + 3u]);
-            const bvec4 b_v6 = greaterThan(t_v4, vec4(c_v5));
-            const vec4 t_v8 = mix(vec4(c_v5), vec4(c_v7), b_v6);
+            const bvec4 b_v6 = greaterThan(t_v4, vec4(c_v11));
+            const vec4 t_v8 = mix(vec4(c_v11), vec4(c_v13), b_v6);
             const uint t_v8_o = (batch_v3 * pc.dst_nb3 + base_v18) / 4u;
             dst[t_v8_o] = t_v8.x;
             dst[t_v8_o + 1u] = t_v8.y;

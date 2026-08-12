@@ -55,7 +55,6 @@ void main() {
         barrier();
     }
     const float red7_v8 = rir_shared_red7_v8[0];
-    const uint base_v20 = row_v0 * pc.x_nb1 + plane_v1 * pc.x_nb2 + batch_v2 * pc.x_nb3;
     const float c_v11 = 1.0;
     const float n_v12 = float(pc.n_col);
     const float t_v13 = red7_v8 / n_v12;
@@ -65,7 +64,7 @@ void main() {
     const float t_v17 = c_v11 / t_v16;
     const uint base_v21 = row_v0 * pc.dst_nb1 + plane_v1 * pc.dst_nb2 + batch_v2 * pc.dst_nb3;
     for (uint col_v9 = lane_v3; col_v9 < pc.n_col; col_v9 += 256u) {
-        const float t_v10 = x[(col_v9 * pc.x_nb0 + base_v20) / 4u];
+        const float t_v10 = x[(col_v9 * pc.x_nb0 + base_v19) / 4u];
         const float t_v18 = t_v10 * t_v17;
         dst[(col_v9 * pc.dst_nb0 + base_v21) / 4u] = t_v18;
     }

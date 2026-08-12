@@ -41,8 +41,6 @@ void main() {
     const float p_v11 = pc.scale;
     const float p_v13 = pc.bias;
     const uint base_v17 = col_v0 * pc.a_nb0 + row_v1 * pc.a_nb1 + plane_v2 * pc.a_nb2;
-    const float p_v5 = pc.scale;
-    const float p_v7 = pc.bias;
     const uint base_v18 = col_v0 * pc.dst_nb0 + row_v1 * pc.dst_nb1 + plane_v2 * pc.dst_nb2;
     for (uint batch_v3 = 0u; batch_v3 < pc.n_batch; ++batch_v3) {
         const uint base_v15 = row_v1 * pc.a_nb1 + plane_v2 * pc.a_nb2 + batch_v3 * pc.a_nb3;
@@ -50,8 +48,8 @@ void main() {
         if (col_v0 + 4u <= pc.n_col) {
             const uint t_v4_i = (batch_v3 * pc.a_nb3 + base_v17) / 4u;
             const vec4 t_v4 = vec4(a[t_v4_i], a[t_v4_i + 1u], a[t_v4_i + 2u], a[t_v4_i + 3u]);
-            const vec4 t_v6 = t_v4 * p_v5;
-            const vec4 t_v8 = t_v6 + p_v7;
+            const vec4 t_v6 = t_v4 * p_v11;
+            const vec4 t_v8 = t_v6 + p_v13;
             const uint t_v8_o = (batch_v3 * pc.dst_nb3 + base_v18) / 4u;
             dst[t_v8_o] = t_v8.x;
             dst[t_v8_o + 1u] = t_v8.y;

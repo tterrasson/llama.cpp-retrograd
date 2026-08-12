@@ -58,25 +58,17 @@ void main() {
         acc10_v5 += t_v10;
     }
     rir_shared_red9_v11[gl_LocalInvocationID.x] = acc9_v4;
+    rir_shared_red10_v12[gl_LocalInvocationID.x] = acc10_v5;
     barrier();
     for (uint stride_red9_v11 = 128u; stride_red9_v11 > 0u; stride_red9_v11 >>= 1u) {
         if (gl_LocalInvocationID.x < stride_red9_v11) {
             rir_shared_red9_v11[gl_LocalInvocationID.x] = rir_shared_red9_v11[gl_LocalInvocationID.x] + rir_shared_red9_v11[gl_LocalInvocationID.x + stride_red9_v11];
+            rir_shared_red10_v12[gl_LocalInvocationID.x] = rir_shared_red10_v12[gl_LocalInvocationID.x] + rir_shared_red10_v12[gl_LocalInvocationID.x + stride_red9_v11];
         }
         barrier();
     }
     const float red9_v11 = rir_shared_red9_v11[0];
-    rir_shared_red10_v12[gl_LocalInvocationID.x] = acc10_v5;
-    barrier();
-    for (uint stride_red10_v12 = 128u; stride_red10_v12 > 0u; stride_red10_v12 >>= 1u) {
-        if (gl_LocalInvocationID.x < stride_red10_v12) {
-            rir_shared_red10_v12[gl_LocalInvocationID.x] = rir_shared_red10_v12[gl_LocalInvocationID.x] + rir_shared_red10_v12[gl_LocalInvocationID.x + stride_red10_v12];
-        }
-        barrier();
-    }
     const float red10_v12 = rir_shared_red10_v12[0];
-    const uint base_v33 = row_v0 * pc.dz_nb1 + plane_v1 * pc.dz_nb2 + batch_v2 * pc.dz_nb3;
-    const uint base_v34 = row_v0 * pc.x_nb1 + plane_v1 * pc.x_nb2 + batch_v2 * pc.x_nb3;
     const float c_v16 = 0.0;
     const float t_v17 = c_v16 - red10_v12;
     const float p_v18 = pc.eps;
@@ -91,8 +83,8 @@ void main() {
     const float t_v29 = c_v25 / t_v28;
     const uint base_v35 = row_v0 * pc.dx_nb1 + plane_v1 * pc.dx_nb2 + batch_v2 * pc.dx_nb3;
     for (uint col_v13 = lane_v3; col_v13 < pc.n_col; col_v13 += 256u) {
-        const float t_v14 = dz[(col_v13 * pc.dz_nb0 + base_v33) / 4u];
-        const float t_v15 = x[(col_v13 * pc.x_nb0 + base_v34) / 4u];
+        const float t_v14 = dz[(col_v13 * pc.dz_nb0 + base_v32) / 4u];
+        const float t_v15 = x[(col_v13 * pc.x_nb0 + base_v31) / 4u];
         const float t_v23 = t_v15 * t_v22;
         const float t_v24 = t_v14 + t_v23;
         const float t_v30 = t_v24 * t_v29;

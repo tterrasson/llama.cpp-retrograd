@@ -61,13 +61,11 @@ void main() {
     const float t_v14 = sqrt(red9_v11);
     const float p_v15 = pc.eps;
     const bool b_v16 = t_v14 > p_v15;
-    const uint base_v27 = row_v0 * pc.dz_nb1 + plane_v1 * pc.dz_nb2 + batch_v2 * pc.dz_nb3;
-    const uint base_v28 = row_v0 * pc.x_nb1 + plane_v1 * pc.x_nb2 + batch_v2 * pc.x_nb3;
     const float t_v19 = red10_v12 / red9_v11;
     const uint base_v29 = row_v0 * pc.dx_nb1 + plane_v1 * pc.dx_nb2 + batch_v2 * pc.dx_nb3;
     for (uint col_v13 = lane_v3; col_v13 < pc.n_col; col_v13 += 32u) {
-        const float t_v17 = dz[(col_v13 * pc.dz_nb0 + base_v27) / 4u];
-        const float t_v18 = x[(col_v13 * pc.x_nb0 + base_v28) / 4u];
+        const float t_v17 = dz[(col_v13 * pc.dz_nb0 + base_v26) / 4u];
+        const float t_v18 = x[(col_v13 * pc.x_nb0 + base_v25) / 4u];
         const float t_v20 = t_v18 * t_v19;
         const float t_v21 = t_v17 - t_v20;
         const float t_v22 = t_v21 / t_v14;

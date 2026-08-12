@@ -66,10 +66,6 @@ void main() {
                 const uint a_d_v14 = l_tile_a_v12 / 64u;
                 const uint a_m_v15 = org_v5 + a_r_v13;
                 const uint a_k_v16 = k0_v11 + a_d_v14;
-                rir_shared_tile_a_v12[l_tile_a_v12] = 0.0;
-                rir_shared_tile_a_v12[l_tile_a_v12 + 1u] = 0.0;
-                rir_shared_tile_a_v12[l_tile_a_v12 + 2u] = 0.0;
-                rir_shared_tile_a_v12[l_tile_a_v12 + 3u] = 0.0;
                 if (a_m_v15 < pc.n_i && a_k_v16 < pc.n_k) {
                     const uint blk_v18 = a_m_v15 / 256u;
                     const uint inb0_v19 = a_m_v15 % 256u;
@@ -104,8 +100,7 @@ void main() {
                         const uint q_sh_v46 = q_sel_v45 * 2u;
                         const uint q_shr_v47 = q_byte_v43 >> q_sh_v46;
                         const uint q_v48 = q_shr_v47 & 3u;
-                        const uint qh_inp_v49 = inb_v40 % 32u;
-                        const uint qh_byte_v50 = uint(a_u8[qh_inp_v49 + base_v78]);
+                        const uint qh_byte_v50 = uint(a_u8[q_inp_v42 + base_v78]);
                         const uint qh_sel_v51 = inb_v40 / 32u;
                         const uint qh_shr_v52 = qh_byte_v50 >> qh_sel_v51;
                         const uint qh_v53 = qh_shr_v52 & 1u;
@@ -117,6 +112,11 @@ void main() {
                         const uint at_v61 = a_at_v17 + a_e_v39;
                         rir_shared_tile_a_v12[at_v61] = t_v60;
                     }
+                } else {
+                    rir_shared_tile_a_v12[l_tile_a_v12] = 0.0;
+                    rir_shared_tile_a_v12[l_tile_a_v12 + 1u] = 0.0;
+                    rir_shared_tile_a_v12[l_tile_a_v12 + 2u] = 0.0;
+                    rir_shared_tile_a_v12[l_tile_a_v12 + 3u] = 0.0;
                 }
             }
             for (uint l_tile_b_v62 = gl_LocalInvocationIndex; l_tile_b_v62 < 256u; l_tile_b_v62 += 256u) {
@@ -125,10 +125,11 @@ void main() {
                 const uint b_d_v64 = l_tile_b_v62 / 16u;
                 const uint b_m_v65 = org_v8 + b_r_v63;
                 const uint b_k_v66 = k0_v11 + b_d_v64;
-                rir_shared_tile_b_v62[l_tile_b_v62] = 0.0;
                 if (b_m_v65 < pc.n_j && b_k_v66 < pc.n_k) {
                     const float t_v68 = b[(b_m_v65 * pc.b_nb0 + b_k_v66 * pc.b_nb1 + base_v82) / 4u];
                     rir_shared_tile_b_v62[b_at_v67] = t_v68;
+                } else {
+                    rir_shared_tile_b_v62[l_tile_b_v62] = 0.0;
                 }
             }
             barrier();
