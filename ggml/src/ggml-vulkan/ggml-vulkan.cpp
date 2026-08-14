@@ -2195,7 +2195,24 @@ struct vk_op_fused_sparse_ce_push_constants {
     uint32_t h_stride; // elements between hidden-state columns
     uint32_t d_stride; // elements between grad_h columns (backward only)
     uint32_t has_bias; // 1 when the head carries a per-vocab bias [n_vocab]
+    uint32_t n_tok;    // tokens per workgroup (the CE shaders' token tile)
 };
+
+// retro delta: tokens per workgroup for the fused CE shaders. Decoding the head
+// is what those kernels spend their time on -- one dequantize() call yields two
+// weights, and a K-quant has no vec4 form to widen it -- so a workgroup decodes
+// each vocabulary column once and reuses it for a whole tile of tokens. Both
+// shaders unroll over this bound, and the backward keeps `tile * pairs per
+// invocation` inside its accumulator budget (ACC_PAIRS = 16 pairs), which is
+// what the second term below expresses.
+#define GGML_VK_FUSED_CE_TOK_MAX 8
+
+static uint32_t ggml_vk_fused_sparse_ce_tile(uint32_t n_embd) {
+    const uint32_t wg        = 256;
+    const uint32_t acc_pairs = 16;
+    const uint32_t per_inv   = std::max(1u, (n_embd / 2 + wg - 1) / wg);
+    return std::max(1u, std::min(uint32_t(GGML_VK_FUSED_CE_TOK_MAX), acc_pairs / per_inv));
+}
 
 struct vk_op_ssm_scan_back_push_constants {
     uint32_t d_state, head_dim, n_head, n_group, n_seq_tokens, n_seqs, n_A0;
@@ -2495,6 +2512,24 @@ static uint64_t ggml_vk_get_node_flops(const ggml_tensor * node) {
         const ggml_tensor * k = node->src[1];
         const ggml_tensor * v = node->src[2];
         return 2ull * q->ne[1] * q->ne[2] * (k->ne[0] + v->ne[0]) * k->ne[1] * q->ne[3];
+    }
+    // retro delta: the fused sparse cross-entropy walks the whole projection
+    // head per token without ever materializing a logit, so its cost is a GEMM's
+    // and its node count is one. Reporting zero here (the default for an op this
+    // function does not know) keeps `batch_flops` flat, and the caller's
+    // flops-based submit heuristic then packs a graph's worth of them into a
+    // single submission -- seconds of GPU work, past what a driver watchdog
+    // allows. The backward makes three passes over the vocabulary where the
+    // forward makes one (logsumexp, softmax weights, weighted accumulation).
+    if (node->op == GGML_OP_FUSED_SPARSE_CE || node->op == GGML_OP_FUSED_SPARSE_CE_BACK) {
+        const bool back = node->op == GGML_OP_FUSED_SPARSE_CE_BACK;
+        const ggml_tensor * h = back ? node->src[1] : node->src[0];
+        const ggml_tensor * w = back ? node->src[2] : node->src[1];
+        if (!h || !w) {
+            return 0;
+        }
+        const uint64_t passes = back ? 3 : 1;
+        return passes * 2ull * (uint64_t) h->ne[0] * (uint64_t) w->ne[1] * (uint64_t) h->ne[1];
     }
     return 0;
 }
@@ -14365,6 +14400,7 @@ static void ggml_vk_fused_sparse_ce(ggml_backend_vk_context * ctx, vk_context& s
         (uint32_t) (h->nb[1] / sizeof(float)),
         0,
         bias != nullptr ? 1u : 0u,
+        ggml_vk_fused_sparse_ce_tile((uint32_t) h->ne[0]),
     };
 
     const vk_subbuffer count_buf = ggml_vk_fused_sparse_ce_count(ctx, subctx, targets, weights, pc);
@@ -14387,7 +14423,7 @@ static void ggml_vk_fused_sparse_ce(ggml_backend_vk_context * ctx, vk_context& s
         { ggml_vk_tensor_subbuffer(ctx, h), ggml_vk_tensor_subbuffer(ctx, w),
           ggml_vk_tensor_subbuffer(ctx, targets), ggml_vk_tensor_subbuffer(ctx, weights),
           count_buf, dst_buf, ggml_vk_tensor_subbuffer(ctx, bias ? bias : weights) },
-        pc, { pc.n_tokens, 1, 1 });
+        pc, { (pc.n_tokens + pc.n_tok - 1) / pc.n_tok, 1, 1 });
 }
 
 static void ggml_vk_fused_sparse_ce_back(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
@@ -14408,6 +14444,7 @@ static void ggml_vk_fused_sparse_ce_back(ggml_backend_vk_context * ctx, vk_conte
         (uint32_t) (h->nb[1] / sizeof(float)),
         (uint32_t) (dst->nb[1] / sizeof(float)),
         bias != nullptr ? 1u : 0u,
+        ggml_vk_fused_sparse_ce_tile((uint32_t) h->ne[0]),
     };
 
     const vk_subbuffer count_buf = ggml_vk_fused_sparse_ce_count(ctx, subctx, targets, weights, pc);
@@ -14423,7 +14460,7 @@ static void ggml_vk_fused_sparse_ce_back(ggml_backend_vk_context * ctx, vk_conte
           ggml_vk_tensor_subbuffer(ctx, weights), count_buf,
           ggml_vk_tensor_subbuffer(ctx, dst),
           ggml_vk_tensor_subbuffer(ctx, bias ? bias : weights) },
-        pc, { pc.n_tokens, 1, 1 });
+        pc, { (pc.n_tokens + pc.n_tok - 1) / pc.n_tok, 1, 1 });
 }
 
 static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -19427,7 +19464,22 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             flops_cap = 2'000'000'000ULL * ctx->device->shader_core_count;
         }
     }
-    uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
+    // retro delta: Metal aborts a command buffer that runs too long, and a
+    // training graph reaches that on its own -- the fused cross-entropy alone is
+    // tens of GFLOP per node. Same shape as the AMD case above, with a cap
+    // measured on an M1: a submission of ~1.6 s of this work survived and ~3 s
+    // did not, and 50 GFLOP is comfortably inside that for the slowest kernel
+    // here (the dequantizing CE, ~85 GFLOP/s) without splitting a plain
+    // matmul-bound graph more than a handful of times.
+    if (ctx->device->driver_id == vk::DriverId::eMoltenvk) {
+        flops_cap = std::min(flops_cap, 50'000'000'000ULL);
+    }
+    // The scaled-down budget is only known once a graph has been costed. Until
+    // then, cap rather than disable the heuristic: the first graph of a run is
+    // also the one whose submissions nothing has bounded yet.
+    uint64_t flops_per_submit = ctx->last_total_flops != 0
+            ? std::min(flops_cap, ctx->last_total_flops / 40u)
+            : flops_cap;
 
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
@@ -21318,8 +21370,15 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (!ggml_is_contiguous(w)) {
                     return false;
                 }
-                // Backward keeps one grad_h slot per thread: n_embd <= 256*32.
-                if (back && h->ne[0] > 256 * 32) {
+                // Both directions walk the head by pairs — the unit dequantize()
+                // returns — so an odd embedding width would read past the last
+                // element. Every block size but F32/F16's is even already.
+                if ((h->ne[0] % 2) != 0) {
+                    return false;
+                }
+                // Backward keeps one grad_h pair per thread per token of the
+                // tile: n_embd <= ACC_PAIRS * 2 * 256 for a tile of one.
+                if (back && h->ne[0] > 16 * 2 * 256) {
                     return false;
                 }
                 return true;
