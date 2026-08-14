@@ -19472,7 +19472,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     // here (the dequantizing CE, ~85 GFLOP/s) without splitting a plain
     // matmul-bound graph more than a handful of times.
     if (ctx->device->driver_id == vk::DriverId::eMoltenvk) {
-        flops_cap = std::min(flops_cap, 50'000'000'000ULL);
+        flops_cap = std::min<uint64_t>(flops_cap, 50'000'000'000ULL);
     }
     // The scaled-down budget is only known once a graph has been costed. Until
     // then, cap rather than disable the heuristic: the first graph of a run is

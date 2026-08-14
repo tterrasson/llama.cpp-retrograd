@@ -1081,6 +1081,16 @@ const rir_op_policy rir_op_policies[] = {
     {"GGML_OP_RMS_NORM_BACK", RIR_BACKEND_VULKAN, RIR_POLICY_PREFER_GENERATED, 0, 1},
     {"GGML_OP_RMS_NORM_BACK", RIR_BACKEND_METAL, RIR_POLICY_PREFER_GENERATED, 0, 1},
     {"GGML_OP_RMS_NORM_BACK", RIR_BACKEND_CPU, RIR_POLICY_NATIVE_ONLY, 0, 0},
+    {"GGML_OP_RMS_NORM", RIR_BACKEND_CUDA, RIR_POLICY_NATIVE_ONLY, 0, 0},
+    {"GGML_OP_RMS_NORM", RIR_BACKEND_VULKAN, RIR_POLICY_OBSERVE_GENERATED, 0, 0},
+    {"GGML_OP_RMS_NORM", RIR_BACKEND_METAL, RIR_POLICY_OBSERVE_GENERATED, 0, 0},
+    {"GGML_OP_RMS_NORM", RIR_BACKEND_CPU, RIR_POLICY_NATIVE_ONLY, 0, 0},
+    // GGML_OP_UNARY outside domain — dtype (unary_abs): both native kernels accept F16 for this family; all fourteen written members are typed F32. Closing it would cost fourteen more kernels for a dtype produced by neither census on a UNARY
+    // GGML_OP_UNARY outside domain — op_variant (unary_abs): the eight members RIR does not declare: softplus and gelu_erf need log and erf, floor/ceil/round/trunc need directed rounding, xielu carries its own scalars in op_params — and gelu, written and exact, is removed by measurement: on Metal native itself yields NMSE of 1.00-1.14e-7 against a 1.0e-7 threshold
+    {"GGML_OP_UNARY", RIR_BACKEND_CUDA, RIR_POLICY_NATIVE_ONLY, 8196, 0},
+    {"GGML_OP_UNARY", RIR_BACKEND_VULKAN, RIR_POLICY_PREFER_GENERATED, 8196, 0},
+    {"GGML_OP_UNARY", RIR_BACKEND_METAL, RIR_POLICY_PREFER_GENERATED, 8196, 0},
+    {"GGML_OP_UNARY", RIR_BACKEND_CPU, RIR_POLICY_NATIVE_ONLY, 8196, 0},
     // GGML_OP_ADD native kernel retained — selected exception: the native strip serves four paths a RIR kernel cannot express — one node, one dispatch: fused ADD chains, RMS_NORM+MUL+ADD fusion, Metal snake fusion, and do_add_rms_partials on Vulkan, which is a correctness path. On Metal there is also no kernel to remove: one pattern serves ADD/SUB/MUL/DIV and ACC. Deliberate native exception, not a missed removal (docs/FUTURE_V1.md §16)
     {"GGML_OP_ADD", RIR_BACKEND_CUDA, RIR_POLICY_NATIVE_ONLY, 0, 0},
     {"GGML_OP_ADD", RIR_BACKEND_VULKAN, RIR_POLICY_PREFER_GENERATED, 0, 0},
@@ -1096,15 +1106,5 @@ const rir_op_policy rir_op_policies[] = {
     {"GGML_OP_SCALE", RIR_BACKEND_VULKAN, RIR_POLICY_PREFER_GENERATED, 4, 0},
     {"GGML_OP_SCALE", RIR_BACKEND_METAL, RIR_POLICY_PREFER_GENERATED, 4, 0},
     {"GGML_OP_SCALE", RIR_BACKEND_CPU, RIR_POLICY_NATIVE_ONLY, 4, 0},
-    {"GGML_OP_RMS_NORM", RIR_BACKEND_CUDA, RIR_POLICY_NATIVE_ONLY, 0, 0},
-    {"GGML_OP_RMS_NORM", RIR_BACKEND_VULKAN, RIR_POLICY_OBSERVE_GENERATED, 0, 0},
-    {"GGML_OP_RMS_NORM", RIR_BACKEND_METAL, RIR_POLICY_OBSERVE_GENERATED, 0, 0},
-    {"GGML_OP_RMS_NORM", RIR_BACKEND_CPU, RIR_POLICY_NATIVE_ONLY, 0, 0},
-    // GGML_OP_UNARY outside domain — dtype (unary_abs): both native kernels accept F16 for this family; all fourteen written members are typed F32. Closing it would cost fourteen more kernels for a dtype produced by neither census on a UNARY
-    // GGML_OP_UNARY outside domain — op_variant (unary_abs): the eight members RIR does not declare: softplus and gelu_erf need log and erf, floor/ceil/round/trunc need directed rounding, xielu carries its own scalars in op_params — and gelu, written and exact, is removed by measurement: on Metal native itself yields NMSE of 1.00-1.14e-7 against a 1.0e-7 threshold
-    {"GGML_OP_UNARY", RIR_BACKEND_CUDA, RIR_POLICY_NATIVE_ONLY, 8196, 0},
-    {"GGML_OP_UNARY", RIR_BACKEND_VULKAN, RIR_POLICY_PREFER_GENERATED, 8196, 0},
-    {"GGML_OP_UNARY", RIR_BACKEND_METAL, RIR_POLICY_PREFER_GENERATED, 8196, 0},
-    {"GGML_OP_UNARY", RIR_BACKEND_CPU, RIR_POLICY_NATIVE_ONLY, 8196, 0},
 };
 const uint32_t rir_op_policy_count = 36;
