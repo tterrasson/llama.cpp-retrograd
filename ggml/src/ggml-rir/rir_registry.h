@@ -4,7 +4,7 @@
 #pragma once
 #include <stdint.h>
 
-#define RIR_REGISTRY_SCHEMA 15
+#define RIR_REGISTRY_SCHEMA 16
 #define RIR_MAX_BINDINGS 4
 #define RIR_MAX_PARAMS 2
 // Nine and not five since FUTURE V1 §6: a kernel that repeats one operand under
@@ -166,6 +166,15 @@ typedef struct rir_variant_desc {
     uint8_t      requires_subgroup; // 1 = needs the 32-lane collective below
     uint32_t     min_subgroup;
     uint32_t     workgroup[3];
+    // Bytes of workgroup-shared storage the generated kernel declares
+    // (docs/CUDA_v1.md §C4). Zero for a lowering that declares none.
+    //
+    // It is published for the same reason `workgroup` is: it is a *budget* the
+    // device half of the contract has to compare against a device limit, and a
+    // backend cannot derive it — the shared arrays are a lowering decision, and
+    // the only other place they exist is inside the compiled kernel. It is the
+    // `shared_bytes` field of `KernelNeeds`, rendered a fourth time (§5.4).
+    uint32_t     shared_bytes;
     uint32_t     push_constant_bytes;
 } rir_variant_desc;
 

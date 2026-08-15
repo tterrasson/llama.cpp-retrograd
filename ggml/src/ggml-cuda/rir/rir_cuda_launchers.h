@@ -10,4 +10,6 @@
 #pragma once
 
 #define RIR_CUDA_LAUNCHERS(X) \
-    /* no RIR kernel in this build */
+    X(l2_norm_back) \
+    X(rms_norm_back) \
+    X(rms_norm_back_shared_reduce)

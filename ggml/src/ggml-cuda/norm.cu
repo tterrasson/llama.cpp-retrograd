@@ -1,5 +1,4 @@
 #include "norm.cuh"
-#include "../ggml-rir/ggml-rir.h" // retro delta: RIR policy + counters (docs/INT_RIR.md)
 #include <cstdint>
 
 template <int block_size>
@@ -408,97 +407,6 @@ static void rms_norm_mul_f32_cuda(const float *  x,
     }
 }
 
-// retro delta: analytic backward for GGML_OP_L2_NORM. Mirrors
-// rms_norm_back_f32 but without the /ncols mean and with l2_norm's
-// max(norm, eps) floor: when norm > eps the gradient carries the usual
-// cross term, when norm <= eps the forward scale is the local constant
-// 1/eps so no cross term applies.
-//
-// xf (the forward-pass input) can be a strided view rather than a fresh
-// contiguous tensor -- e.g. qwen3.5/qwen3next's GDN slice q/k out of an
-// interleaved qkv conv buffer before l2-normalizing them -- so xf is
-// addressed via explicit per-dim strides like l2_norm_f32 above. grad and
-// dst are always freshly allocated by the graph and stay contiguous.
-template <int block_size>
-static __global__ void l2_norm_back_f32(
-        const float * grad, const float * xf, float * dst, const int ncols,
-        const int64_t xf_stride_row, const int64_t xf_stride_channel, const int64_t xf_stride_sample,
-        const float eps) {
-    const int nrows     = gridDim.x;
-    const int nchannels = gridDim.y;
-
-    const int row     = blockIdx.x;
-    const int channel = blockIdx.y;
-    const int sample  = blockIdx.z;
-    const int tid = threadIdx.x;
-
-    const int64_t contig_off = ((int64_t(sample)*nchannels + channel)*nrows + row)*ncols;
-    grad += contig_off;
-    dst  += contig_off;
-    xf   += int64_t(sample)*xf_stride_sample + int64_t(channel)*xf_stride_channel + int64_t(row)*xf_stride_row;
-
-    float sum_xx = 0.0f;
-    float sum_xg = 0.0f;
-
-    for (int col = tid; col < ncols; col += block_size) {
-        const float xfi = xf[col];
-        sum_xx += xfi * xfi;
-        sum_xg += xfi * grad[col];
-    }
-
-    sum_xx = warp_reduce_sum(sum_xx);
-    sum_xg = warp_reduce_sum(sum_xg);
-    if constexpr (block_size > WARP_SIZE) {
-        static_assert(block_size == 1024, "unexpected block_size");
-        __shared__ float s_sum_xx[32];
-        __shared__ float s_sum_xg[32];
-        const int warp_id = threadIdx.x / WARP_SIZE;
-        const int lane_id = threadIdx.x % WARP_SIZE;
-        if (lane_id == 0) {
-            s_sum_xx[warp_id] = sum_xx;
-            s_sum_xg[warp_id] = sum_xg;
-        }
-        __syncthreads();
-
-        sum_xx = s_sum_xx[lane_id];
-        sum_xx = warp_reduce_sum(sum_xx);
-
-        sum_xg = s_sum_xg[lane_id];
-        sum_xg = warp_reduce_sum(sum_xg);
-    }
-
-    const float norm = sqrtf(sum_xx);
-
-    float scale_grad;
-    float scale_x;
-    if (norm > eps) {
-        scale_grad = 1.0f / norm;
-        scale_x    = -scale_grad * sum_xg / sum_xx;
-    } else {
-        scale_grad = 1.0f / eps;
-        scale_x    = 0.0f;
-    }
-
-    for (int col = tid; col < ncols; col += block_size) {
-        dst[col] = scale_grad*grad[col] + scale_x*xf[col];
-    }
-}
-
-static void l2_norm_back_f32_cuda(
-        const float * grad, const float * xf, float * dst, const int ncols,
-        const int64_t ne01, const int64_t ne02, const int64_t ne03,
-        const int64_t xf_s01, const int64_t xf_s02, const int64_t xf_s03,
-        const float eps, cudaStream_t stream) {
-    const dim3 blocks_num(ne01, ne02, ne03);
-    if (ncols < 1024) {
-        const dim3 block_dims(WARP_SIZE, 1, 1);
-        l2_norm_back_f32<WARP_SIZE><<<blocks_num, block_dims, 0, stream>>>(grad, xf, dst, ncols, xf_s01, xf_s02, xf_s03, eps);
-    } else {
-        const dim3 block_dims(1024, 1, 1);
-        l2_norm_back_f32<1024><<<blocks_num, block_dims, 0, stream>>>(grad, xf, dst, ncols, xf_s01, xf_s02, xf_s03, eps);
-    }
-}
-
 static void rms_norm_back_f32_cuda(const float * grad, const float * xf, float * dst, const int ncols, const int nrows, const float eps, cudaStream_t stream) {
     if (ncols < 1024) {
         const dim3 block_dims(WARP_SIZE, 1, 1);
@@ -789,52 +697,11 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
 
-// retro delta: analytic backward for GGML_OP_L2_NORM
-void ggml_cuda_op_l2_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    // retro delta: the AOT registry declares CUDA NativeOnly for this op
-    // (docs/INT_RIR.md §6.3) — there is no RIR emitter/schedule for CUDA and
-    // the specialized kernel keeps priority. Under observe/prefer, count the
-    // native dispatch so hybrid coverage reports include CUDA rather than
-    // inferring the policy from an absence of code.
-    if (ggml_rir_get_mode() != GGML_RIR_MODE_OFF) {
-        ggml_rir_site_begin("GGML_OP_L2_NORM_BACK", RIR_BACKEND_CUDA);
-        ggml_rir_count_seen();
-        ggml_rir_count_reject(GGML_RIR_REJECT_POLICY_NATIVE);
-        ggml_rir_count_native();
-        // The row this leaves behind is the point: a report that shows
-        // GGML_OP_L2_NORM_BACK/cuda with policy_native=N is the test-visible
-        // form of "CUDA is NativeOnly" (§6.3), not an absence of code.
-        ggml_rir_site_end();
-    }
-    const ggml_tensor * grad  = dst->src[0]; // gradients
-    const ggml_tensor * src0f = dst->src[1]; // src0 from forward pass
-
-    const float * grad_d  = (const float *) grad->data;
-    const float * src0f_d = (const float *) src0f->data;
-    float       * dst_d   = (float       *) dst->data;
-
-    cudaStream_t stream = ctx.stream();
-
-    GGML_ASSERT(ggml_is_contiguous(grad));
-    // src0f (the forward input) only needs contiguous rows: qwen3.5/qwen3next
-    // slice q/k out of an interleaved qkv conv buffer via a view before
-    // l2-normalizing, so higher dims can be strided.
-    GGML_ASSERT(ggml_is_contiguous_rows(src0f));
-
-    GGML_ASSERT( grad->type == GGML_TYPE_F32);
-    GGML_ASSERT(src0f->type == GGML_TYPE_F32);
-    GGML_ASSERT(  dst->type == GGML_TYPE_F32);
-
-    const int64_t ne00 = src0f->ne[0];
-
-    const size_t ts0 = ggml_type_size(src0f->type);
-    const int64_t s01 = src0f->nb[1] / ts0;
-    const int64_t s02 = src0f->nb[2] / ts0;
-    const int64_t s03 = src0f->nb[3] / ts0;
-
-    float eps;
-    memcpy(&eps, dst->op_params, sizeof(float));
-    GGML_ASSERT(eps >= 0.0f);
-
-    l2_norm_back_f32_cuda(grad_d, src0f_d, dst_d, ne00, src0f->ne[1], src0f->ne[2], src0f->ne[3], s01, s02, s03, eps, stream);
-}
+// retro delta: `ggml_cuda_op_l2_norm_back` and its two kernels are gone
+// (docs/CUDA_v1.md §C5, §C7). The generated RIR variant is the only
+// implementation of GGML_OP_L2_NORM_BACK on CUDA, as it already was on Metal
+// and Vulkan: the pair declares no domain restriction, and the lane measured it
+// claiming 60/60 of the test-backend-ops matrix at 0.99 against this kernel
+// (session wisp-20260815T033015Z, RTX 4090, 1.55 µs native / 1.53 µs RIR over
+// nine passes). That number is published here because after this deletion it is
+// no longer measurable — there is nothing left to measure it against.
