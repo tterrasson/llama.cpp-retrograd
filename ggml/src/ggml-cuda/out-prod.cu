@@ -436,8 +436,33 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     const bool src1_T = ggml_is_transposed(src1);
     const cublasOperation_t src1_op = src1_T ? CUBLAS_OP_N : CUBLAS_OP_T;
-    const int64_t           ldb     = (src1_T ?        nb10 :        nb11) /  sizeof(float);
+    int64_t                 ldb     = (src1_T ?        nb10 :        nb11) /  sizeof(float);
     GGML_ASSERT(                      (src1_T ?        nb11 :        nb10) == sizeof(float));
+
+    // retro delta: cuBLAS validates `ldb` against the *stored* extent of B even
+    // when the stride it names is never dereferenced, and a ggml tensor with a
+    // single element along the strided axis carries a degenerate stride there.
+    // A rank-1 LoRA backward produces exactly that: `out_prod(dY[1024,1],
+    // g[16,1])` has `src1->nb[1] == 4` because `ne11 == 1`, so `ldb` comes out
+    // as 1 while `CUBLAS_OP_T` demands `ldb >= n == 16` — SGEMM rejects
+    // parameter 10 and the process aborts.
+    //
+    // With one column along that axis the stride is unused arithmetic, so
+    // raising it to the minimum cuBLAS accepts cannot move a single load. The
+    // clamp is therefore guarded on that extent being 1, and not applied
+    // otherwise: a too-small `ldb` with more than one column is a real layout
+    // error and must keep failing loudly.
+    //   CUBLAS_OP_T: B is stored [n, k], `ldb` strides the k columns -> k = ne01
+    //   CUBLAS_OP_N: B is stored [k, n], `ldb` strides the n columns -> n = ne10
+    if (src1_T) {
+        if (ne10 == 1) {
+            ldb = std::max<int64_t>(ldb, ne01);
+        }
+    } else {
+        if (ne01 == 1) {
+            ldb = std::max<int64_t>(ldb, ne10);
+        }
+    }
 
     // Distance in floats between two consecutive reduction elements of src1, used
     // to offset a reduction slice: with CUBLAS_OP_N cuBLAS reads src1 as [k, ne1]

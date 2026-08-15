@@ -74,6 +74,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-rir/ggml-rir.h" // retro delta: RIR op census (docs/CUDA_v1.md §C1)
 #include "ggml.h"
 
 #include <algorithm>
@@ -4464,6 +4465,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    // retro delta: under RETRO_RIR_CENSUS, rank the ops of the *real* graph by
+    // node count and traffic — including the ones RIR does not cover, which is
+    // the only place they are visible (docs/CUDA_v1.md §C1). Off by default,
+    // and it costs nothing when nobody asked for it.
+    ggml_rir_census_graph(RIR_BACKEND_CUDA, cgraph);
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
