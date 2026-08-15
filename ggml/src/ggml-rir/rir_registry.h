@@ -4,7 +4,7 @@
 #pragma once
 #include <stdint.h>
 
-#define RIR_REGISTRY_SCHEMA 16
+#define RIR_REGISTRY_SCHEMA 17
 #define RIR_MAX_BINDINGS 4
 #define RIR_MAX_PARAMS 2
 // Nine and not five since FUTURE V1 §6: a kernel that repeats one operand under
@@ -150,6 +150,21 @@ typedef struct rir_variant_desc {
     uint8_t          n_axes;
     rir_axis_desc    axes[RIR_MAX_AXES];
     rir_dispatch_desc dispatch[3];
+    // The **flattened** dispatch (docs/CUDA_v1.md §C6): the axes one linear
+    // grid dimension decomposes into, fastest first, with the number of indices
+    // one invocation covers on each. Zero for every other lowering, and the two
+    // are exclusive — a flattened variant has no grid axis at all.
+    //
+    // `per_workgroup` is read as "per invocation" here, which is why the type is
+    // shared rather than copied: the divisor of entry `i` is
+    // `ceil(extent(axis) / per)`, exactly the `ceil` a grid dimension applies,
+    // and the grid is `ceil(Π divisors / dispatch[0].per_workgroup)`.
+    //
+    // A consumer that ignores this field dispatches one block for the whole
+    // tensor, so `dispatch[0].axis` is **-1** on a flattened variant rather
+    // than a plausible axis: it cannot be read as a grid by accident.
+    uint8_t          n_flat;
+    rir_dispatch_desc flat[RIR_MAX_AXES];
     // Width of the integers the constant buffer carries. Every extent, every
     // stride and every addressed byte offset must be representable in it, or
     // the kernel would address the wrong bytes.

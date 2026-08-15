@@ -151,7 +151,13 @@ void ggml_rir_site_end(void);
 // widths — twenty-eight rows for one pair. A site that cannot hold its variants
 // reports `[overflow]`, which the lane refuses to count; the cap said so, out
 // loud, at the first node.
-#define GGML_RIR_MAX_SITE_VARIANTS 32
+// Forty-eight since docs/CUDA_v1.md §C6: the same family gains a **third**
+// lowering on CUDA, the flattened dispatch, so `GGML_OP_UNARY` publishes
+// forty-two rows at one site. The cap said so again, at generation this time —
+// `the_forks_variant_caps_hold_for_the_widest_pair` reads the tables and the
+// header together, so a pair that outgrew its site is a failed test rather than
+// a report with `[overflow]` in it.
+#define GGML_RIR_MAX_SITE_VARIANTS 48
 
 typedef struct ggml_rir_site_counters {
     const char *      ggml_op;

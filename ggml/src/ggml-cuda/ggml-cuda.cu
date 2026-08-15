@@ -2122,6 +2122,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_ADD:
         case GGML_OP_ADD1: // TODO: more efficient implementation
+            // retro delta: the elementwise band under measurement
+            // (docs/CUDA_v1.md §C6). `observe` until the lane publishes a
+            // ratio, so this returns false today and the native kernel below
+            // runs — the site exists to *count*, which is what an observed pair
+            // is registered for. Reached only when `ggml_cuda_try_fuse` found
+            // nothing, so a fused chain never presents its nodes here (§3.6).
+            if (dst->op == GGML_OP_ADD && ggml_cuda_rir_try(&ctx, dst)) {
+                break;
+            }
             ggml_cuda_op_add(ctx, dst);
             break;
         case GGML_OP_ADD_ID:
@@ -2134,12 +2143,34 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_acc(ctx, dst);
             break;
         case GGML_OP_MUL:
+            // retro delta: the elementwise band under measurement
+            // (docs/CUDA_v1.md §C6). `observe` until the lane publishes a
+            // ratio, so this returns false today and the native kernel below
+            // runs — the site exists to *count*, which is what an observed pair
+            // is registered for. Reached only when `ggml_cuda_try_fuse` found
+            // nothing, so a fused chain never presents its nodes here (§3.6).
+            if (ggml_cuda_rir_try(&ctx, dst)) {
+                break;
+            }
             ggml_cuda_op_mul(ctx, dst);
             break;
         case GGML_OP_DIV:
             ggml_cuda_op_div(ctx, dst);
             break;
         case GGML_OP_UNARY:
+            // retro delta: the elementwise band under measurement
+            // (docs/CUDA_v1.md §C6). `observe` until the lane publishes a
+            // ratio, so this returns false today and the native kernel below
+            // runs — the site exists to *count*, which is what an observed pair
+            // is registered for. Reached only when `ggml_cuda_try_fuse` found
+            // nothing, so a fused chain never presents its nodes here (§3.6).
+            //
+            // One site for the family, not one per member: the registry's
+            // `ggml_op_variant` is what selects the member's kernel, so this
+            // `if` is the same line the two other backends carry.
+            if (ggml_cuda_rir_try(&ctx, dst)) {
+                break;
+            }
             switch (ggml_get_unary_op(dst)) {
                 case GGML_UNARY_OP_ABS:
                     ggml_cuda_op_abs(ctx, dst);
@@ -2300,6 +2331,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_out_prod(ctx, dst);
             break;
         case GGML_OP_SCALE:
+            // retro delta: the elementwise band under measurement
+            // (docs/CUDA_v1.md §C6). `observe` until the lane publishes a
+            // ratio, so this returns false today and the native kernel below
+            // runs — the site exists to *count*, which is what an observed pair
+            // is registered for. Reached only when `ggml_cuda_try_fuse` found
+            // nothing, so a fused chain never presents its nodes here (§3.6).
+            if (ggml_cuda_rir_try(&ctx, dst)) {
+                break;
+            }
             ggml_cuda_op_scale(ctx, dst);
             break;
         case GGML_OP_SQR:

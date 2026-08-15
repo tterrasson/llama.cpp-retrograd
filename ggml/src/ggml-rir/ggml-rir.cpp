@@ -562,7 +562,11 @@ constexpr int RIR_N_BACKENDS = 4;  // rir_backend is dense: cuda/vulkan/metal/cp
 // one pair. The bound is still a bound and still aborts rather than dropping a
 // row — a variant the table cannot hold is one that would never be selected,
 // which is worse than a loud failure at startup.
-constexpr uint32_t RIR_MAX_PAIR_VARIANTS = 32;
+//
+// Forty-eight since docs/CUDA_v1.md §C6, for the same pair that raised it to
+// thirty-two: `GGML_OP_UNARY` on CUDA carries a third lowering — the flattened
+// dispatch — over fourteen members, so forty-two rows resolve one node.
+constexpr uint32_t RIR_MAX_PAIR_VARIANTS = 48;
 
 struct op_selection {
     const rir_variant_desc * variant = nullptr;  // null when unregistered
@@ -1145,6 +1149,45 @@ int64_t axis_extent(const rir_variant_desc * v, uint32_t a, const struct ggml_te
     return 0;
 }
 
+// The number of points a flattened dispatch covers: the product of
+// `ceil(extent / per_index)` over the axes the variant decomposes
+// (docs/CUDA_v1.md §C6). Zero when the variant is not flattened, and
+// **saturating** rather than wrapping: the caller compares it against a bound,
+// and a wrapped product would compare small.
+uint64_t flat_total(const rir_variant_desc * v, const struct ggml_tensor * node) {
+    uint64_t total = 1;
+    for (uint32_t i = 0; i < v->n_flat; ++i) {
+        const int8_t a = v->flat[i].axis;
+        if (a < 0 || (uint32_t) a >= v->n_axes) {
+            return 0;
+        }
+        const uint32_t per = v->flat[i].per_workgroup ? v->flat[i].per_workgroup : 1;
+        const int64_t extent = axis_extent(v, (uint32_t) a, node);
+        if (extent <= 0) {
+            return 0;
+        }
+        total *= ((uint64_t) extent + per - 1) / per;
+        if (total > UINT64_MAX / 2) {
+            return UINT64_MAX / 2;  // saturate: only comparisons follow
+        }
+    }
+    return v->n_flat ? total : 0;
+}
+
+// The multiplier and the shift of an unsigned division by `d`, as
+// `init_fastdiv_values` computes them in ggml-cuda/common.cuh and as
+// `rir_lower::fastdiv_magic` computes them for the oracle
+// (docs/CUDA_v1.md §C1.5). One formula, three implementations, and the parity
+// harness is what keeps them equal.
+void fastdiv_magic(uint32_t d, uint32_t * mp, uint32_t * sh) {
+    uint32_t l = 0;
+    while (l < 32 && ((uint64_t) 1 << l) < (uint64_t) d) {
+        ++l;
+    }
+    *mp = (uint32_t) ((((uint64_t) 1 << 32) * (((uint64_t) 1 << l) - d)) / d + 1);
+    *sh = l;
+}
+
 } // namespace
 
 bool ggml_rir_variant_fits_shape(const rir_variant_desc * v, const struct ggml_tensor * node) {
@@ -1190,7 +1233,12 @@ bool ggml_rir_variant_fits_layout(const rir_variant_desc * v, const struct ggml_
     // one, by construction of the lowering. Only the bindings this axis indexes
     // *at dimension 0* are read in vectors; a binding it indexes elsewhere (or
     // not at all) is read scalar and broadcast, and its stride is free.
-    const int8_t a = v->dispatch[0].axis;
+    //
+    // A flattened variant has no grid axis, and the contiguous one is the first
+    // it decomposes into — `flat[0]`, fastest first (docs/CUDA_v1.md §C6). The
+    // width means the same thing there and claims the same stride; what changes
+    // is only where the axis is published.
+    const int8_t a = v->n_flat > 0 ? v->flat[0].axis : v->dispatch[0].axis;
     if (a < 0 || (uint32_t) a >= v->n_axes) {
         return false;
     }
@@ -1392,9 +1440,32 @@ int32_t ggml_rir_evaluate_portable(const rir_variant_desc * v, const struct ggml
         return GGML_RIR_REJECT_SHAPE;
     }
 
+    // The flattened index has to be representable, and the bound is tighter
+    // than `index_bits` says (docs/CUDA_v1.md §C6). The decomposition adds
+    // `umulhi(n, mp)` to `n` in 32 bits, which is exact while `n < 2^31` and
+    // wraps above it — so the claim this variant makes is not "the index fits
+    // in 32 bits" but "it fits in 31". It is checked here, with the other
+    // representability conditions, and it is what makes the flattened variant a
+    // specialization with a fallback under it rather than a lowering that is
+    // right for most shapes.
+    if (v->n_flat > 0) {
+        const uint64_t total = flat_total(v, node);
+        if (total == 0 || total > 0x7fffffffull || total > index_max) {
+            return GGML_RIR_REJECT_INTEGER_RANGE;
+        }
+    }
+
     // The grid the dispatcher will ask for, in the same integers.
     uint32_t grid[3];
     ggml_rir_grid(v, node, grid);
+    if (v->n_flat > 0) {
+        const uint32_t per = v->dispatch[0].per_workgroup ? v->dispatch[0].per_workgroup : 1;
+        const uint64_t want = (flat_total(v, node) + per - 1) / per;
+        if (want > index_max || want != grid[0] || grid[1] != 1 || grid[2] != 1) {
+            return GGML_RIR_REJECT_INTEGER_RANGE;
+        }
+        return GGML_RIR_MATCHED;
+    }
     for (uint32_t d = 0; d < 3; ++d) {
         const int8_t a = v->dispatch[d].axis;
         if (a < 0) {
@@ -1472,12 +1543,57 @@ bool ggml_rir_fill_params(const rir_variant_desc * v, const struct ggml_tensor *
             slot[i] = (uint32_t) t->nb[d];
         }
     }
+    // The flattened dispatch's own block, last, exactly as the generated shader
+    // declares it (docs/CUDA_v1.md §C6): the total, then one (divisor, magic
+    // multiplier, shift) triple per divisor — one fewer than there are axes,
+    // the last index being the quotient itself.
+    //
+    // This is the only place a push constant is *computed* rather than copied,
+    // and it is why the flattening is not free of the host: the reciprocal of a
+    // runtime divisor cannot be a compile-time constant, and dividing on the
+    // device is exactly the cost §C1.5 says the native does not pay.
+    if (v->n_flat > 0) {
+        const uint64_t total = flat_total(v, node);
+        if (total == 0 || total > 0x7fffffffull) {
+            return false;  // refused by `evaluate_portable` long before here
+        }
+        if (i < n_slots) {
+            slot[i++] = (uint32_t) total;
+        }
+        for (uint32_t f = 0; f + 1 < v->n_flat && i + 2 < n_slots; ++f) {
+            const uint32_t per = v->flat[f].per_workgroup ? v->flat[f].per_workgroup : 1;
+            const int64_t extent = axis_extent(v, (uint32_t) v->flat[f].axis, node);
+            if (extent <= 0) {
+                return false;
+            }
+            const uint32_t d = (uint32_t) (((uint64_t) extent + per - 1) / per);
+            uint32_t mp = 0;
+            uint32_t sh = 0;
+            fastdiv_magic(d, &mp, &sh);
+            slot[i++] = d;
+            slot[i++] = mp;
+            slot[i++] = sh;
+        }
+    }
     // A layout that does not fill the buffer exactly is a generator/consumer
     // mismatch, and the tail would be whatever the caller's stack held.
     return i == n_slots;
 }
 
 void ggml_rir_grid(const rir_variant_desc * v, const struct ggml_tensor * node, uint32_t grid[3]) {
+    // The flattened dispatch first (docs/CUDA_v1.md §C6): one dimension over
+    // the whole parallel space. It is read before `dispatch[]` and not beside
+    // it because such a variant has **no** grid axis — `dispatch[0].axis` is -1
+    // — and the loop below would answer a single workgroup for the whole
+    // tensor.
+    if (v != nullptr && node != nullptr && v->n_flat > 0) {
+        const uint32_t per = v->dispatch[0].per_workgroup ? v->dispatch[0].per_workgroup : 1;
+        const uint64_t total = flat_total(v, node);
+        grid[0] = (uint32_t) ((total + per - 1) / per);
+        grid[1] = 1;
+        grid[2] = 1;
+        return;
+    }
     for (uint32_t d = 0; d < 3; ++d) {
         grid[d] = 1;
         if (v == nullptr || node == nullptr) {

@@ -10,7 +10,7 @@ static void rir_k_rms_norm_back_shared_reduce(
         const uint8_t * __restrict__ dz,
         const uint8_t * __restrict__ x,
         uint8_t * __restrict__ dx,
-        const rir_rms_norm_back_params p)
+        const rir_rms_norm_back_shared_reduce_params p)
 {
     __shared__ float rir_shared_red9_v11[256];
     __shared__ float rir_shared_red10_v12[256];
@@ -77,8 +77,8 @@ static void rir_k_rms_norm_back_shared_reduce(
 extern "C" void rir_launch_rms_norm_back_shared_reduce(
         void * const * bufs, const void * params, const uint32_t grid[3],
         cudaStream_t stream) {
-    static_assert(sizeof(rir_rms_norm_back_params) == 68, "registry: push_constant_bytes");
-    rir_rms_norm_back_params p;
+    static_assert(sizeof(rir_rms_norm_back_shared_reduce_params) == 68, "registry: push_constant_bytes");
+    rir_rms_norm_back_shared_reduce_params p;
     std::memcpy(&p, params, sizeof p);
     rir_k_rms_norm_back_shared_reduce<<<dim3(grid[0], grid[1], grid[2]), dim3(256, 1, 1), 0, stream>>>(
             (const uint8_t *) bufs[0], (const uint8_t *) bufs[1], (uint8_t *) bufs[2], p);

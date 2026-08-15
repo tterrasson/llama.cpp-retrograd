@@ -12,4 +12,35 @@
 #define RIR_CUDA_LAUNCHERS(X) \
     X(l2_norm_back) \
     X(rms_norm_back) \
-    X(rms_norm_back_shared_reduce)
+    X(rms_norm_back_shared_reduce) \
+    X(unary_abs) \
+    X(unary_sgn) \
+    X(unary_neg) \
+    X(unary_step) \
+    X(unary_tanh) \
+    X(unary_elu) \
+    X(unary_relu) \
+    X(unary_sigmoid) \
+    X(unary_gelu_quick) \
+    X(unary_silu) \
+    X(unary_hardswish) \
+    X(unary_hardsigmoid) \
+    X(unary_exp) \
+    X(unary_expm1) \
+    X(add) \
+    X(add_vec4) \
+    X(mul) \
+    X(mul_vec4) \
+    X(scale) \
+    X(add_repeat) \
+    X(add_repeat_vec4) \
+    X(mul_repeat) \
+    X(mul_repeat_vec4) \
+    X(add_f16) \
+    X(add_f16_vec4) \
+    X(mul_f16) \
+    X(mul_f16_vec4) \
+    X(add_repeat_f16) \
+    X(add_repeat_f16_vec4) \
+    X(mul_repeat_f16) \
+    X(mul_repeat_f16_vec4)
