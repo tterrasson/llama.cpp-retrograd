@@ -1166,10 +1166,12 @@ uint64_t flat_total(const rir_variant_desc * v, const struct ggml_tensor * node)
         if (extent <= 0) {
             return 0;
         }
-        total *= ((uint64_t) extent + per - 1) / per;
-        if (total > UINT64_MAX / 2) {
-            return UINT64_MAX / 2;  // saturate: only comparisons follow
+        const uint64_t factor = ((uint64_t) extent + per - 1) / per;
+        const uint64_t cap = UINT64_MAX / 2;
+        if (total > cap / factor) {
+            return cap;  // saturate before multiplying: only comparisons follow
         }
+        total *= factor;
     }
     return v->n_flat ? total : 0;
 }
@@ -1210,9 +1212,12 @@ bool ggml_rir_variant_fits_shape(const rir_variant_desc * v, const struct ggml_t
             if (extent <= 0) {
                 return false;
             }
-            product *= (uint64_t) extent;
-            if (product > 0xffffffffull) {
-                product = 0xffffffffull;  // saturate: only comparisons follow
+            const uint64_t factor = (uint64_t) extent;
+            const uint64_t cap = 0xffffffffull;
+            if (product > cap / factor) {
+                product = cap;  // saturate before multiplying: only comparisons follow
+            } else {
+                product *= factor;
             }
         }
         if (product < rule.min_extent || product > rule.max_extent) {
