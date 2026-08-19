@@ -4,7 +4,7 @@
 #pragma once
 #include <stdint.h>
 
-#define RIR_REGISTRY_SCHEMA 17
+#define RIR_REGISTRY_SCHEMA 18
 #define RIR_MAX_BINDINGS 4
 #define RIR_MAX_PARAMS 2
 // Nine and not five since FUTURE V1 §6: a kernel that repeats one operand under
@@ -177,6 +177,24 @@ typedef struct rir_variant_desc {
     // nb[0] is anything else, and the pair's scalar fallback takes that node
     // (docs/INT_RIR_V4.md §P1).
     uint8_t      vector_width;
+    // 1 when the flattened index is also the **address** (docs/OPTIM_V3.md §3):
+    // the shader computes `linear * vector_width * elem_bytes` and decomposes
+    // nothing, so `flat[]` below is read by the host alone.
+    //
+    // It is a **claim**, and a strictly stronger one than `vector_width`, which
+    // pins `nb[0]` on the bindings the contiguous axis indexes. This pins every
+    // stride of every binding — each of them contiguous — because that is what
+    // makes Σ idx[d]·nb[d] equal one product; and it pins the contiguous extent
+    // to a whole number of vectors, without which the flattened index and the
+    // element index stop differing by exactly the width.
+    // `ggml_rir_variant_fits_layout` evaluates both, and the pair's decomposing
+    // variant takes every node that fails them.
+    //
+    // Two consumers read it. Selection refuses the variant for a node whose
+    // layout it does not describe; `ggml_rir_fill_params` writes the flattened
+    // total and **not** the divisor triples, because the shader declares none —
+    // a layout that does not fill the buffer exactly is a mismatch it reports.
+    uint8_t      linear_addr;
     uint8_t      max_rank;          // maximum effective ggml rank accepted
     uint8_t      requires_subgroup; // 1 = needs the 32-lane collective below
     uint32_t     min_subgroup;

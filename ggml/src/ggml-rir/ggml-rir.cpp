@@ -1231,6 +1231,33 @@ bool ggml_rir_variant_fits_layout(const rir_variant_desc * v, const struct ggml_
     if (v == nullptr || node == nullptr) {
         return false;
     }
+    // Linear addressing (docs/OPTIM_V3.md §3), first because it is the strictest
+    // claim of the two and subsumes what the width claims below it: the shader
+    // computes `linear * vector_width * elem_bytes` and reads no stride at all,
+    // which is the byte offset of that point exactly when **every** binding is
+    // contiguous — `nb[0]` the element and each stride the product of the
+    // extents below it, which is `ggml_is_contiguous` — and the contiguous
+    // extent is a whole number of vectors. Miss either and the flattened index
+    // and the element index stop differing by the width, so the pair's
+    // decomposing variant takes the node.
+    if (v->linear_addr) {
+        const uint32_t w = v->vector_width ? v->vector_width : 1;
+        const int8_t a = v->n_flat > 0 ? v->flat[0].axis : -1;
+        if (a < 0 || (uint32_t) a >= v->n_axes) {
+            return false;  // a linear variant that is not flattened: nothing to scale
+        }
+        const int64_t ne0 = axis_extent(v, (uint32_t) a, node);
+        if (ne0 <= 0 || (uint64_t) ne0 % w != 0) {
+            return false;
+        }
+        for (uint32_t b = 0; b < v->n_bindings; ++b) {
+            const ggml_tensor * t = ggml_rir_binding_tensor(v, b, node);
+            if (t == nullptr || !ggml_is_contiguous(t)) {
+                return false;
+            }
+        }
+        return true;
+    }
     if (v->vector_width <= 1) {
         return true;  // the scalar lowering accepts any stride the contract does
     }
@@ -1565,7 +1592,10 @@ bool ggml_rir_fill_params(const rir_variant_desc * v, const struct ggml_tensor *
         if (i < n_slots) {
             slot[i++] = (uint32_t) total;
         }
-        for (uint32_t f = 0; f + 1 < v->n_flat && i + 2 < n_slots; ++f) {
+        // A linear variant decomposes nothing, so it declares no reciprocal
+        // (docs/OPTIM_V3.md §3). Writing them anyway would overrun the layout the
+        // shader published, which the exact-fill check below reports.
+        for (uint32_t f = 0; !v->linear_addr && f + 1 < v->n_flat && i + 2 < n_slots; ++f) {
             const uint32_t per = v->flat[f].per_workgroup ? v->flat[f].per_workgroup : 1;
             const int64_t extent = axis_extent(v, (uint32_t) v->flat[f].axis, node);
             if (extent <= 0) {
