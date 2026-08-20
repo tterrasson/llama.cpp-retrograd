@@ -1,7 +1,5 @@
 #include "out-prod.cuh"
-#include "convert.cuh"
-#include "dequantize.cuh"
-#include "../ggml-retro-quant.h"
+#include "retro-quant-loader.cuh"
 
 #include <algorithm>
 #include <cstdint>
@@ -18,128 +16,17 @@
 // Each block produces 256 x 32 output values. The 32 accumulators per thread
 // are a better trade than re-reading/dequantizing the frozen weight for every
 // skinny output tile (the Vulkan reference uses 64 x 16).
-static constexpr int OUT_PROD_Q_BM = 256;
+static constexpr int OUT_PROD_Q_BM = RETRO_QUANT_TILE;
 static constexpr int OUT_PROD_Q_BN = 32;
 static constexpr int OUT_PROD_Q_BK = 4;
 static constexpr int OUT_PROD_Q_TM = 16;
 static constexpr int OUT_PROD_Q_TN = 2;
-static constexpr int OUT_PROD_Q_THREADS = 256;
+static constexpr int OUT_PROD_Q_THREADS = RETRO_QUANT_THREADS;
 
-struct out_prod_f16_loader {
-    static __device__ __forceinline__ void load(
-            const void * row, const int64_t m0, const int64_t ne0, float * tile) {
-        const int m = threadIdx.x;
-        if (m0 + m < ne0) {
-            tile[m] = __half2float(((const half *) row)[m0 + m]);
-        }
-    }
-};
-
-template<int qk, int qr, dequantize_kernel_t dequantize_kernel>
-struct out_prod_pair_loader {
-    static __device__ __forceinline__ void load(
-            const void * row, const int64_t m0, const int64_t ne0, float * tile) {
-        const int pair = threadIdx.x;
-        if (pair >= OUT_PROD_Q_BM/2 || m0 + 2*pair >= ne0) {
-            return;
-        }
-
-        const int i00 = 2*pair;
-        const int ib  = (m0 + i00)/qk;
-        const int iqs = ((m0 + i00)%qk)/qr;
-        const int block_start = i00 - i00%qk;
-        const int second = qr == 1 ? 1 : qk/2;
-
-        float2 v;
-        dequantize_kernel(row, ib, iqs, v);
-        tile[block_start + iqs]          = v.x;
-        tile[block_start + iqs + second] = v.y;
-    }
-};
-
-template<int dequant_threads, dequantize_kq_t<float> dequantize_block>
-struct out_prod_superblock_loader {
-    static __device__ __forceinline__ void load(
-            const void * row, const int64_t m0, const int64_t ne0, float * tile) {
-        GGML_UNUSED(ne0);
-        if (threadIdx.x < dequant_threads) {
-            dequantize_block(row, m0/QK_K, tile, threadIdx.x);
-        }
-    }
-};
-
-struct out_prod_nvfp4_loader {
-    static __device__ __forceinline__ void load(
-            const void * row, const int64_t m0, const int64_t ne0, float * tile) {
-        const int local = threadIdx.x;
-        const int64_t m = m0 + local;
-        if (m >= ne0) {
-            return;
-        }
-        const block_nvfp4 * blocks = (const block_nvfp4 *) row;
-        const block_nvfp4 & block = blocks[m/QK_NVFP4];
-        const int in_block = m%QK_NVFP4;
-        const int sub = in_block/QK_NVFP4_SUB;
-        const int in_sub = in_block%QK_NVFP4_SUB;
-        const uint8_t q = block.qs[sub*(QK_NVFP4_SUB/2) + in_sub%(QK_NVFP4_SUB/2)];
-        const int nibble = in_sub < QK_NVFP4_SUB/2 ? q & 0x0f : q >> 4;
-        tile[local] = ggml_cuda_ue4m3_to_fp32(block.d[sub])*kvalues_mxfp4[nibble];
-    }
-};
-
-// The type-to-loader mapping is kept declarative.  The dispatch below expands
-// GGML_RETRO_OUT_PROD_TYPES, so adding a CPU/Vulkan/CUDA OUT_PROD type without a
-// CUDA loader is a compile error rather than a silent trip through the fallback.
-template<ggml_type type> struct out_prod_native_traits;
-
-#define OUT_PROD_F16_TRAITS(type) \
-    template<> struct out_prod_native_traits<type> { \
-        using loader = out_prod_f16_loader; \
-        static constexpr int64_t alignment = 1; \
-    }
-#define OUT_PROD_PAIR_TRAITS(type, qk, qr, decoder) \
-    template<> struct out_prod_native_traits<type> { \
-        using loader = out_prod_pair_loader<qk, qr, decoder>; \
-        static constexpr int64_t alignment = qk; \
-    }
-#define OUT_PROD_SUPER_TRAITS(type, threads, decoder) \
-    template<> struct out_prod_native_traits<type> { \
-        using loader = out_prod_superblock_loader<threads, decoder>; \
-        static constexpr int64_t alignment = QK_K; \
-    }
-
-OUT_PROD_F16_TRAITS(GGML_TYPE_F16);
-OUT_PROD_PAIR_TRAITS(GGML_TYPE_Q1_0, QK1_0, QR1_0, dequantize_q1_0);
-OUT_PROD_PAIR_TRAITS(GGML_TYPE_Q2_0, QK2_0, QR2_0, dequantize_q2_0);
-OUT_PROD_PAIR_TRAITS(GGML_TYPE_Q4_0, QK4_0, QR4_0, dequantize_q4_0);
-OUT_PROD_PAIR_TRAITS(GGML_TYPE_Q4_1, QK4_1, QR4_1, dequantize_q4_1);
-OUT_PROD_PAIR_TRAITS(GGML_TYPE_Q5_0, QK5_0, QR5_0, dequantize_q5_0);
-OUT_PROD_PAIR_TRAITS(GGML_TYPE_Q5_1, QK5_1, QR5_1, dequantize_q5_1);
-OUT_PROD_PAIR_TRAITS(GGML_TYPE_Q8_0, QK8_0, QR8_0, dequantize_q8_0);
-OUT_PROD_SUPER_TRAITS(GGML_TYPE_MXFP4,   32, dequantize_mxfp4<float>);
-OUT_PROD_SUPER_TRAITS(GGML_TYPE_Q2_K,    64, dequantize_q2_K<float>);
-OUT_PROD_SUPER_TRAITS(GGML_TYPE_Q3_K,    64, dequantize_q3_K<float>);
-OUT_PROD_SUPER_TRAITS(GGML_TYPE_Q4_K,    32, dequantize_q4_K<float>);
-OUT_PROD_SUPER_TRAITS(GGML_TYPE_Q5_K,    64, dequantize_q5_K<float>);
-OUT_PROD_SUPER_TRAITS(GGML_TYPE_Q6_K,    64, dequantize_q6_K<float>);
-OUT_PROD_SUPER_TRAITS(GGML_TYPE_IQ2_XXS, 32, dequantize_iq2_xxs<float>);
-OUT_PROD_SUPER_TRAITS(GGML_TYPE_IQ2_XS,  32, dequantize_iq2_xs<float>);
-OUT_PROD_SUPER_TRAITS(GGML_TYPE_IQ2_S,   32, dequantize_iq2_s<float>);
-OUT_PROD_SUPER_TRAITS(GGML_TYPE_IQ3_XXS, 32, dequantize_iq3_xxs<float>);
-OUT_PROD_SUPER_TRAITS(GGML_TYPE_IQ3_S,   32, dequantize_iq3_s<float>);
-OUT_PROD_SUPER_TRAITS(GGML_TYPE_IQ1_S,   32, dequantize_iq1_s<float>);
-OUT_PROD_SUPER_TRAITS(GGML_TYPE_IQ1_M,   32, dequantize_iq1_m<float>);
-OUT_PROD_SUPER_TRAITS(GGML_TYPE_IQ4_NL,  32, dequantize_iq4_nl<float>);
-OUT_PROD_SUPER_TRAITS(GGML_TYPE_IQ4_XS,  32, dequantize_iq4_xs<float>);
-template<> struct out_prod_native_traits<GGML_TYPE_NVFP4> {
-    using loader = out_prod_nvfp4_loader;
-    static constexpr int64_t alignment = QK_NVFP4;
-};
-
-#undef OUT_PROD_F16_TRAITS
-#undef OUT_PROD_PAIR_TRAITS
-#undef OUT_PROD_SUPER_TRAITS
-
+// The per-type loaders and their traits table live in retro-quant-loader.cuh:
+// fused sparse CE decodes the same frozen weights with the same contract, and
+// two copies of a quantization formula is the drift this repo keeps closing
+// (OPTIM_V3 O5 point 1). The 256-value tile of that contract *is* OUT_PROD_Q_BM.
 template<typename loader>
 static __global__ void k_out_prod_quant(
         const void * __restrict__ src0, const float * __restrict__ src1, float * __restrict__ dst,
@@ -251,7 +138,7 @@ static void launch_out_prod_quant_native(ggml_backend_cuda_context & ctx, const 
 template<ggml_type type>
 static bool launch_out_prod_quant_type(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    using traits = out_prod_native_traits<type>;
+    using traits = retro_quant_traits<type>;
     if (src0->ne[0] % traits::alignment != 0) {
         return false;
     }
