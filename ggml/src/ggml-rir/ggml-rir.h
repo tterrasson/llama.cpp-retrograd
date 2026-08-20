@@ -546,6 +546,58 @@ void ggml_rir_census_graph(uint8_t backend, const struct ggml_cgraph * cgraph);
 uint32_t            ggml_rir_census_count(void);
 ggml_rir_census_row ggml_rir_census_snapshot(uint32_t index);
 
+// --- subgraph patterns ------------------------------------------------------
+//
+// The rows above rank *ops*. They cannot rank what O6 asks about
+// (docs/OPTIM_V3.md §6): a fusion does not remove an op, it removes the
+// boundary between two of them — a dispatch, and the round trip through memory
+// of the tensor that only existed to cross it. An op row has no column for
+// that, because the cost belongs to the edge and not to either endpoint.
+//
+// So the same walk also counts **linear chains**: producer → consumer where the
+// producer's result is read exactly once in the whole graph, is not a graph
+// output, and is not a view. Under those conditions, and only under them,
+// fusing the pair is a local rewrite — nobody else can observe the tensor that
+// disappears. Every contiguous window of length 2..GGML_RIR_MAX_PATTERN_LEN of
+// a chain is counted, not only the maximal chain, because the pilot O6 §6.2
+// has to pick between `RMS_NORM→MUL` and `RMS_NORM→MUL→ADD` and a census that
+// published only the longest would hide the shorter one's own traffic.
+//
+// What is deliberately *not* counted: a node with two computed sources that are
+// both fusable — `ADD(f(x), g(x))` is a DAG motif, not a chain, and collapsing
+// it needs a fusion vocabulary the IntegrationSpec of §6.3 does not have. The
+// walk follows one spine, the first fusable source in `src` order, so the
+// relation is a function and the chains are disjoint.
+//
+// Like the op rows, this counts work and not time: `n_bytes_intermediate` is
+// what a fused kernel would stop writing, and a memory round trip is that
+// figure read *and* written, i.e. twice it. Nothing here executed anything.
+
+#define GGML_RIR_MAX_PATTERN_ROWS 128
+// Four is the length of the pilot named in §6.2 plus one. Longer chains are not
+// dropped: their length-4 windows are counted, which is what a fusion of that
+// vocabulary could actually emit.
+#define GGML_RIR_MAX_PATTERN_LEN  4
+
+typedef struct ggml_rir_census_pattern {
+    uint8_t  backend;                          // rir_backend
+    uint32_t n_ops;                            // 2..GGML_RIR_MAX_PATTERN_LEN
+    int32_t  ops[GGML_RIR_MAX_PATTERN_LEN];    // ggml_op, producer first
+    uint64_t n_occurrences;
+    uint64_t n_dispatches;                     // Σ n_ops; a fusion leaves n_occurrences
+    uint64_t n_bytes_intermediate;             // Σ nbytes of the tensors fusing removes
+    bool     registered;                       // every op of the chain has a variant
+} ggml_rir_census_pattern;
+
+// Append-only and monotonic, same contract as the op rows.
+uint32_t                ggml_rir_census_pattern_count(void);
+ggml_rir_census_pattern ggml_rir_census_pattern_snapshot(uint32_t index);
+
+// Windows dropped because the table was full. Its own counter rather than a
+// silent truncation: a reader ranking patterns has to know the rows above do
+// not add up to the graph.
+uint64_t                ggml_rir_census_pattern_overflow(void);
+
 // The last violation recorded by a preflight (or by a dispatch site that found
 // one under `require`). Process-wide, last writer wins — the same contract the
 // decision snapshot has.

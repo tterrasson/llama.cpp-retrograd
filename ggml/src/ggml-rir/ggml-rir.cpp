@@ -18,6 +18,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <unordered_map>
+#include <vector>
 
 static_assert(RIR_MAX_PUSH_CONSTANT_BYTES <= RIR_PUSH_CONSTANT_CAPACITY,
               "un kernel demande plus de constantes que la capacité publiée par ggml-rir.h");
@@ -1881,6 +1883,236 @@ void census_note_shape(census_row & row, const ggml_tensor * node) {
     s.n_nodes = 1;
 }
 
+// --- subgraph patterns ------------------------------------------------------
+//
+// Same table discipline, one row per (backend, op sequence). See ggml-rir.h for
+// what a "chain" is and what it deliberately is not.
+
+struct pattern_row {
+    uint8_t  backend = 0;
+    uint32_t n_ops   = 0;
+    int32_t  ops[GGML_RIR_MAX_PATTERN_LEN] = {};
+    uint64_t n_occurrences        = 0;
+    uint64_t n_dispatches         = 0;
+    uint64_t n_bytes_intermediate = 0;
+    bool     registered           = false;
+};
+
+pattern_row           g_patterns[GGML_RIR_MAX_PATTERN_ROWS];
+std::atomic<uint32_t> g_n_patterns{0};
+std::atomic<uint64_t> g_patterns_overflow{0};
+
+// Requires g_census_mutex — the pattern table is written by the same walk and
+// under the same lock, so a snapshot of one is consistent with the other.
+pattern_row * find_or_append_pattern(uint8_t backend, const int32_t * ops, uint32_t n_ops) {
+    const uint32_t n = g_n_patterns.load(std::memory_order_relaxed);
+    for (uint32_t i = 0; i < n; ++i) {
+        if (g_patterns[i].backend != backend || g_patterns[i].n_ops != n_ops) {
+            continue;
+        }
+        bool same = true;
+        for (uint32_t k = 0; k < n_ops; ++k) {
+            if (g_patterns[i].ops[k] != ops[k]) {
+                same = false;
+                break;
+            }
+        }
+        if (same) {
+            return &g_patterns[i];
+        }
+    }
+    if (n >= GGML_RIR_MAX_PATTERN_ROWS) {
+        return nullptr;
+    }
+    g_patterns[n].backend = backend;
+    g_patterns[n].n_ops   = n_ops;
+    for (uint32_t k = 0; k < n_ops; ++k) {
+        g_patterns[n].ops[k] = ops[k];
+    }
+    g_n_patterns.store(n + 1, std::memory_order_release);
+    return &g_patterns[n];
+}
+
+// The same filter the op walk applies: a view or a reshape is a relabelling and
+// not a kernel, so it is neither a link of a chain nor an endpoint of one.
+bool census_counts_node(const ggml_tensor * node) {
+    return node != nullptr && !ggml_op_is_empty(node->op) && !ggml_is_empty(node);
+}
+
+// Whether the *result* of `node` could stop existing if its single consumer
+// absorbed it. `n_refs` is how many times the whole graph mentions it — as a
+// source of any node, empty ops included, and as the view_src of any tensor.
+// Anything above one, an explicit graph output, or a tensor that is itself a
+// window onto someone else's buffer, and the answer is no.
+bool pattern_intermediate_is_private(const ggml_tensor * node, uint32_t n_refs) {
+    if (n_refs != 1 || node->view_src != nullptr) {
+        return false;
+    }
+    return (node->flags & (GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_LOSS)) == 0;
+}
+
+// Requires g_census_mutex. `chain` is a spine of counted nodes, each the single
+// private producer of the next.
+void census_note_chain(uint8_t backend, const std::vector<const ggml_tensor *> & chain) {
+    const size_t len = chain.size();
+    for (size_t start = 0; start < len; ++start) {
+        const size_t max_window = len - start < (size_t) GGML_RIR_MAX_PATTERN_LEN
+                                      ? len - start
+                                      : (size_t) GGML_RIR_MAX_PATTERN_LEN;
+        for (size_t window = 2; window <= max_window; ++window) {
+            int32_t ops[GGML_RIR_MAX_PATTERN_LEN];
+            bool    registered = true;
+            for (size_t k = 0; k < window; ++k) {
+                const ggml_tensor * node = chain[start + k];
+                ops[k] = (int32_t) node->op;
+                registered = registered &&
+                    ggml_rir_find_variant_for_op((int32_t) node->op, (rir_backend) backend) != nullptr;
+            }
+            pattern_row * row = find_or_append_pattern(backend, ops, (uint32_t) window);
+            if (row == nullptr) {
+                g_patterns_overflow.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            uint64_t intermediate = 0;
+            for (size_t k = 0; k + 1 < window; ++k) {
+                const ggml_tensor * produced = chain[start + k];
+                const ggml_tensor * consumer = chain[start + k + 1];
+                // An in-place consumer already writes into the producer's
+                // buffer, so the round trip a fusion would remove is not there
+                // to remove. Counting it would credit the fusion with traffic
+                // the graph builder had already saved.
+                if (produced->data != nullptr && produced->data == consumer->data) {
+                    continue;
+                }
+                intermediate += (uint64_t) ggml_nbytes(produced);
+            }
+            row->n_occurrences++;
+            row->n_dispatches         += (uint64_t) window;
+            row->n_bytes_intermediate += intermediate;
+            // A property of the (ops, backend) key alone, so it is the same on
+            // every occurrence: whether RIR has a kernel for each link, which
+            // is what removes a row from the candidate list of §6.2.
+            row->registered = registered;
+        }
+    }
+}
+
+// Requires g_census_mutex. Walks `g` a second time — the op walk needs no
+// topology and this one needs nothing else, and keeping them apart is what lets
+// the op rows stay exact if this ever has to be capped differently.
+void census_note_patterns(uint8_t backend, ggml_cgraph * g, int n_nodes) {
+    std::unordered_map<const ggml_tensor *, uint32_t> refs;
+    for (int i = 0; i < n_nodes; ++i) {
+        const ggml_tensor * node = ggml_graph_node(g, i);
+        if (node == nullptr) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (node->src[s] != nullptr) {
+                refs[node->src[s]]++;
+            }
+        }
+        if (node->view_src != nullptr) {
+            refs[node->view_src]++;
+        }
+    }
+
+    // Position of each counted node, so a source can be resolved to an index
+    // without scanning the graph per edge.
+    std::unordered_map<const ggml_tensor *, int> pos;
+    std::vector<const ggml_tensor *>             counted;
+    counted.reserve((size_t) n_nodes);
+    for (int i = 0; i < n_nodes; ++i) {
+        const ggml_tensor * node = ggml_graph_node(g, i);
+        if (!census_counts_node(node)) {
+            continue;
+        }
+        pos.emplace(node, (int) counted.size());
+        counted.push_back(node);
+    }
+
+    const int n_counted = (int) counted.size();
+    std::vector<int> pred((size_t) n_counted, -1);
+    std::vector<int> succ((size_t) n_counted, -1);
+    for (int j = 0; j < n_counted; ++j) {
+        const ggml_tensor * node = counted[(size_t) j];
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = node->src[s];
+            if (src == nullptr) {
+                continue;
+            }
+            const auto it = pos.find(src);
+            if (it == pos.end()) {
+                continue;  // a leaf, or a node the census does not count
+            }
+            const auto ref = refs.find(src);
+            const uint32_t n_refs = ref == refs.end() ? 0 : ref->second;
+            if (!pattern_intermediate_is_private(src, n_refs)) {
+                continue;
+            }
+            // First fusable source in `src` order wins, and a private result
+            // has exactly one consumer, so `succ` is a function too and the
+            // chains below are disjoint.
+            pred[(size_t) j]          = it->second;
+            succ[(size_t) it->second] = j;
+            break;
+        }
+    }
+
+    std::vector<const ggml_tensor *> chain;
+    for (int i = 0; i < n_counted; ++i) {
+        if (pred[(size_t) i] != -1) {
+            continue;  // not the head of its chain
+        }
+        chain.clear();
+        for (int cur = i; cur != -1; cur = succ[(size_t) cur]) {
+            chain.push_back(counted[(size_t) cur]);
+        }
+        if (chain.size() >= 2) {
+            census_note_chain(backend, chain);
+        }
+    }
+}
+
+// The pattern ranking, printed with the op ranking. Sorted by the traffic a
+// fusion would remove — twice the intermediate bytes, since the tensor is
+// written and read back — and then by the dispatches it would remove. Those two
+// columns are exactly what O6 §6.2 picks its pilot with.
+void pattern_print(std::FILE * out) {
+    const uint32_t n = g_n_patterns.load(std::memory_order_acquire);
+    if (n == 0) {
+        return;
+    }
+    uint32_t order[GGML_RIR_MAX_PATTERN_ROWS];
+    for (uint32_t i = 0; i < n; ++i) {
+        order[i] = i;
+    }
+    std::sort(order, order + n, [](uint32_t a, uint32_t b) {
+        if (g_patterns[a].n_bytes_intermediate != g_patterns[b].n_bytes_intermediate) {
+            return g_patterns[a].n_bytes_intermediate > g_patterns[b].n_bytes_intermediate;
+        }
+        return (g_patterns[a].n_dispatches - g_patterns[a].n_occurrences) >
+               (g_patterns[b].n_dispatches - g_patterns[b].n_occurrences);
+    });
+    std::fprintf(out, "ggml-rir: census patterns rows=%u dropped=%llu\n",
+        n, (unsigned long long) g_patterns_overflow.load(std::memory_order_relaxed));
+    for (uint32_t k = 0; k < n; ++k) {
+        const pattern_row & row = g_patterns[order[k]];
+        std::fprintf(out, "ggml-rir: census pattern ");
+        for (uint32_t i = 0; i < row.n_ops; ++i) {
+            std::fprintf(out, "%s%s", i == 0 ? "" : ">", ggml_op_name((ggml_op) row.ops[i]));
+        }
+        std::fprintf(out, "/%s occurrences=%llu dispatches=%llu saved=%llu inter=%llu roundtrip=%llu %s\n",
+            ggml_rir_backend_name(row.backend),
+            (unsigned long long) row.n_occurrences,
+            (unsigned long long) row.n_dispatches,
+            (unsigned long long) (row.n_dispatches - row.n_occurrences),
+            (unsigned long long) row.n_bytes_intermediate,
+            (unsigned long long) (2 * row.n_bytes_intermediate),
+            row.registered ? "registered" : "uncovered");
+    }
+}
+
 // The ranking, printed at exit. Sorted by bytes moved, because that is the
 // first-order cost model of every op in this graph that is not a matmul, and
 // the column that says which shapes to hand to the isolated bench next. It is
@@ -1935,6 +2167,7 @@ void census_print(std::FILE * out) {
         }
         std::fprintf(out, "\n");
     }
+    pattern_print(out);
 }
 } // namespace
 
@@ -1979,6 +2212,7 @@ void ggml_rir_census_graph(uint8_t backend, const struct ggml_cgraph * cgraph) {
             ggml_rir_find_variant_for_op((int32_t) node->op, (rir_backend) backend) != nullptr;
         census_note_shape(*row, node);
     }
+    census_note_patterns(backend, g, n_nodes);
 }
 
 uint32_t ggml_rir_census_count(void) {
@@ -2004,4 +2238,31 @@ ggml_rir_census_row ggml_rir_census_snapshot(uint32_t index) {
         out.shapes[i] = row.shapes[i];
     }
     return out;
+}
+
+uint32_t ggml_rir_census_pattern_count(void) {
+    return g_n_patterns.load(std::memory_order_acquire);
+}
+
+ggml_rir_census_pattern ggml_rir_census_pattern_snapshot(uint32_t index) {
+    ggml_rir_census_pattern out = {};
+    if (index >= ggml_rir_census_pattern_count()) {
+        return out;
+    }
+    std::lock_guard<std::mutex> lock(g_census_mutex);
+    const pattern_row & row = g_patterns[index];
+    out.backend              = row.backend;
+    out.n_ops                = row.n_ops;
+    out.n_occurrences        = row.n_occurrences;
+    out.n_dispatches         = row.n_dispatches;
+    out.n_bytes_intermediate = row.n_bytes_intermediate;
+    out.registered           = row.registered;
+    for (uint32_t i = 0; i < row.n_ops && i < GGML_RIR_MAX_PATTERN_LEN; ++i) {
+        out.ops[i] = row.ops[i];
+    }
+    return out;
+}
+
+uint64_t ggml_rir_census_pattern_overflow(void) {
+    return g_patterns_overflow.load(std::memory_order_relaxed);
 }
