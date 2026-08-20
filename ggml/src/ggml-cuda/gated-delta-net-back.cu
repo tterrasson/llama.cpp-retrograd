@@ -870,15 +870,43 @@ static __global__ void k_gdn_state_grad_out(const gdn_geom G,
     g_state[gdn_state_off(G, unit) + n] += dST[unit*SS + n];
 }
 
-// Row-major front end for cublasSgemmStridedBatched: C[m,n] = alpha*op(A)*op(B)
-// + beta*C, every matrix row-major with `ld` its stored row length, `s` its
-// per-unit element stride. Column-major cuBLAS computes the transpose of that
-// from the same buffers with the operands swapped.
-static void gdn_gemm(cublasHandle_t handle, bool transA, bool transB,
+enum class gdn_gemm_precision {
+    f32,
+    bf16,
+};
+
+struct gdn_gemm_workspace {
+    gdn_gemm_precision precision = gdn_gemm_precision::f32;
+};
+
+// Row-major front end for the chunk GEMMs: C[m,n] = alpha*op(A)*op(B) +
+// beta*C, every matrix row-major with `ld` its stored row length, `s` its
+// per-unit element stride. Column-major cuBLAS computes the transpose from the
+// same buffers with the operands swapped. CUBLAS_COMPUTE_32F_FAST_16BF asks
+// cuBLAS to round the F32 inputs to BF16 internally and use a F32 accumulator;
+// the stored inputs and C therefore stay F32, with no conversion launches or
+// extra scratch around these deliberately small GEMMs.
+static void gdn_gemm(cublasHandle_t handle, const gdn_gemm_workspace & work,
+                     bool transA, bool transB,
                      int m, int n, int k, float alpha,
                      const float * A, int lda, long long sA,
                      const float * B, int ldb, long long sB,
                      float beta, float * C, int ldc, long long sC, int batch) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11000
+    if (work.precision == gdn_gemm_precision::bf16) {
+        CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle,
+                transB ? CUBLAS_OP_T : CUBLAS_OP_N,
+                transA ? CUBLAS_OP_T : CUBLAS_OP_N,
+                n, m, k, &alpha,
+                B, CUDA_R_32F, ldb, sB,
+                A, CUDA_R_32F, lda, sA,
+                &beta, C, CUDA_R_32F, ldc, sC, batch,
+                CUBLAS_COMPUTE_32F_FAST_16BF, CUBLAS_GEMM_DEFAULT));
+        return;
+    }
+#else
+    GGML_ASSERT(work.precision == gdn_gemm_precision::f32);
+#endif
     CUBLAS_CHECK(cublasSgemmStridedBatched(handle,
             transB ? CUBLAS_OP_T : CUBLAS_OP_N,
             transA ? CUBLAS_OP_T : CUBLAS_OP_N,
@@ -904,6 +932,7 @@ static __global__ void k_gdn_fill_ptrs(const float ** a, float ** b, float ** c,
 // passes: forward to advance the state, backward to recompute what the adjoints
 // read. `SnextT` null means "backward pass, keep the working tiles".
 struct gdn_chunk_buffers {
+    gdn_gemm_workspace gemm;
     float * A;
     float * Qt;
     float * Kt;
@@ -954,7 +983,7 @@ static void gdn_chunk_forward(ggml_backend_cuda_context & ctx, const gdn_geom & 
     // (ii) Z = ktil S0. The state is stored transposed, so S0 on the right is a
     // B-transposed product against the raw buffer. Z lands in VmZ, which
     // k_gdn_make_w then turns into V - Z.
-    gdn_gemm(handle, false, true, (int) L, lds, lds, 1.0f,
+    gdn_gemm(handle, b.gemm, false, true, (int) L, lds, lds, 1.0f,
              b.Kt, lds, scs, S0T, lds, sss, 0.0f, b.VmZ, lds, scs, batch);
 
     {
@@ -964,7 +993,7 @@ static void gdn_chunk_forward(ggml_backend_cuda_context & ctx, const gdn_geom & 
     }
 
     // (iv) T, and (vi) P: two masked C x C products.
-    gdn_gemm(handle, false, true, (int) L, (int) L, lds, 1.0f,
+    gdn_gemm(handle, b.gemm, false, true, (int) L, (int) L, lds, 1.0f,
              b.Kt, lds, scs, b.Kh, lds, scs, 0.0f, b.M, ldc, scc, batch);
     {
         const dim3 grid((L*L + GDN_CHUNK_BLOCK - 1)/GDN_CHUNK_BLOCK, batch);
@@ -987,7 +1016,7 @@ static void gdn_chunk_forward(ggml_backend_cuda_context & ctx, const gdn_geom & 
     // P is only consumed by the adjoint. The state-only first pass skips this
     // GEMM and mask; the backward recompute requests them below.
     if (need_adjoint) {
-        gdn_gemm(handle, false, true, (int) L, (int) L, lds, 1.0f,
+        gdn_gemm(handle, b.gemm, false, true, (int) L, (int) L, lds, 1.0f,
                  b.Qt, lds, scs, b.Kh, lds, scs, 0.0f, b.P, ldc, scc, batch);
         {
             const dim3 grid((L*L + GDN_CHUNK_BLOCK - 1)/GDN_CHUNK_BLOCK, batch);
@@ -997,7 +1026,7 @@ static void gdn_chunk_forward(ggml_backend_cuda_context & ctx, const gdn_geom & 
     }
 
     // (viii) khat^T U, then S0 added and the exit state scaled out.
-    gdn_gemm(handle, true, false, lds, lds, (int) L, 1.0f,
+    gdn_gemm(handle, b.gemm, true, false, lds, lds, (int) L, 1.0f,
              b.U, lds, scs, b.Kh, lds, scs, 0.0f, b.XT, lds, sss, batch);
     {
         const dim3 grid((S*S + GDN_CHUNK_BLOCK - 1)/GDN_CHUNK_BLOCK, batch);
@@ -1037,32 +1066,32 @@ static void gdn_chunk_backward(ggml_backend_cuda_context & ctx, const gdn_geom &
     // (viii)^T
     k_gdn_grad_state_in<<<batch, GDN_CHUNK_BLOCK, 0, stream>>>(G, L, b.A, b.dST, b.XT, b.GT, b.dA);
     CUDA_CHECK(cudaGetLastError());
-    gdn_gemm(handle, false, false, (int) L, lds, lds, 1.0f,
+    gdn_gemm(handle, b.gemm, false, false, (int) L, lds, lds, 1.0f,
              b.U, lds, scs, b.GT, lds, sss, 0.0f, b.dKh, lds, scs, batch);
-    gdn_gemm(handle, false, true, (int) L, lds, lds, 1.0f,
+    gdn_gemm(handle, b.gemm, false, true, (int) L, lds, lds, 1.0f,
              b.Kh, lds, scs, b.GT, lds, sss, 0.0f, b.dU, lds, scs, batch);
     CUDA_CHECK(cudaMemcpyAsync(b.dST, b.GT, (size_t) G.units*S*S*sizeof(float),
                                cudaMemcpyDeviceToDevice, stream));
 
     // (vii)^T
-    gdn_gemm(handle, false, false, (int) L, lds, lds, sc,
+    gdn_gemm(handle, b.gemm, false, false, (int) L, lds, lds, sc,
              b.dO, lds, scs, S0T, lds, sss, 0.0f, b.dQt, lds, scs, batch);
-    gdn_gemm(handle, true, false, lds, lds, (int) L, sc,
+    gdn_gemm(handle, b.gemm, true, false, lds, lds, (int) L, sc,
              b.dO, lds, scs, b.Qt, lds, scs, 1.0f, b.dST, lds, sss, batch);
-    gdn_gemm(handle, false, true, (int) L, (int) L, lds, sc,
+    gdn_gemm(handle, b.gemm, false, true, (int) L, (int) L, lds, sc,
              b.dO, lds, scs, b.U, lds, scs, 0.0f, b.X, ldc, scc, batch);
     {
         const dim3 grid((L*L + GDN_CHUNK_BLOCK - 1)/GDN_CHUNK_BLOCK, batch);
         k_gdn_mask_lower_incl<<<grid, GDN_CHUNK_BLOCK, 0, stream>>>(G, L, b.X);
         CUDA_CHECK(cudaGetLastError());
     }
-    gdn_gemm(handle, true, false, (int) L, lds, (int) L, sc,
+    gdn_gemm(handle, b.gemm, true, false, (int) L, lds, (int) L, sc,
              b.P, ldc, scc, b.dO, lds, scs, 1.0f, b.dU, lds, scs, batch);
 
     // (vi)^T
-    gdn_gemm(handle, false, false, (int) L, lds, (int) L, 1.0f,
+    gdn_gemm(handle, b.gemm, false, false, (int) L, lds, (int) L, 1.0f,
              b.X, ldc, scc, b.Kh, lds, scs, 1.0f, b.dQt, lds, scs, batch);
-    gdn_gemm(handle, true, false, (int) L, lds, (int) L, 1.0f,
+    gdn_gemm(handle, b.gemm, true, false, (int) L, lds, (int) L, 1.0f,
              b.X, ldc, scc, b.Qt, lds, scs, 1.0f, b.dKh, lds, scs, batch);
 
     // (v)^T dWhat = L^T dU: the same triangular factor, transposed, in place.
@@ -1075,14 +1104,14 @@ static void gdn_chunk_backward(ggml_backend_cuda_context & ctx, const gdn_geom &
     }
 
     // (iv)^T
-    gdn_gemm(handle, false, true, (int) L, (int) L, lds, -1.0f,
+    gdn_gemm(handle, b.gemm, false, true, (int) L, (int) L, lds, -1.0f,
              b.dU, lds, scs, b.U, lds, scs, 0.0f, b.X, ldc, scc, batch);
     k_gdn_dt<<<dim3((unsigned) L, (unsigned) batch), GDN_CHUNK_BLOCK, 0, stream>>>(
         G, t0, L, b.M, b.bet, b.X, dst);
     CUDA_CHECK(cudaGetLastError());
-    gdn_gemm(handle, false, false, (int) L, lds, (int) L, 1.0f,
+    gdn_gemm(handle, b.gemm, false, false, (int) L, lds, (int) L, 1.0f,
              b.X, ldc, scc, b.Kh, lds, scs, 0.0f, b.dKt, lds, scs, batch);
-    gdn_gemm(handle, true, false, (int) L, lds, (int) L, 1.0f,
+    gdn_gemm(handle, b.gemm, true, false, (int) L, lds, (int) L, 1.0f,
              b.X, ldc, scc, b.Kt, lds, scs, 1.0f, b.dKh, lds, scs, batch);
 
     // (iii)^T
@@ -1091,9 +1120,9 @@ static void gdn_chunk_backward(ggml_backend_cuda_context & ctx, const gdn_geom &
     CUDA_CHECK(cudaGetLastError());
 
     // (ii)^T
-    gdn_gemm(handle, false, false, (int) L, lds, lds, 1.0f,
+    gdn_gemm(handle, b.gemm, false, false, (int) L, lds, lds, 1.0f,
              b.dZ, lds, scs, S0T, lds, sss, 1.0f, b.dKt, lds, scs, batch);
-    gdn_gemm(handle, true, false, lds, lds, (int) L, 1.0f,
+    gdn_gemm(handle, b.gemm, true, false, lds, lds, (int) L, 1.0f,
              b.dZ, lds, scs, b.Kt, lds, scs, 1.0f, b.dST, lds, sss, batch);
 
     // (i)^T
@@ -1125,6 +1154,18 @@ static bool ggml_cuda_gated_delta_net_back_chunked(
     const int64_t C = MIN(MIN(chunk, (int64_t) GDN_CHUNK_MAX), n_tokens);
     G.C = C;
 
+    // G3 is deliberately opt-in: rounding every GEMM input changes the
+    // numerical regime of a backward pass. Ampere is the first NVIDIA
+    // generation with native BF16 tensor cores; every other backend keeps the
+    // exact F32 oracle path even when the variable is set.
+    bool use_bf16_gemm = false;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11000
+    const char * mma_env = getenv("GGML_CUDA_GDN_BACK_MMA");
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    use_bf16_gemm = mma_env != nullptr && std::atoi(mma_env) != 0 &&
+        GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE;
+#endif
+
     // The gates decide the layout, so they have to be read before the first
     // GEMM shape is known: one reduction to n_tokens floats, one copy back.
     std::vector<int64_t> starts;
@@ -1147,8 +1188,9 @@ static bool ggml_cuda_gated_delta_net_back_chunked(
     }
     const int64_t n_chunks = (int64_t) starts.size() - 1;
     if (getenv("GGML_CUDA_GDN_BACK_DEBUG")) {
-        fprintf(stderr, "gdn_back: n_tokens=%lld units=%lld C=%lld chunks=%lld\n",
-                (long long) n_tokens, (long long) units, (long long) C, (long long) n_chunks);
+        fprintf(stderr, "gdn_back: n_tokens=%lld units=%lld C=%lld chunks=%lld gemm=%s\n",
+                (long long) n_tokens, (long long) units, (long long) C, (long long) n_chunks,
+                use_bf16_gemm ? "bf16-f32" : "f32");
     }
 
     // Working tiles, all per-unit strided so every GEMM is one strided-batched
@@ -1166,6 +1208,7 @@ static bool ggml_cuda_gated_delta_net_back_chunked(
 
     gdn_chunk_buffers b = {};
     {
+        b.gemm.precision = use_bf16_gemm ? gdn_gemm_precision::bf16 : gdn_gemm_precision::f32;
         float * t = tiles.get();
         const int64_t n = units*C*S;
         b.A = t; t += n; b.Qt  = t; t += n; b.Kt  = t; t += n; b.Kh = t; t += n;
