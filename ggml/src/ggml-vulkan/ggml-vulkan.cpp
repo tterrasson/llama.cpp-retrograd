@@ -12065,8 +12065,16 @@ static void ggml_vk_flash_attn_back(
 
     const int32_t grad_mask = ggml_get_op_params_i32(dst, 3);
 
+    // retro delta (OPTIM_V3 O4): bit 6 asks the dQ shader to fold the row
+    // log-sum-exp into the sweep that accumulates dQ instead of giving it a pass
+    // of its own. Opt-in, like the CUDA side: the two-sweep form is the default
+    // and the oracle until a measurement clears the folded one. A push constant
+    // rather than a build flag, so a before/after needs no rebuild.
+    const char * fused_env = getenv("GGML_VK_FA_BACK_FUSED_LSE");
+    const bool fused_lse = fused_env != nullptr && std::atoi(fused_env) != 0;
     const uint32_t flags = (mask ? 1u : 0u) | (sinks ? 2u : 0u) |
-        ((uint32_t) grad_mask << 2) | (kv_idxs ? 32u : 0u);
+        ((uint32_t) grad_mask << 2) | (kv_idxs ? 32u : 0u) |
+        (fused_lse ? 64u : 0u);
     const vk_flash_attn_back_push_constants pc = {
         (uint32_t) q->ne[1], (uint32_t) k->ne[1],
         (uint32_t) q->ne[0], (uint32_t) v->ne[0],
@@ -12111,6 +12119,24 @@ static void ggml_vk_flash_attn_back(
     vk_pipeline pipeline_kv = use_mma
         ? ctx->device->pipeline_flash_attn_back_mma_kv
         : ctx->device->pipeline_flash_attn_back_kv[kv_variant][bucket];
+
+    // O4 point 2: the MMA path is only taken at HSK == HSV == 128 with 16x16x16
+    // F32-accumulate cooperative matrices, so a timing that does not say which
+    // shader ran says nothing. Mirrors GGML_CUDA_FA_BACK_DEBUG.
+    if (getenv("GGML_VK_FA_BACK_DEBUG")) {
+        fprintf(stderr,
+                "fa_back(vk): hsk=%lld hsv=%lld nq=%lld nkv=%lld nhead=%lld nheadk=%lld "
+                "nwin=%u kv=%s mask=%d grads=%c%c%c path=%s lse=%s\n",
+                (long long) q->ne[0], (long long) v->ne[0], (long long) q->ne[1],
+                (long long) k->ne[1], (long long) q->ne[2], (long long) k->ne[2],
+                n_kv_grad, k->type == GGML_TYPE_F16 ? "f16" : "f32", mask ? 1 : 0,
+                (grad_mask & GGML_FLASH_ATTN_BACK_GRAD_Q) ? 'q' : '-',
+                (grad_mask & GGML_FLASH_ATTN_BACK_GRAD_K) ? 'k' : '-',
+                (grad_mask & GGML_FLASH_ATTN_BACK_GRAD_V) ? 'v' : '-',
+                use_mma ? "mma" : "scalar",
+                (!fused_lse || !(grad_mask & GGML_FLASH_ATTN_BACK_GRAD_Q))
+                    ? "two-pass" : "fused");
+    }
 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline_q, 1);
     ggml_pipeline_request_descriptor_sets(ctx, pipeline_kv, 1);

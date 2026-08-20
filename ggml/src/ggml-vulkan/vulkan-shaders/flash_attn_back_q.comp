@@ -51,6 +51,13 @@ layout(binding = 8) readonly buffer KvIdxs { int       kv_idxs[]; };
 const uint FLAG_MASK   = 1u;
 const uint FLAG_SINKS  = 2u;
 const uint FLAG_GRAD_Q = 4u;
+// retro delta (OPTIM_V3 O4): set to fold the row log-sum-exp into the sweep that
+// accumulates dQ -- the accumulators are rescaled by exp(m_old - m_new) as the
+// maximum moves and divided by the final sum once. Same algebra as the two
+// sweeps below, half the Q.K work, a different summation order; hence opt-in
+// (GGML_VK_FA_BACK_FUSED_LSE=1) while the two-sweep form stays the default. A
+// push constant, so a before/after needs no rebuild.
+const uint FLAG_FUSED_LSE = 64u;
 
 float alibi_slope(uint head) {
     if (p.max_bias <= 0.0f) {
@@ -111,24 +118,68 @@ void main() {
     }
     float delta = subgroupAdd(delta_part);
 
+    const bool grad_q = (p.flags & FLAG_GRAD_Q) != 0u;
+    const bool fused = grad_q && (p.flags & FLAG_FUSED_LSE) != 0u;
+
+    float dq[FA_BACK_SLOTS];
+    for (uint slot = 0u; slot < FA_BACK_SLOTS; ++slot) {
+        dq[slot] = 0.0f;
+    }
+
     float row_max = -3.402823466e+38f;
     float row_sum = 0.0f;
-    for (uint key = 0u; key < p.KV; ++key) {
-        float part = 0.0f;
-        for (uint id = lid; id < p.HSK; id += 32u) {
-            part += q[q_base + id] * float(k[k_head_base + key * p.HSK + id]);
+    if (fused) {
+        // One sweep: the log-sum-exp and dQ share the Q.K dot product, and the
+        // accumulators carry the running maximum instead of a final one.
+        for (uint key = 0u; key < p.KV; ++key) {
+            float qk_part = 0.0f;
+            for (uint id = lid; id < p.HSK; id += 32u) {
+                qk_part += q[q_base + id] * float(k[k_head_base + key * p.HSK + id]);
+            }
+            float dot_qk = subgroupAdd(qk_part);
+            float score = score_from_dot(dot_qk, key, row, head, batch);
+            float new_max = max(row_max, score);
+            float rescale = exp(row_max - new_max);
+            row_sum = row_sum * rescale + exp(score - new_max);
+            row_max = new_max;
+
+            float dv_part = 0.0f;
+            for (uint id = lid; id < p.HSV; id += 32u) {
+                dv_part += dout[out_base + id] * float(v[v_head_base + key * p.HSV + id]);
+            }
+            float dot_dv = subgroupAdd(dv_part);
+            float ds = exp(score - new_max) * (dot_dv - delta) * score_derivative(dot_qk);
+            for (uint slot = 0u; slot < FA_BACK_SLOTS; ++slot) {
+                uint id = lid + 32u * slot;
+                if (id < p.HSK) {
+                    dq[slot] = dq[slot] * rescale + ds * float(k[k_head_base + key * p.HSK + id]);
+                }
+            }
         }
-        float dot = subgroupAdd(part);
-        float score = score_from_dot(dot, key, row, head, batch);
-        float new_max = max(row_max, score);
-        row_sum = row_sum * exp(row_max - new_max) + exp(score - new_max);
-        row_max = new_max;
+    } else {
+        for (uint key = 0u; key < p.KV; ++key) {
+            float part = 0.0f;
+            for (uint id = lid; id < p.HSK; id += 32u) {
+                part += q[q_base + id] * float(k[k_head_base + key * p.HSK + id]);
+            }
+            float dot = subgroupAdd(part);
+            float score = score_from_dot(dot, key, row, head, batch);
+            float new_max = max(row_max, score);
+            row_sum = row_sum * exp(row_max - new_max) + exp(score - new_max);
+            row_max = new_max;
+        }
     }
     if ((p.flags & FLAG_SINKS) != 0u) {
         float score = sinks[head];
         float new_max = max(row_max, score);
-        row_sum = row_sum * exp(row_max - new_max) + exp(score - new_max);
+        float rescale = exp(row_max - new_max);
+        row_sum = row_sum * rescale + exp(score - new_max);
         row_max = new_max;
+        // The sink can move the maximum too, and it contributes to the
+        // denominator without contributing to dQ.
+        for (uint slot = 0u; slot < FA_BACK_SLOTS; ++slot) {
+            dq[slot] *= rescale;
+        }
     }
 
     float lse = row_max + log(row_sum);
@@ -142,15 +193,21 @@ void main() {
     // skipped when the packed result has no dQ segment. The branch is uniform
     // across the workgroup (push constant), so the subgroup reductions inside
     // the loop stay well formed.
-    if ((p.flags & FLAG_GRAD_Q) == 0u) {
+    if (!grad_q) {
         return;
     }
 
-    float dq[FA_BACK_SLOTS];
-    for (uint slot = 0u; slot < FA_BACK_SLOTS; ++slot) {
-        dq[slot] = 0.0f;
+    if (fused) {
+        // Finish the online normalization: dq holds sum_key exp(score - row_max)
+        // (...) k, so one division by the final sum is the whole difference from
+        // exp(score - lse). A fully masked row has no contribution to normalize.
+        float inv_sum = row_sum > 0.0f ? 1.0f / row_sum : 0.0f;
+        for (uint slot = 0u; slot < FA_BACK_SLOTS; ++slot) {
+            dq[slot] *= inv_sum;
+        }
     }
-    for (uint key = 0u; key < p.KV; ++key) {
+    // The two-sweep form only: its second pass over the cache.
+    for (uint key = 0u; !fused && key < p.KV; ++key) {
         float qk_part = 0.0f;
         for (uint id = lid; id < p.HSK; id += 32u) {
             qk_part += q[q_base + id] * float(k[k_head_base + key * p.HSK + id]);

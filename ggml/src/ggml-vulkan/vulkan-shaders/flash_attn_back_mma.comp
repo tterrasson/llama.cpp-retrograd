@@ -41,6 +41,11 @@ const uint FLAG_GRAD_Q = 4u;
 const uint FLAG_GRAD_K = 8u;
 const uint FLAG_GRAD_V = 16u;
 const uint FLAG_WINDOW = 32u;
+// retro delta (OPTIM_V3 O4): set to fold the log-sum-exp into the sweep that
+// accumulates dQ, which removes a whole pass of K loads and one of the three
+// cooperative-matrix products per tile. See flash_attn_back_q.comp: opt-in, the
+// two-sweep form is the default.
+const uint FLAG_FUSED_LSE = 64u;
 
 shared float16_t sq[TILE*D];
 shared float16_t sd[TILE*D];
@@ -51,6 +56,7 @@ shared float dov[TILE*TILE];
 shared float row_m[TILE];
 shared float row_l[TILE];
 shared float row_delta[TILE];
+shared float row_rescale[TILE];
 
 float alibi_slope(uint head) {
     if (p.max_bias <= 0.0f) return 1.0f;
@@ -137,7 +143,13 @@ void main_q() {
     }
     barrier();
 
-    for (uint kv0 = 0u; kv0 < p.KV; kv0 += TILE) {
+    const bool grad_q = (p.flags & FLAG_GRAD_Q) != 0u;
+    // With no dQ to accumulate there is nothing to fold the log-sum-exp into, so
+    // the sweep below stays the right shape: the dK/dV pass needs the statistics
+    // either way.
+    const bool two_pass = !grad_q || (p.flags & FLAG_FUSED_LSE) == 0u;
+
+    for (uint kv0 = 0u; two_pass && kv0 < p.KV; kv0 += TILE) {
         for (uint idx = lid; idx < TILE*D; idx += 256u) {
             uint kr = idx/D, id = idx % D, key = kv0 + kr;
             sk[idx] = key < p.KV ? k[k_head_base + key*D + id] : float16_t(0.0);
@@ -157,7 +169,7 @@ void main_q() {
         }
         barrier();
     }
-    if (lid < TILE && q0 + lid < p.N) {
+    if (two_pass && lid < TILE && q0 + lid < p.N) {
         uint si = (batch*p.n_head + head)*p.N + q0 + lid;
         float l = row_l[lid], m = row_m[lid];
         if ((p.flags & FLAG_SINKS) != 0u) {
@@ -173,7 +185,7 @@ void main_q() {
         grad[p.off_stats + p.N*p.n_head*p.n_batch + si] = row_delta[lid];
     }
     barrier();
-    if ((p.flags & FLAG_GRAD_Q) == 0u) return;
+    if (!grad_q) return;
 
     float dq[8];
     for (uint i = 0u; i < 8u; ++i) dq[i] = 0.0;
@@ -188,23 +200,72 @@ void main_q() {
         barrier();
         if (lid < 32u) { mma_qk(); mma_dov(); }
         barrier();
+        if (!two_pass) {
+            // Fold this tile into the running log-sum-exp and publish what the
+            // accumulators owe it: a row whose maximum has not moved owes 1, and
+            // so does a row that has seen nothing yet -- its dQ is still zero.
+            if (lid < TILE) {
+                row_rescale[lid] = 1.0;
+                if (q0 + lid < p.N) {
+                    float m = row_m[lid], l = row_l[lid];
+                    for (uint kr = 0u; kr < TILE && kv0 + kr < p.KV; ++kr) {
+                        float s = score_value(qk[lid*TILE + kr], kv0 + kr, q0 + lid, head, batch);
+                        if (isinf(s) && s < 0.0) continue;
+                        float mn = max(m, s);
+                        l = l*exp(m - mn) + exp(s - mn); m = mn;
+                    }
+                    if (m != row_m[lid] && !isinf(row_m[lid])) row_rescale[lid] = exp(row_m[lid] - m);
+                    row_m[lid] = m; row_l[lid] = l;
+                }
+            }
+            barrier();
+        }
         for (uint oi = 0u; oi < 8u; ++oi) {
             uint idx = lid + oi*256u, qr = idx/D, id = idx % D, row = q0 + qr;
             if (row >= p.N) continue;
+            if (!two_pass) dq[oi] *= row_rescale[qr];
             for (uint kr = 0u; kr < TILE && kv0 + kr < p.KV; ++kr) {
                 float dot = qk[qr*TILE + kr];
                 float s = score_value(dot, kv0 + kr, row, head, batch);
                 if (isinf(s) && s < 0.0) continue;
-                float prob = exp(s - row_m[qr])/row_l[qr];
+                // Two-sweep: the final softmax weight. One sweep: still scaled by
+                // the running maximum, with row_l dividing once below.
+                float prob = two_pass ? exp(s - row_m[qr])/row_l[qr] : exp(s - row_m[qr]);
                 float ds0 = prob*(dov[qr*TILE + kr] - row_delta[qr])*score_derivative(dot);
                 dq[oi] += ds0*float(sk[kr*D + id]);
             }
         }
         barrier();
     }
+    if (!two_pass) {
+        // The sink and the statistics were skipped above; the single sweep is
+        // over, so the row state is final and both can be finished here.
+        if (lid < TILE && q0 + lid < p.N) {
+            uint si = (batch*p.n_head + head)*p.N + q0 + lid;
+            float l = row_l[lid], m = row_m[lid];
+            if ((p.flags & FLAG_SINKS) != 0u) {
+                float s = sinks[head], mn = max(m, s);
+                l = l*exp(m - mn) + exp(s - mn);
+                row_rescale[lid] = m == mn ? 1.0 : (isinf(m) ? 1.0 : exp(m - mn));
+                m = mn;
+                row_l[lid] = l; row_m[lid] = m;
+            } else {
+                row_rescale[lid] = 1.0;
+            }
+            grad[p.off_stats + si] = l > 0.0 ? m + log(l) : uintBitsToFloat(0x7f800000u);
+            grad[p.off_stats + p.N*p.n_head*p.n_batch + si] = row_delta[lid];
+        }
+        barrier();
+    }
     for (uint oi = 0u; oi < 8u; ++oi) {
         uint idx = lid + oi*256u, qr = idx/D, id = idx % D, row = q0 + qr;
-        if (row < p.N) grad[p.off_q + ((batch*p.n_head + head)*p.N + row)*D + id] = dq[oi];
+        if (row >= p.N) continue;
+        float value = dq[oi];
+        if (!two_pass) {
+            // Finish the online normalization, sink included.
+            value = row_l[qr] > 0.0 ? value*row_rescale[qr]/row_l[qr] : 0.0;
+        }
+        grad[p.off_q + ((batch*p.n_head + head)*p.N + row)*D + id] = value;
     }
 }
 

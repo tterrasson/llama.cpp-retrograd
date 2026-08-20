@@ -1,6 +1,7 @@
 #include "flash-attn-back.cuh"
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 
 #include <algorithm>
@@ -164,6 +165,7 @@ static __global__ void flash_attn_back_mma_q_kernel(
     float * row_m = dov + FA_BACK_MMA_TILE*FA_BACK_MMA_TILE;
     float * row_l = row_m + FA_BACK_MMA_TILE;
     float * row_delta = row_l + FA_BACK_MMA_TILE;
+    float * row_rescale = row_delta + FA_BACK_MMA_TILE;
 
     for (int idx = tid; idx < FA_BACK_MMA_TILE*d; idx += blockDim.x) {
         const int qr = idx/d;
@@ -196,8 +198,21 @@ static __global__ void flash_attn_back_mma_q_kernel(
     }
     __syncthreads();
 
-    // Pass 1: tensor-core Q.K^T and online LSE.
-    for (int64_t kv0 = 0; kv0 < nkv; kv0 += FA_BACK_MMA_TILE) {
+    // retro delta (OPTIM_V3 O4): the two sweeps of the KV cache below are one
+    // sweep when the log-sum-exp is folded into the pass that accumulates dQ.
+    // Pass 1 existed only to know row_m/row_l before dividing by them; the
+    // online form rescales the dQ accumulators by exp(m_old - m_new) instead and
+    // divides by row_l once, at the end. It removes a full pass of K loads and
+    // one of the three tensor-core sweeps per tile, and it is the *same* algebra
+    // -- what it is not is the same summation order, which is why the scalar
+    // kernel stays the oracle and the parity is a tolerance.
+    //
+    // With want_dq false there is nothing to fold into, so the LSE-only sweep is
+    // still the right shape: the KV kernel needs the statistics either way.
+    const bool two_pass = !a.fused_lse || !want_dq;
+
+    // Pass 1 (two-sweep form): tensor-core Q.K^T and online LSE.
+    for (int64_t kv0 = 0; two_pass && kv0 < nkv; kv0 += FA_BACK_MMA_TILE) {
         for (int idx = tid; idx < FA_BACK_MMA_TILE*d; idx += blockDim.x) {
             const int kr = idx/d;
             const int id = idx - kr*d;
@@ -231,21 +246,25 @@ static __global__ void flash_attn_back_mma_q_kernel(
         __syncthreads();
     }
 
-    if (tid < FA_BACK_MMA_TILE && q0 + tid < nq) {
-        const int64_t stat = (ib*nhead + ih)*nq + q0 + tid;
-        const int64_t nstats = gridDim.z*nhead*nq;
-        float * stats = (float *) ((char *) dst + off_s);
-        // A fully masked row gets +INFINITY, not -INFINITY, and the scalar
-        // kernel does the same: the KV kernel reads this back as
-        // exp(score - lse), so the sentinel has to drive that to zero for *any*
-        // score it might see. -INFINITY would drive it to +inf, i.e. NaN in
-        // dK/dV, the moment the two kernels ever disagreed about which entries
-        // are masked.
-        stats[stat] = row_l[tid] > 0.0f ? row_m[tid] + logf(row_l[tid]) : INFINITY;
-        stats[nstats + stat] = row_delta[tid];
+    // A fully masked row gets +INFINITY, not -INFINITY, and the scalar kernel
+    // does the same: the KV kernel reads this back as exp(score - lse), so the
+    // sentinel has to drive that to zero for *any* score it might see.
+    // -INFINITY would drive it to +inf, i.e. NaN in dK/dV, the moment the two
+    // kernels ever disagreed about which entries are masked.
+#define FAB_MMA_WRITE_STATS()                                                       \
+    if (tid < FA_BACK_MMA_TILE && q0 + tid < nq) {                                  \
+        const int64_t stat = (ib*nhead + ih)*nq + q0 + tid;                         \
+        const int64_t nstats = gridDim.z*nhead*nq;                                  \
+        float * stats = (float *) ((char *) dst + off_s);                           \
+        stats[stat] = row_l[tid] > 0.0f ? row_m[tid] + logf(row_l[tid]) : INFINITY; \
+        stats[nstats + stat] = row_delta[tid];                                      \
     }
-    if (!want_dq) {
-        return;
+
+    if (two_pass) {
+        FAB_MMA_WRITE_STATS();
+        if (!want_dq) {
+            return;
+        }
     }
 
     float dq[FA_BACK_MMA_OWNED];
@@ -272,26 +291,68 @@ static __global__ void flash_attn_back_mma_q_kernel(
             fab_mma_scores(sd, sv, dov, (int) d);
         }
         __syncthreads();
-        const int owned = (FA_BACK_MMA_TILE*(int) d + blockDim.x - 1)/blockDim.x;
         const int n = (int) min((int64_t) FA_BACK_MMA_TILE, nkv - kv0);
+        if (!two_pass) {
+            // Fold this tile into the running log-sum-exp and publish what the
+            // accumulators owe it. A row whose maximum has not moved owes 1; a
+            // row that has seen nothing yet owes 1 too, because its dQ is still
+            // zero and exp(-inf - m) would be a NaN rather than a scale.
+            if (tid < FA_BACK_MMA_TILE) {
+                row_rescale[tid] = 1.0f;
+                if (q0 + tid < nq) {
+                    float m = row_m[tid];
+                    float l = row_l[tid];
+                    const half * mask_row = has_mask ? (const half *) (mask + (q0 + tid)*nbm1 + ib*nbm3) : nullptr;
+                    for (int kr = 0; kr < n; ++kr) {
+                        const float score = fab_mma_score(qk[tid*FA_BACK_MMA_TILE + kr], mask_row,
+                                                          kv0 + kr, nbm0, has_mask, scale, softcap);
+                        if (score == -INFINITY) {
+                            continue;
+                        }
+                        const float mn = fmaxf(m, score);
+                        l = l*expf(m - mn) + expf(score - mn);
+                        m = mn;
+                    }
+                    if (m != row_m[tid] && row_m[tid] != -INFINITY) {
+                        row_rescale[tid] = expf(row_m[tid] - m);
+                    }
+                    row_m[tid] = m;
+                    row_l[tid] = l;
+                }
+            }
+            __syncthreads();
+        }
+        const int owned = (FA_BACK_MMA_TILE*(int) d + blockDim.x - 1)/blockDim.x;
         for (int oi = 0; oi < owned; ++oi) {
             const int idx = tid + oi*blockDim.x;
             if (idx >= FA_BACK_MMA_TILE*d) { continue; }
             const int qr = idx/d;
             const int id = idx - qr*d;
-            if (q0 + qr >= nq || row_l[qr] <= 0.0f) { continue; }
+            if (q0 + qr >= nq) { continue; }
+            if (two_pass) {
+                if (row_l[qr] <= 0.0f) { continue; }
+            } else {
+                dq[oi] *= row_rescale[qr];
+            }
             const half * mask_row = has_mask ? (const half *) (mask + (q0 + qr)*nbm1 + ib*nbm3) : nullptr;
             for (int kr = 0; kr < n; ++kr) {
                 const float dot = qk[qr*FA_BACK_MMA_TILE + kr];
                 const float score = fab_mma_score(dot, mask_row, kv0 + kr, nbm0, has_mask, scale, softcap);
                 if (score == -INFINITY) { continue; }
-                const float p = expf(score - row_m[qr])/row_l[qr];
+                // Two-sweep: p is the final softmax weight. Single sweep: it is
+                // still scaled by the running maximum, and row_l divides once
+                // below.
+                const float p = two_pass ? expf(score - row_m[qr])/row_l[qr]
+                                         : expf(score - row_m[qr]);
                 const float ds0 = p*(dov[qr*FA_BACK_MMA_TILE + kr] - row_delta[qr]) *
                                   fab_mma_deriv(dot, scale, softcap);
                 dq[oi] += ds0*__half2float(sk[kr*d + id]);
             }
         }
         __syncthreads();
+    }
+    if (!two_pass) {
+        FAB_MMA_WRITE_STATS();
     }
     const int owned = (FA_BACK_MMA_TILE*(int) d + blockDim.x - 1)/blockDim.x;
     for (int oi = 0; oi < owned; ++oi) {
@@ -301,9 +362,12 @@ static __global__ void flash_attn_back_mma_q_kernel(
         const int id = idx - qr*d;
         const int64_t iq = q0 + qr;
         if (iq < nq) {
-            dst[((ib*nhead + ih)*nq + iq)*d + id] = dq[oi];
+            const float value = two_pass ? dq[oi]
+                : (row_l[qr] > 0.0f ? dq[oi]/row_l[qr] : 0.0f);
+            dst[((ib*nhead + ih)*nq + iq)*d + id] = value;
         }
     }
+#undef FAB_MMA_WRITE_STATS
 }
 
 template<int>
@@ -813,6 +877,27 @@ static __global__ void flash_attn_back_kv_kernel(
     }
 }
 
+// O4 point 2: a number is only comparable to another number taken in the same
+// regime, and the MMA path's contract (F16 cache, HSK == HSV, a multiple of 16 up
+// to 256, NVIDIA Turing or newer) excludes shapes silently. Publish which kernel
+// ran and on what, rather than leave a measurement to guess -- the same reason
+// the GDN backward publishes gemm=f32 vs gemm=bf16-f32.
+static void fab_debug_regime(
+        int64_t hsk, int64_t hsv, int64_t nq, int64_t nkv, int64_t nhead, int64_t nheadk,
+        int64_t nwin, bool kv_f16, bool has_mask, bool want_dq, bool want_dk, bool want_dv,
+        const char * path, const char * schedule) {
+    if (!getenv("GGML_CUDA_FA_BACK_DEBUG")) {
+        return;
+    }
+    fprintf(stderr,
+            "fa_back: hsk=%lld hsv=%lld nq=%lld nkv=%lld nhead=%lld nheadk=%lld nwin=%lld "
+            "kv=%s mask=%d grads=%c%c%c path=%s %s\n",
+            (long long) hsk, (long long) hsv, (long long) nq, (long long) nkv,
+            (long long) nhead, (long long) nheadk, (long long) nwin,
+            kv_f16 ? "f16" : "f32", (int) has_mask,
+            want_dq ? 'q' : '-', want_dk ? 'k' : '-', want_dv ? 'v' : '-', path, schedule);
+}
+
 void ggml_cuda_flash_attn_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * q = dst->src[0];
     const ggml_tensor * k = dst->src[1];
@@ -891,6 +976,12 @@ void ggml_cuda_flash_attn_back(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         hsk <= FA_BACK_MMA_MAX_D && hsk % 16 == 0 &&
         k->nb[0] == sizeof(half) && v->nb[0] == sizeof(half) &&
         GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc);
+    // O4 point 1: the before/after of the folded log-sum-exp has to be measurable
+    // in one session, on one machine, without a rebuild -- same rule
+    // GGML_CUDA_FA_BACK_MMA already follows for the MMA path itself. The default
+    // is the two-sweep form: §11 does not move a default before its gate.
+    const char * fused_env = getenv("GGML_CUDA_FA_BACK_FUSED_LSE");
+    const bool fused_lse = fused_env != nullptr && std::atoi(fused_env) != 0;
     if (use_mma) {
         const fa_back_mma_args mma = {
             hsk, nq, nkv, nhead, nheadk, ratio,
@@ -904,10 +995,16 @@ void ggml_cuda_flash_attn_back(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             window.idxs, window.nwin, window.stride, window.stream0,
             scale, softcap,
             has_mask, want_dq, want_dk, want_dv,
+            fused_lse,
         };
+        // 4 half tiles (Q/dO/K/V), 2 score tiles, and 4 per-row F32 arrays:
+        // row_m, row_l, row_delta and O4's row_rescale.
         const size_t mma_smem = 4*(size_t) FA_BACK_MMA_TILE*hsk*sizeof(half) +
             2*(size_t) FA_BACK_MMA_TILE*FA_BACK_MMA_TILE*sizeof(float) +
-            3*(size_t) FA_BACK_MMA_TILE*sizeof(float);
+            4*(size_t) FA_BACK_MMA_TILE*sizeof(float);
+        fab_debug_regime(hsk, hsv, nq, nkv, nhead, nheadk, window.nwin, kv_f16, has_mask,
+                         want_dq, want_dk, want_dv, "mma",
+                         (!fused_lse || !want_dq) ? "lse=two-pass" : "lse=fused");
         const dim3 grid_q((unsigned) ((nq + FA_BACK_MMA_TILE - 1)/FA_BACK_MMA_TILE),
                           (unsigned) nhead, (unsigned) nbatch);
         flash_attn_back_mma_q_kernel<0><<<grid_q, FA_BACK_MMA_THREADS, mma_smem, stream>>>(
@@ -927,6 +1024,10 @@ void ggml_cuda_flash_attn_back(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     }
 #endif
 
+    // O4 point 2: a number is only comparable to another number taken in the same
+    // regime, and the MMA path's contract (F16 cache, HSK == HSV, a multiple of
+    // 16 up to 256, NVIDIA Turing or newer) excludes shapes silently. Publish it
+    // rather than leave a measurement to guess which kernel ran.
     // One warp per query row, and one block per (query tile, head, batch) so the
     // warps of a block share ih/ib and can therefore share a K/V tile.
     const int block = 256;
@@ -943,8 +1044,24 @@ void ggml_cuda_flash_attn_back(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     // self-defeating. At head_dim 128 that is a 32-row tile; at Gemma-4's 512 it
     // falls to 8, which still amortizes each K/V read across the block's query rows.
     const size_t row_floats = (size_t) (hsk + hsv);
-    const int tkv = (int) std::max<size_t>(1, std::min<size_t>(32, (32*1024)/(row_floats*sizeof(float))));
+    int tkv = (int) std::max<size_t>(1, std::min<size_t>(32, (32*1024)/(row_floats*sizeof(float))));
+    // O4 point 4: the tile depth is the one schedule parameter of this kernel, and
+    // the 32 KiB budget above picks it from the head dimension alone. Sweeping it
+    // per head_dim/GQA/causal scope needs it overridable, not recompiled; the
+    // shared-memory ceiling still decides what is legal.
+    if (const char * tkv_env = getenv("GGML_CUDA_FA_BACK_TKV")) {
+        const int requested = std::atoi(tkv_env);
+        const int cap = (int) std::max<size_t>(1, (48*1024)/(row_floats*sizeof(float)));
+        if (requested > 0) {
+            tkv = std::min(requested, cap);
+        }
+    }
     const size_t smem = (size_t) tkv*row_floats*sizeof(float);
+
+    char schedule[32];
+    snprintf(schedule, sizeof(schedule), "tkv=%d", tkv);
+    fab_debug_regime(hsk, hsv, nq, nkv, nhead, nheadk, window.nwin, kv_f16, has_mask,
+                     want_dq, want_dk, want_dv, "scalar", schedule);
 
     // Smallest bucket that covers the shape: head_dim only costs registers here,
     // so a wide model works, but narrow models must not pay for it.
