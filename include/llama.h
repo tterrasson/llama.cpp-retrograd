@@ -1779,6 +1779,14 @@ extern "C" {
             const struct llama_context * lctx,
             struct llama_opt_memory * out_memory);
 
+    // retro delta: what the retained activation checkpoints cost and how long they
+    // are held, from the last backward graph the optimizer built. See
+    // ggml_opt_checkpoint_profile. False (and a zeroed profile) when gradient
+    // checkpointing is off or no backward graph exists yet.
+    LLAMA_API bool llama_opt_get_checkpoint_profile(
+            const struct llama_context * lctx,
+            struct ggml_opt_checkpoint_profile * out_profile);
+
     // retro delta: training-graph preflight. Requires llama_opt_init.
     enum llama_opt_preflight_check {
         LLAMA_OPT_PREFLIGHT_MISSING_GRAD    = 0, // op has no gradient rule in ggml (dev is NULL)

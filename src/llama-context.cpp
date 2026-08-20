@@ -5512,6 +5512,20 @@ void llama_opt_get_memory(
     *out_memory = ctx->opt_memory_get();
 }
 
+// retro delta
+bool llama_opt_get_checkpoint_profile(
+        const struct llama_context * ctx,
+        struct ggml_opt_checkpoint_profile * out_profile) {
+    if (!out_profile) {
+        return false;
+    }
+    memset(out_profile, 0, sizeof(*out_profile));
+    if (!ctx || !ctx->opt_context()) {
+        return false;
+    }
+    return ggml_opt_get_checkpoint_profile(ctx->opt_context(), out_profile);
+}
+
 //
 // ext
 //

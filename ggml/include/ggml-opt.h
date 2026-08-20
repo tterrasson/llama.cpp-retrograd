@@ -268,6 +268,48 @@ extern "C" {
         ggml_opt_context_t opt_ctx,
         enum ggml_type     type);
 
+    // retro delta: what the retained checkpoints actually cost, and for how long.
+    //
+    // The two questions activation offloading has to answer before a single copy
+    // is written (docs/OPTIM_V3.md §7, O7 plan step 1): how many bytes the
+    // checkpoints hold against the device peak, and whether any of them are held
+    // long enough for a host round-trip to hide behind compute. Neither is
+    // answerable from the checkpoint list alone — the list has shapes, not
+    // lifetimes — so this walks the built backward graph.
+    //
+    // Spans are measured in node indices of that graph, from the node that
+    // produces a checkpoint to the last node that reads it. A node index is not a
+    // duration: nodes differ by orders of magnitude in cost, and turning a span
+    // into seconds would need a per-node timing whose fixed cost exceeds most
+    // nodes. It is a position, and that is all it is read as — the ordering of
+    // "which checkpoints are held longest" is what plan step 4 needs, and it
+    // survives the units it is not measured in.
+    //
+    // A narrowed checkpoint (see above) is held as its 16-bit copy, and the bytes
+    // reported are that copy's: the whole chain — the F32 tensor, its store and
+    // its fetch — is followed, so the figure is what is retained, not what the
+    // forward built.
+    struct ggml_opt_checkpoint_profile {
+        int64_t n_checkpoints;
+        int64_t n_nodes;           // graph length the spans below are positions in
+        size_t  retained_bytes;    // summed over checkpoints, as held
+        size_t  live_peak_bytes;   // most bytes held simultaneously
+        int64_t live_peak_count;   // checkpoints alive at that point
+        int64_t live_peak_node;    // where it occurs
+        size_t  long_lived_bytes;  // bytes of checkpoints spanning >= half the graph
+        int64_t n_long_lived;
+        int64_t max_span_nodes;
+        int64_t total_span_nodes;  // divide by n_checkpoints for the mean span
+    };
+
+    // Fills `out_profile` from the last backward graph built by ggml_opt_alloc.
+    // False (and a zeroed profile) when checkpointing is off or no backward graph
+    // has been built yet — the two cases where there is nothing to report, as
+    // opposed to a measured nothing.
+    GGML_API bool ggml_opt_get_checkpoint_profile(
+        ggml_opt_context_t opt_ctx,
+        struct ggml_opt_checkpoint_profile * out_profile);
+
     // allocate the next graph for evaluation, either forward or forward + backward
     // must be called exactly once prior to calling ggml_opt_eval
     GGML_API void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward);
