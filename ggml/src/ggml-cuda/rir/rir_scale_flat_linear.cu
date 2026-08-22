@@ -5,7 +5,7 @@
 #include <cstring>
 #include "../../ggml-rir/rir_kernel_params.h"
 
-// Componentwise register vectors (docs/CUDA_v1.md §5.1). CUDA's own `float4`
+// Componentwise register vectors. CUDA's own `float4`
 // carries no arithmetic, so the operators the two other backends get from their
 // shading language are spelled out once, here, for any width.
 template <int N> struct rir_vf { float c[N]; };

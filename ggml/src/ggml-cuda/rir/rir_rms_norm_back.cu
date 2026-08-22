@@ -5,7 +5,7 @@
 #include <cstring>
 #include "../../ggml-rir/rir_kernel_params.h"
 
-// Warp collectives (docs/CUDA_v1.md §3.4, §C5). A butterfly over the 32 lanes
+// Warp collectives. A butterfly over the 32 lanes
 // of a warp: same topology as `subgroupAdd`/`simd_sum`, so every lane ends with
 // the complete result and the accumulation order matches theirs.
 __device__ __forceinline__ float rir_lane_sum(float v) {

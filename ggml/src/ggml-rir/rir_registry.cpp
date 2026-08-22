@@ -1709,17 +1709,17 @@ const rir_op_policy rir_op_policies[] = {
     {"GGML_OP_UNARY", RIR_BACKEND_VULKAN, RIR_POLICY_PREFER_GENERATED, 8196, 0},
     {"GGML_OP_UNARY", RIR_BACKEND_METAL, RIR_POLICY_PREFER_GENERATED, 8196, 0},
     {"GGML_OP_UNARY", RIR_BACKEND_CPU, RIR_POLICY_NATIVE_ONLY, 8196, 0},
-    // GGML_OP_ADD native kernel retained — selected exception: the native strip serves four paths a RIR kernel cannot express — one node, one dispatch: fused ADD chains, RMS_NORM+MUL+ADD fusion, Metal snake fusion, and do_add_rms_partials on Vulkan, which is a correctness path. On Metal there is also no kernel to remove: one pattern serves ADD/SUB/MUL/DIV and ACC. Deliberate native exception, not a missed removal (docs/FUTURE_V1.md §16)
+    // GGML_OP_ADD native kernel retained — selected exception: the native strip serves four paths a RIR kernel cannot express — one node, one dispatch: fused ADD chains, RMS_NORM+MUL+ADD fusion, Metal snake fusion, and do_add_rms_partials on Vulkan, which is a correctness path. On Metal there is also no kernel to remove: one pattern serves ADD/SUB/MUL/DIV and ACC. Deliberate native exception, not a missed removal
     {"GGML_OP_ADD", RIR_BACKEND_CUDA, RIR_POLICY_OBSERVE_GENERATED, 0, 0},
     {"GGML_OP_ADD", RIR_BACKEND_VULKAN, RIR_POLICY_PREFER_GENERATED, 0, 0},
     {"GGML_OP_ADD", RIR_BACKEND_METAL, RIR_POLICY_PREFER_GENERATED, 0, 0},
     {"GGML_OP_ADD", RIR_BACKEND_CPU, RIR_POLICY_NATIVE_ONLY, 0, 0},
-    // GGML_OP_MUL native kernel retained — selected exception: the native strip serves four paths a RIR kernel cannot express — one node, one dispatch: fused ADD chains, RMS_NORM+MUL+ADD fusion, Metal snake fusion, and do_add_rms_partials on Vulkan, which is a correctness path. On Metal there is also no kernel to remove: one pattern serves ADD/SUB/MUL/DIV and ACC. Deliberate native exception, not a missed removal (docs/FUTURE_V1.md §16)
+    // GGML_OP_MUL native kernel retained — selected exception: the native strip serves four paths a RIR kernel cannot express — one node, one dispatch: fused ADD chains, RMS_NORM+MUL+ADD fusion, Metal snake fusion, and do_add_rms_partials on Vulkan, which is a correctness path. On Metal there is also no kernel to remove: one pattern serves ADD/SUB/MUL/DIV and ACC. Deliberate native exception, not a missed removal
     {"GGML_OP_MUL", RIR_BACKEND_CUDA, RIR_POLICY_OBSERVE_GENERATED, 0, 0},
     {"GGML_OP_MUL", RIR_BACKEND_VULKAN, RIR_POLICY_PREFER_GENERATED, 0, 0},
     {"GGML_OP_MUL", RIR_BACKEND_METAL, RIR_POLICY_PREFER_GENERATED, 0, 0},
     {"GGML_OP_MUL", RIR_BACKEND_CPU, RIR_POLICY_NATIVE_ONLY, 0, 0},
-    // GGML_OP_SCALE outside domain — dtype: F16: both native GPU kernels accept it, ggml_compute_forward_scale does not — an F16 member would be a variant no benchmark can judge (docs/FUTURE_V1.md §8)
+    // GGML_OP_SCALE outside domain — dtype: F16: both native GPU kernels accept it, ggml_compute_forward_scale does not — an F16 member would be a variant no benchmark can judge
     {"GGML_OP_SCALE", RIR_BACKEND_CUDA, RIR_POLICY_PREFER_GENERATED, 4, 0},
     {"GGML_OP_SCALE", RIR_BACKEND_VULKAN, RIR_POLICY_PREFER_GENERATED, 4, 0},
     {"GGML_OP_SCALE", RIR_BACKEND_METAL, RIR_POLICY_PREFER_GENERATED, 4, 0},

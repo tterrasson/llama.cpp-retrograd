@@ -6,7 +6,7 @@
 #include <cuda_fp16.h>
 #include "../../ggml-rir/rir_kernel_params.h"
 
-// Componentwise register vectors (docs/CUDA_v1.md §5.1). CUDA's own `float4`
+// Componentwise register vectors. CUDA's own `float4`
 // carries no arithmetic, so the operators the two other backends get from their
 // shading language are spelled out once, here, for any width.
 template <int N> struct rir_vf { float c[N]; };
@@ -86,9 +86,9 @@ rir_vf<N> rir_vselect(rir_vf<N> f, rir_vf<N> t, rir_vb<N> c) {
     return r;
 }
 
-// Magic-number division (docs/CUDA_v1.md §C1.5): the divisor's reciprocal is
-// precomputed host side and passed in the constant buffer, so the decomposition
-// of a flattened index costs a multiply-high instead of an integer division.
+// Magic-number division: the divisor's reciprocal is precomputed host side
+// and passed in the constant buffer, so the decomposition of a flattened
+// index costs a multiply-high instead of an integer division.
 __device__ __forceinline__ uint32_t rir_fastdiv(uint32_t n, uint32_t mp, uint32_t sh) {
     return (__umulhi(n, mp) + n) >> sh;
 }
