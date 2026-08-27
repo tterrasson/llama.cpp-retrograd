@@ -134,7 +134,12 @@ int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_wi
     X(UPSCALE,         upscale)        \
     X(ARGSORT,         argsort)        \
     X(POOL,            pool)           \
-    X(MISC,            misc)
+    X(MISC,            misc)           \
+    X(RETRO,           retro)          \
+    X(RIR,             rir)
+// retro delta: the two fork-owned kernel libraries. Their sources are in
+// CMakeLists.txt's METALLIB_KERNEL_SOURCES; without a line here their pipelines
+// are unreachable at runtime ("kernel not found in any metal library").
 
 enum ggml_metal_lib_kind {
 #define X(e, s) GGML_METAL_LIB_##e,

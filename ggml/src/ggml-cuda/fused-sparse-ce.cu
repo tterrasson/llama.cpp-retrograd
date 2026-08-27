@@ -285,7 +285,7 @@ static void fused_sparse_ce_lse(
 // log-sum-exp, then the grad_h accumulation), each of them n_embd*tile floats of
 // store-then-load traffic. Metal and Vulkan never pay that -- they read the head
 // through the per-type decoders inside the kernel (see
-// ggml-metal-retro.metal, fused_sparse_ce{,_back}.comp) -- and this is the CUDA
+// kernels/retro.metal, fused_sparse_ce{,_back}.comp) -- and this is the CUDA
 // version of the same thing, over the shared loader table of
 // retro-quant-loader.cuh so no second list of formats appears (O5 points 1-3).
 //
