@@ -681,6 +681,18 @@ extern "C" {
     // Returns true if the model is diffusion-based (like LLaDA, Dream, etc.)
     LLAMA_API bool llama_model_is_diffusion(const struct llama_model * model);
 
+    // retro delta: whether this model's graph can be built on a micro-batch
+    // that mixes several sequences (one prompt group and its branches, or two
+    // independent rows, in the same physical ubatch).
+    //
+    // True for every attention-only model: its history is addressed by sequence
+    // id through the KV mask. For a recurrent or hybrid model it is true only
+    // where the graph reads its per-sequence state by index rather than by the
+    // physical adjacency an equal-sequence split guarantees. A caller that packs
+    // sequences must branch on this rather than on the architecture name; the
+    // packed entry points refuse a model this is false for.
+    LLAMA_API bool llama_model_supports_packed_seq(const struct llama_model * model);
+
     // Returns 0 on success
     LLAMA_API uint32_t llama_model_quantize(
             const char * fname_inp,
@@ -1004,6 +1016,21 @@ extern "C" {
     //   -1 - invalid input batch
     // < -1 - fatal error (processed ubatches will remain in the context's memory)
     LLAMA_API int32_t llama_decode(
+            struct llama_context * ctx,
+              struct llama_batch   batch);
+
+    // retro delta: one forward pass over `batch` without regrouping it.
+    //
+    // llama_decode lets the memory choose the split; a recurrent or hybrid
+    // model regroups the batch into equal-sequence micro-batches, which is the
+    // opposite of what a caller verifying a packed training step needs. This
+    // entry point keeps the caller's physical order — the same split the packed
+    // optimizer step uses — so the two can be compared numerically.
+    //
+    // Only valid when llama_model_supports_packed_seq(model) is true: a model
+    // whose graph needs equal-sequence ubatches is refused with -1 rather than
+    // packed. Returns the same codes as llama_decode.
+    LLAMA_API int32_t llama_decode_packed(
             struct llama_context * ctx,
               struct llama_batch   batch);
 

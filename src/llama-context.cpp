@@ -1879,7 +1879,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
     llama_memory_context_ptr mctx;
 
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+        // retro delta: decode_packed() keeps the caller's physical layout, so
+        // that a packed training step can be verified against the forwards it
+        // stands for. Everything else on this path is shared with decode().
+        mctx = decode_packed_active
+            ? memory->init_batch_packed(*balloc, cparams.n_ubatch)
+            : memory->init_batch(*balloc, cparams.n_ubatch, output_all);
         if (!mctx) {
             return -2;
         }
@@ -2401,6 +2406,42 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         GGML_ASSERT(backend != nullptr);
         ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
     }
+}
+
+// retro delta: the packed split is the only way to hand a graph an ubatch it
+// may not accept, so the two calls to init_batch_packed() are the two places
+// where the capability declared by llm_arch_supports_unequal_seqs() has to be
+// honoured. Checking it here turns a wrong entry in that table into a returned
+// error the caller can fall back from, instead of the GGML_ASSERT the model
+// graph would reach a few frames later.
+bool llama_context::packed_seq_supported(const char * func) const {
+    if (llm_arch_supports_unequal_seqs(model.arch)) {
+        return true;
+    }
+
+    LLAMA_LOG_ERROR("%s: %s requires equal-sequence micro-batches "
+            "(llama_model_supports_packed_seq() is false for this model)\n",
+            func, llm_arch_name(model.arch));
+
+    return false;
+}
+
+// retro delta: decode() with the packed memory split (see llama-context.h).
+//
+// The flag is cleared on every exit, including an exception thrown out of
+// decode(), because a leaked `true` would silently repack every later decode.
+int llama_context::decode_packed(const llama_batch & batch_inp) {
+    if (!packed_seq_supported(__func__)) {
+        return -1;
+    }
+
+    struct packed_scope {
+        bool & flag;
+        explicit packed_scope(bool & f) : flag(f) { flag = true; }
+        ~packed_scope() { flag = false; }
+    } scope(decode_packed_active);
+
+    return decode(batch_inp);
 }
 
 void llama_context::output_reorder() {
@@ -4338,6 +4379,10 @@ bool llama_context::opt_step_packed_sequences(
         uint32_t                 accumulation_steps,
         ggml_opt_epoch_callback  callback) {
     GGML_ASSERT(opt_ctx);
+    if (!packed_seq_supported(__func__)) {
+        return false;
+    }
+
     if (!tokens || !labels_sparse || !label_weights || !positions ||
             !seq_offsets || !seq_ids ||
             n_tokens == 0 || n_tokens != this->n_ubatch() ||
@@ -5370,6 +5415,18 @@ int32_t llama_decode(
     const int ret = ctx->decode(batch);
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
+    }
+
+    return ret;
+}
+
+// retro delta: forward pass over a packed multi-sequence batch (see llama.h).
+int32_t llama_decode_packed(
+        llama_context * ctx,
+          llama_batch   batch) {
+    const int ret = ctx->decode_packed(batch);
+    if (ret != 0 && ret != 1) {
+        LLAMA_LOG_ERROR("%s: failed to decode packed batch, ret = %d\n", __func__, ret);
     }
 
     return ret;
