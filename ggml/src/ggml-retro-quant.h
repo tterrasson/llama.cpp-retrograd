@@ -9,13 +9,8 @@
 // Two training ops read a frozen, quantized tensor directly: OUT_PROD (src0 is
 // the frozen projection whose input gradient we need, dx = out_prod(W, dy)) and
 // FUSED_SPARSE_CE[_BACK] (the frozen output head). Which types each could decode
-// used to be written out by hand ten times - two supports_op cases and two
-// template blocks on Metal, two CREATE_* blocks plus the shader generator on
-// Vulkan, one case on CUDA, two more in the retroback probe ABI. Nothing tied
-// them together, so they drifted: Metal had Q5_0 but not Q4_0, Vulkan had Q4_0
-// but no IQ type, CUDA had every quant but not F16.
-//
-// One row there, one expansion per consumer. Macro-only by design:
+// The supported types are declared in one row and expanded per consumer.
+// Macro-only by design:
 // ggml-metal.metal is a consumer, so this header must stay legal MSL - no
 // #include, no types, no prototypes.
 //

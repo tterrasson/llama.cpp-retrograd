@@ -7,9 +7,8 @@
 #define RIR_REGISTRY_SCHEMA 18
 #define RIR_MAX_BINDINGS 4
 #define RIR_MAX_PARAMS 2
-// Nine and not five since FUTURE V1 §6: a kernel that repeats one operand under
-// another declares four extra axes, one per folded dimension, carrying nothing
-// but the extent the fold divides by.
+// Nine axes cover the four tensor dimensions plus four folded dimensions and
+// one additional axis used by the dispatch contract.
 #define RIR_MAX_AXES 9
 #define RIR_MAX_SHAPE_RULES 2
 
