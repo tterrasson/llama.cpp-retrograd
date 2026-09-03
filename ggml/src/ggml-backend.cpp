@@ -2119,6 +2119,12 @@ bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
         case GGML_OP_CUMSUM:
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
+        // retro delta: both backward ops carry a scratch region that the Metal
+        // get_alloc_size adds on top of ggml_nbytes (extra_tmp). They are only
+        // ever built by the backward pass, which is why a gated-delta-net model
+        // generates fine and aborts here the moment it is trained.
+        case GGML_OP_SSM_SCAN_BACK:
+        case GGML_OP_GATED_DELTA_NET_BACK:
             return true;
         default:
             return false;
