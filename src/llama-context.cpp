@@ -3656,6 +3656,70 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
 // fixed [n_vocab] F32 bias graph input; recognize that pattern too (either ADD
 // operand order) so the fused path stays available. Returns false only when
 // neither shape matches.
+// retro delta (plan DISTILL D6.5): the slice of a top-k label block that
+// belongs to dataset row `idata`. Returns a zeroed block (ids == NULL) when
+// there is no top-k, which every caller reads as "scalar labels".
+static llama_opt_topk_labels llama_opt_topk_row(
+        const llama_opt_topk_labels * topk, int64_t idata, uint32_t n_ctx) {
+    llama_opt_topk_labels row = { nullptr, nullptr, 0 };
+    if (!topk || !topk->ids || !topk->weights || topk->n_topk == 0) {
+        return row;
+    }
+    const size_t base = (size_t) idata*n_ctx*topk->n_topk;
+    row.ids     = topk->ids     + base;
+    row.weights = topk->weights + base;
+    row.n_topk  = topk->n_topk;
+    return row;
+}
+
+// retro delta (plan DISTILL D6.5): one reading of the labels of a position,
+// whether it carries a single target or a sparse target distribution.
+//
+// Without top-k the scalar arrays are read as before (`n_topk` is 1, the id is
+// the sparse label, the weight the position's coefficient). With top-k the ids
+// and the weights come from [n_topk, n_positions] arrays, entry j of position p
+// at p*n_topk + j. Both paths agree bit for bit when n_topk == 1 and the top-k
+// arrays hold the scalar label with weight 1.
+//
+// `active()` is what masks a position, and it is deliberately a property of the
+// *position*: k entries are one term of the loss, not k, so the mean the
+// operator (and ggml_opt_set_loss_active_rows) normalizes by counts positions.
+struct llama_opt_label_view {
+    const llama_token * scalar_ids     = nullptr;
+    const float       * scalar_weights = nullptr;
+    const llama_token * topk_ids       = nullptr;
+    const float       * topk_weights   = nullptr;
+    uint32_t            n_topk         = 1;
+
+    llama_token id(size_t p, uint32_t j) const {
+        return topk_ids ? topk_ids[p*n_topk + j] : scalar_ids[p];
+    }
+    float weight(size_t p, uint32_t j) const {
+        if (topk_weights) {
+            return topk_weights[p*n_topk + j];
+        }
+        return scalar_weights ? scalar_weights[p] : 1.0f;
+    }
+    bool active(size_t p) const {
+        for (uint32_t j = 0; j < n_topk; ++j) {
+            if (id(p, j) >= 0 && weight(p, j) != 0.0f) {
+                return true;
+            }
+        }
+        return false;
+    }
+    // Offsets this view by `p0` positions, so a caller holding a row can hand a
+    // sub-range down without recomputing strides at every use site.
+    llama_opt_label_view offset(size_t p0) const {
+        llama_opt_label_view v = *this;
+        if (v.scalar_ids)     { v.scalar_ids     += p0; }
+        if (v.scalar_weights) { v.scalar_weights += p0; }
+        if (v.topk_ids)       { v.topk_ids       += p0*n_topk; }
+        if (v.topk_weights)   { v.topk_weights   += p0*n_topk; }
+        return v;
+    }
+};
+
 static bool llama_fused_ce_unpack_head(
         struct ggml_tensor *   t_logits,
         struct ggml_tensor * & w,
@@ -4074,8 +4138,10 @@ int32_t llama_context::opt_preflight(llama_opt_preflight_cb callback, void * use
             if (opt_ce_offload_logsoftmax) {
                 llama_fused_ce_release_hidden_output(ce_h);
             }
-            struct ggml_tensor * ce_targets = ggml_new_tensor_1d(ctx_compute_opt, GGML_TYPE_I32, n_outputs);
-            struct ggml_tensor * ce_weights = ggml_new_tensor_1d(ctx_compute_opt, GGML_TYPE_F32, n_outputs);
+            // retro delta (plan DISTILL D6.5): [K, n_tokens]. Validation always
+            // scores one target per position, so K = 1 here.
+            struct ggml_tensor * ce_targets = ggml_new_tensor_2d(ctx_compute_opt, GGML_TYPE_I32, 1, n_outputs);
+            struct ggml_tensor * ce_weights = ggml_new_tensor_2d(ctx_compute_opt, GGML_TYPE_F32, 1, n_outputs);
             ggml_set_input(ce_targets);
             ggml_set_input(ce_weights);
             struct ggml_tensor * fused_loss = ggml_fused_sparse_ce(
@@ -4134,6 +4200,7 @@ void llama_context::opt_epoch_iter(
         const std::vector<llama_token> & tokens,
         const std::vector<llama_token> & labels_sparse,
         const float                    * label_weights,
+        const llama_opt_topk_labels    * topk, // retro delta (DISTILL D6.5)
         uint32_t                         n_evals,
         llama_batch                    & batch,
         ggml_opt_epoch_callback          callback,
@@ -4141,6 +4208,18 @@ void llama_context::opt_epoch_iter(
         int64_t                          idata_in_loop,
         int64_t                          ndata_in_loop,
         int64_t                          t_loop_start) {
+    // retro delta (plan DISTILL D6.5): one reading of the labels for the whole
+    // row, scalar or top-k. `n_topk` is 1 on every path but offline KD.
+    llama_opt_label_view labels;
+    labels.scalar_ids     = labels_sparse.data();
+    labels.scalar_weights = label_weights;
+    if (topk && topk->ids && topk->weights && topk->n_topk >= 1) {
+        labels.topk_ids     = topk->ids;
+        labels.topk_weights = topk->weights;
+        labels.n_topk       = topk->n_topk;
+    }
+    const uint32_t n_topk = labels.n_topk;
+
     GGML_ASSERT(opt_ctx);
     const uint32_t n_ctx    = llama_model_n_ctx_train(&model);
     const uint32_t n_batch  = std::min(this->n_batch(),  n_ctx);
@@ -4253,8 +4332,9 @@ void llama_context::opt_epoch_iter(
                 if (opt_ce_offload_logsoftmax) {
                     llama_fused_ce_release_hidden_output(ce_h);
                 }
-                ce_targets = ggml_new_tensor_1d(ctx_compute_opt, GGML_TYPE_I32, n_outputs);
-                ce_weights = ggml_new_tensor_1d(ctx_compute_opt, GGML_TYPE_F32, n_outputs);
+                // retro delta (plan DISTILL D6.5): [K, n_tokens].
+                ce_targets = ggml_new_tensor_2d(ctx_compute_opt, GGML_TYPE_I32, n_topk, n_outputs);
+                ce_weights = ggml_new_tensor_2d(ctx_compute_opt, GGML_TYPE_F32, n_topk, n_outputs);
                 ggml_set_input(ce_targets);
                 ggml_set_input(ce_weights);
                 ggml_set_name(ce_targets, "ce_targets");
@@ -4280,18 +4360,22 @@ void llama_context::opt_epoch_iter(
 
             res->set_inputs(&ubatch);
             if (opt_fused_ce) {
-                std::vector<int32_t> targets_i32(n_outputs);
-                std::vector<float> weights_f32(n_outputs);
+                // retro delta (plan DISTILL D6.5): k entries per position, laid
+                // out [K, n_tokens] exactly like the tensors above.
+                std::vector<int32_t> targets_i32((size_t) n_outputs*n_topk);
+                std::vector<float> weights_f32((size_t) n_outputs*n_topk);
                 for (uint32_t pos_ubatch = 0; pos_ubatch < n_outputs; ++pos_ubatch) {
                     const uint32_t ilabel = pos_ctx + pos_batch + pos_ubatch;
-                    targets_i32[pos_ubatch] = (int32_t) labels_sparse[ilabel];
-                    weights_f32[pos_ubatch] = label_weights ? label_weights[ilabel] : 1.0f;
+                    for (uint32_t j = 0; j < n_topk; ++j) {
+                        targets_i32[pos_ubatch*n_topk + j] = (int32_t) labels.id(ilabel, j);
+                        weights_f32[pos_ubatch*n_topk + j] = labels.weight(ilabel, j);
+                    }
                 }
                 ggml_backend_tensor_set(ce_targets, targets_i32.data(), 0, ggml_nbytes(ce_targets));
                 ggml_backend_tensor_set(ce_weights, weights_f32.data(), 0, ggml_nbytes(ce_weights));
             } else {
-                struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
-                GGML_ASSERT(labels->ne[1] == n_ubatch);
+                struct ggml_tensor * labels_t = ggml_opt_labels(opt_ctx);
+                GGML_ASSERT(labels_t->ne[1] == n_ubatch);
                 // retro delta: the incremental-clear optimization below only reset
                 // the previously-active one-hot offsets, assuming the backend
                 // buffer stays zeroed between reused allocations. That holds when
@@ -4303,8 +4387,8 @@ void llama_context::opt_epoch_iter(
                 // loss is NaN. Always fully zero the dense labels; a cudaMemset of
                 // the [n_vocab, n_ubatch] tensor is cheap next to the vocab matmul.
                 const bool new_label_storage = true;
-                ggml_set_zero(labels);
-                opt_label_storage = labels->data;
+                ggml_set_zero(labels_t);
+                opt_label_storage = labels_t->data;
 
                 std::vector<size_t> sparse_offsets;
                 std::vector<float> sparse_values;
@@ -4313,6 +4397,15 @@ void llama_context::opt_epoch_iter(
                     sparse_values.resize(sparse_offsets.size(), 0.0f);
                 }
                 opt_active_label_offsets.clear();
+                // retro delta (plan DISTILL D6.5): the offset a position writes
+                // is no longer unique to it, so the linear std::find this loop
+                // used to do over `sparse_offsets` would now run over k times as
+                // many entries, at a quadratic cost. Index the offsets instead.
+                std::unordered_map<size_t, size_t> offset_slots;
+                offset_slots.reserve(sparse_offsets.size() + (size_t) n_ubatch*n_topk);
+                for (size_t i = 0; i < sparse_offsets.size(); ++i) {
+                    offset_slots.emplace(sparse_offsets[i], i);
+                }
                 int32_t n_active_labels = 0;
                 for (uint32_t pos_ubatch = 0; pos_ubatch < n_ubatch; ++pos_ubatch) {
                     const uint32_t ilabel = pos_ctx + pos_batch + pos_ubatch;
@@ -4321,24 +4414,39 @@ void llama_context::opt_epoch_iter(
                     // retro delta: a weighted position scales its one-hot value,
                     // which the generalized cross-entropy backward turns into an
                     // exactly scaled per-token gradient; weight zero masks it.
-                    const float weight = label_weights ? label_weights[ilabel] : 1.0f;
-                    if (labels_sparse[ilabel] >= 0 && weight != 0.0f) {
-                        GGML_ASSERT(labels_sparse[ilabel] < labels->ne[0]);
-                        const size_t offset = (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float);
-                        auto previous = std::find(sparse_offsets.begin(), sparse_offsets.end(), offset);
-                        if (previous == sparse_offsets.end()) {
+                    // retro delta (plan DISTILL D6.5): with k targets the row is
+                    // no longer one-hot but a sparse distribution; the dense
+                    // cross-entropy already reads it as one, so writing k entries
+                    // is the whole of the offline-KD forward on this path.
+                    for (uint32_t j = 0; j < n_topk; ++j) {
+                        const llama_token id     = labels.id(ilabel, j);
+                        const float       weight = labels.weight(ilabel, j);
+                        if (!(id >= 0 && weight != 0.0f)) {
+                            continue;
+                        }
+                        GGML_ASSERT(id < labels_t->ne[0]);
+                        const size_t offset = (pos_ubatch*labels_t->ne[0] + id)*sizeof(float);
+                        auto slot = offset_slots.find(offset);
+                        if (slot == offset_slots.end()) {
+                            offset_slots.emplace(offset, sparse_offsets.size());
                             sparse_offsets.push_back(offset);
                             sparse_values.push_back(weight);
                         } else {
-                            sparse_values[previous - sparse_offsets.begin()] = weight;
+                            sparse_values[slot->second] = weight;
                         }
                         opt_active_label_offsets.push_back(offset);
+                    }
+                    // The mean is over positions: k entries on one position are
+                    // one active row, not k. Getting this wrong divides the loss
+                    // by k without changing anything else, which is exactly the
+                    // kind of scale error a gradient test does not see.
+                    if (labels.active(ilabel)) {
                         ++n_active_labels;
                     }
                 }
-                if (!llama_backend_set_sparse_f32(sched.get(), labels, sparse_offsets, sparse_values)) {
+                if (!llama_backend_set_sparse_f32(sched.get(), labels_t, sparse_offsets, sparse_values)) {
                     for (size_t i = 0; i < sparse_offsets.size(); ++i) {
-                        ggml_backend_tensor_set(labels, &sparse_values[i], sparse_offsets[i], sizeof(float));
+                        ggml_backend_tensor_set(labels_t, &sparse_values[i], sparse_offsets[i], sizeof(float));
                     }
                 }
                 ggml_opt_set_loss_active_rows(opt_ctx, n_active_labels);
@@ -4370,6 +4478,7 @@ bool llama_context::opt_step_packed_sequences(
         const llama_token      * tokens,
         const llama_token      * labels_sparse,
         const float            * label_weights,
+        const llama_opt_topk_labels * topk, // retro delta (DISTILL D6.5)
         const llama_pos        * positions,
         const size_t           * seq_offsets,
         const llama_seq_id     * seq_ids,
@@ -4382,6 +4491,19 @@ bool llama_context::opt_step_packed_sequences(
     if (!packed_seq_supported(__func__)) {
         return false;
     }
+
+    // retro delta (plan DISTILL D6.5): the same reading of the labels the epoch
+    // path uses; `n_topk` is 1 unless the batch carries a sparse teacher
+    // distribution per position.
+    llama_opt_label_view labels;
+    labels.scalar_ids     = labels_sparse;
+    labels.scalar_weights = label_weights;
+    if (topk && topk->ids && topk->weights && topk->n_topk >= 1) {
+        labels.topk_ids     = topk->ids;
+        labels.topk_weights = topk->weights;
+        labels.n_topk       = topk->n_topk;
+    }
+    const uint32_t n_topk = labels.n_topk;
 
     if (!tokens || !labels_sparse || !label_weights || !positions ||
             !seq_offsets || !seq_ids ||
@@ -4519,10 +4641,11 @@ bool llama_context::opt_step_packed_sequences(
                 if (opt_ce_offload_logsoftmax) {
                     llama_fused_ce_release_hidden_output(hidden);
                 }
-                ce_targets = ggml_new_tensor_1d(opt_cached_compute_ctx.get(),
-                        GGML_TYPE_I32, n_tokens);
-                ce_weights = ggml_new_tensor_1d(opt_cached_compute_ctx.get(),
-                        GGML_TYPE_F32, n_tokens);
+                // retro delta (plan DISTILL D6.5): [K, n_tokens].
+                ce_targets = ggml_new_tensor_2d(opt_cached_compute_ctx.get(),
+                        GGML_TYPE_I32, n_topk, n_tokens);
+                ce_weights = ggml_new_tensor_2d(opt_cached_compute_ctx.get(),
+                        GGML_TYPE_F32, n_topk, n_tokens);
                 ggml_set_input(ce_targets);
                 ggml_set_input(ce_weights);
                 ggml_set_name(ce_targets, "ce_targets");
@@ -4576,33 +4699,47 @@ bool llama_context::opt_step_packed_sequences(
                 res->reset();
                 break;
             }
-            std::vector<int32_t> targets_i32(n_tokens);
-            std::vector<float>   weights_f32(n_tokens);
+            // retro delta (plan DISTILL D6.5): [K, n_tokens].
+            std::vector<int32_t> targets_i32((size_t) n_tokens*n_topk);
+            std::vector<float>   weights_f32((size_t) n_tokens*n_topk);
             for (uint32_t i = 0; i < n_tokens; ++i) {
-                targets_i32[i] = (int32_t) labels_sparse[i];
-                weights_f32[i] = label_weights[i];
+                for (uint32_t j = 0; j < n_topk; ++j) {
+                    targets_i32[i*n_topk + j] = (int32_t) labels.id(i, j);
+                    weights_f32[i*n_topk + j] = labels.weight(i, j);
+                }
             }
             ggml_backend_tensor_set(ce_targets, targets_i32.data(), 0, ggml_nbytes(ce_targets));
             ggml_backend_tensor_set(ce_weights, weights_f32.data(), 0, ggml_nbytes(ce_weights));
         } else {
-            struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
-            if (labels->ne[1] != n_tokens) {
+            struct ggml_tensor * labels_t = ggml_opt_labels(opt_ctx);
+            if (labels_t->ne[1] != n_tokens) {
                 LLAMA_LOG_ERROR("%s: optimizer label width %lld != %u\n",
-                        __func__, (long long) labels->ne[1], n_tokens);
+                        __func__, (long long) labels_t->ne[1], n_tokens);
                 ggml_opt_cancel(opt_ctx);
                 ggml_opt_set_graph_cache(opt_ctx, false);
                 opt_cached_compute_ctx.reset();
                 res->reset();
                 break;
             }
-            ggml_set_zero(labels);
+            ggml_set_zero(labels_t);
             std::vector<size_t> sparse_offsets;
             std::vector<float> sparse_values;
+            // retro delta (plan DISTILL D6.5): k entries per position. Unlike the
+            // epoch path this one writes each position exactly once, so the k
+            // entries of a position can only collide with each other; a producer
+            // that emits a vocabulary id twice for the same position is a bug in
+            // the sidecar and the last write wins, as it did before.
+            std::unordered_map<size_t, size_t> offset_slots;
+            offset_slots.reserve((size_t) n_tokens*n_topk);
             int32_t n_active_labels = 0;
             for (uint32_t i = 0; i < n_tokens; ++i) {
-                const float weight = label_weights[i];
-                if (labels_sparse[i] >= 0 && weight != 0.0f) {
-                    if (labels_sparse[i] >= labels->ne[0]) {
+                for (uint32_t j = 0; j < n_topk; ++j) {
+                    const llama_token id     = labels.id(i, j);
+                    const float       weight = labels.weight(i, j);
+                    if (!(id >= 0 && weight != 0.0f)) {
+                        continue;
+                    }
+                    if (id >= labels_t->ne[0]) {
                         ggml_opt_cancel(opt_ctx);
                         ggml_opt_set_graph_cache(opt_ctx, false);
                         opt_cached_compute_ctx.reset();
@@ -4611,17 +4748,25 @@ bool llama_context::opt_step_packed_sequences(
                         memory->clear(true);
                         return false;
                     }
-                    sparse_offsets.push_back(
-                            (i*labels->ne[0] + labels_sparse[i])*sizeof(float));
-                    sparse_values.push_back(weight);
+                    const size_t offset = (i*labels_t->ne[0] + id)*sizeof(float);
+                    auto slot = offset_slots.find(offset);
+                    if (slot == offset_slots.end()) {
+                        offset_slots.emplace(offset, sparse_offsets.size());
+                        sparse_offsets.push_back(offset);
+                        sparse_values.push_back(weight);
+                    } else {
+                        sparse_values[slot->second] = weight;
+                    }
+                }
+                if (labels.active(i)) {
                     ++n_active_labels;
                 }
             }
             if (!llama_backend_set_sparse_f32(
-                    sched.get(), labels, sparse_offsets, sparse_values)) {
+                    sched.get(), labels_t, sparse_offsets, sparse_values)) {
                 for (size_t i = 0; i < sparse_offsets.size(); ++i) {
                     ggml_backend_tensor_set(
-                            labels, &sparse_values[i], sparse_offsets[i], sizeof(float));
+                            labels_t, &sparse_values[i], sparse_offsets[i], sizeof(float));
                 }
             }
             ggml_opt_set_loss_active_rows(opt_ctx, n_active_labels);
@@ -4655,7 +4800,8 @@ void llama_context::opt_epoch(
         int64_t                   idata_split,
         ggml_opt_epoch_callback   callback_train,
         ggml_opt_epoch_callback   callback_eval,
-        const float             * label_weights) {
+        const float             * label_weights,
+        const llama_opt_topk_labels * topk) { // retro delta (DISTILL D6.5)
     // The row-oriented path has position-dependent ubatch graphs. It must not
     // inherit the fixed-width packed graph retained by a preceding GRPO step
     // (mixed callers and fallback geometries are both supported).
@@ -4708,11 +4854,22 @@ void llama_context::opt_epoch(
         row_evals.resize(idata_split);
         uint64_t total = 0;
         for (int64_t i = 0; i < idata_split; ++i) {
-            const int32_t * row_labels  = all_labels    + i*n_ctx;
-            const float   * row_weights = label_weights + i*n_ctx;
+            // retro delta (plan DISTILL D6.5): the last active position of the
+            // row is what bounds the physical passes, and with a sparse teacher
+            // distribution it is the top-k entries, not the scalar labels, that
+            // say which positions are active.
+            llama_opt_label_view row;
+            row.scalar_ids     = all_labels;
+            row.scalar_weights = label_weights;
+            if (topk && topk->ids && topk->weights && topk->n_topk >= 1) {
+                row.topk_ids     = topk->ids;
+                row.topk_weights = topk->weights;
+                row.n_topk       = topk->n_topk;
+            }
+            row = row.offset((size_t) i*n_ctx);
             int64_t last = -1;
             for (uint32_t j = 0; j < n_ctx_train; ++j) {
-                if (row_labels[j] >= 0 && row_weights[j] != 0.0f) {
+                if (row.active(j)) {
                     last = j;
                 }
             }
@@ -4741,8 +4898,10 @@ void llama_context::opt_epoch(
         const int64_t idata_in_loop = idata*ubatch_per_ctx;
 
         ggml_opt_dataset_get_batch_host(dataset, opt_tokens.data(), n_ctx*sizeof(llama_token), opt_labels_sparse.data(), idata);
+        const llama_opt_topk_labels row_topk = llama_opt_topk_row(topk, idata, n_ctx);
         opt_epoch_iter(dataset, result_train, opt_tokens, opt_labels_sparse,
             label_weights ? label_weights + idata*n_ctx : nullptr,
+            row_topk.ids ? &row_topk : nullptr,
             row_evals.empty() ? 0 : row_evals[idata], opt_batch,
             callback_train, train, idata_in_loop, ndata_in_loop, t_loop_start);
     }
@@ -4754,8 +4913,10 @@ void llama_context::opt_epoch(
         const int64_t idata_in_loop = (idata - idata_split)*ubatch_per_ctx;
 
         ggml_opt_dataset_get_batch_host(dataset, opt_tokens.data(), n_ctx*sizeof(llama_token), opt_labels_sparse.data(), idata);
+        const llama_opt_topk_labels row_topk = llama_opt_topk_row(topk, idata, n_ctx);
         opt_epoch_iter(dataset, result_eval, opt_tokens, opt_labels_sparse,
-            label_weights ? label_weights + idata*n_ctx : nullptr, /*n_evals=*/0, opt_batch,
+            label_weights ? label_weights + idata*n_ctx : nullptr,
+            row_topk.ids ? &row_topk : nullptr, /*n_evals=*/0, opt_batch,
             callback_eval, train, idata_in_loop, ndata_in_loop, t_loop_start);
     }
 }
@@ -5519,7 +5680,8 @@ void llama_opt_epoch_weighted(
         int64_t                   idata_split,
         ggml_opt_epoch_callback   callback_train,
         ggml_opt_epoch_callback   callback_eval,
-        const float             * label_weights) {
+        const float             * label_weights,
+        const llama_opt_topk_labels * topk) {
     ctx->opt_epoch(
         dataset,
         result_train,
@@ -5527,7 +5689,8 @@ void llama_opt_epoch_weighted(
         idata_split,
         callback_train,
         callback_eval,
-        label_weights);
+        label_weights,
+        topk);
 }
 
 bool llama_opt_step_packed_sequences(
@@ -5537,6 +5700,7 @@ bool llama_opt_step_packed_sequences(
         const llama_token       * tokens,
         const llama_token       * labels,
         const float             * label_weights,
+        const llama_opt_topk_labels * topk,
         const llama_pos         * positions,
         const size_t            * seq_offsets,
         const llama_seq_id      * seq_ids,
@@ -5546,7 +5710,7 @@ bool llama_opt_step_packed_sequences(
         uint32_t                  accumulation_steps,
         ggml_opt_epoch_callback   callback) {
     return ctx->opt_step_packed_sequences(dataset, result, tokens, labels, label_weights,
-            positions, seq_offsets, seq_ids, n_tokens, n_seq_ids, n_sequences,
+            topk, positions, seq_offsets, seq_ids, n_tokens, n_seq_ids, n_sequences,
             accumulation_steps, callback);
 }
 

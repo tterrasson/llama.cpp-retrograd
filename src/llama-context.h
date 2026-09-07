@@ -232,7 +232,10 @@ struct llama_context {
             int64_t                 idata_split,
             ggml_opt_epoch_callback callback_train,
             ggml_opt_epoch_callback callback_eval,
-            const float           * label_weights = nullptr);
+            const float           * label_weights = nullptr,
+            // retro delta (plan DISTILL D6.5): sparse teacher distribution per
+            // position, nullable = the scalar labels above.
+            const llama_opt_topk_labels * topk = nullptr);
 
     // retro delta: see llama_opt_preflight
     int32_t opt_preflight(llama_opt_preflight_cb callback, void * userdata);
@@ -243,6 +246,7 @@ struct llama_context {
             const std::vector<llama_token> & tokens,
             const std::vector<llama_token> & labels_sparse,
             const float                    * label_weights, // per label position, nullable
+            const llama_opt_topk_labels    * topk,          // retro delta (DISTILL D6.5), nullable
             uint32_t                         n_evals,       // retro delta: physical ubatches to run, 0 = full row
             llama_batch                    & batch,
             ggml_opt_epoch_callback          callback,
@@ -257,6 +261,7 @@ struct llama_context {
             const llama_token      * tokens,
             const llama_token      * labels_sparse,
             const float            * label_weights,
+            const llama_opt_topk_labels * topk, // retro delta (DISTILL D6.5), nullable
             const llama_pos        * positions,
             const size_t           * seq_offsets,
             const llama_seq_id     * seq_ids,

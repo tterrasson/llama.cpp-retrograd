@@ -3034,12 +3034,25 @@ extern "C" {
     // which only bounds the peak when seq_chunk > 0 (with seq_chunk = 0 the staging
     // buffer is the full tensor and nothing is saved). Numerically inert: the
     // result is identical with and without the flag.
+    // retro delta (plan DISTILL D6.5): ceiling on K. Bounds the shared-memory and
+    // register scratch the Vulkan and Metal kernels reserve per position, so it is
+    // part of the operator's contract and not a host-side preference.
+#define GGML_FUSED_SPARSE_CE_K_MAX 32
+
+    // retro delta (plan DISTILL D6.5): `targets` and `weights` are [K, n_tokens],
+    // K sparse targets per position instead of one. The loss a position carries is
+    //   sum_j weights[j,t] * (logsumexp(z[:,t]) - z[targets[j,t],t])
+    // so K = 1 is the previous one-hot objective, bit for bit, and K > 1 is the
+    // same operator against a sparse target *distribution* (offline top-k KD).
+    // An entry with targets < 0 or weights == 0 is skipped; a position all of
+    // whose entries are skipped is inactive and drops out of the mean, which is
+    // taken over active *positions*, never over entries.
     GGML_API struct ggml_tensor * ggml_fused_sparse_ce(
             struct ggml_context * ctx,
             struct ggml_tensor  * h,
             struct ggml_tensor  * w,
-            struct ggml_tensor  * targets,
-            struct ggml_tensor  * weights,
+            struct ggml_tensor  * targets, // [K, n_tokens] I32
+            struct ggml_tensor  * weights, // [K, n_tokens] F32
             struct ggml_tensor  * bias, // may be NULL
             int                   n_tiles,
             int                   seq_chunk,
@@ -3047,7 +3060,8 @@ extern "C" {
 
     // Gradient of ggml_fused_sparse_ce wrt the hidden states `h`.
     //   a       : scalar gradient of the loss result
-    //   h, w, targets, weights, bias : the forward inputs (bias may be NULL)
+    //   h, w, targets, weights, bias : the forward inputs (bias may be NULL);
+    //     targets / weights are [K, n_tokens] exactly as in the forward
     // Result has the shape of `h`. seq_chunk / offload_h have the same meaning as
     // above; offload_h is what makes this node eligible for in-place allocation
     // over `h`.
@@ -3056,8 +3070,8 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * h,
             struct ggml_tensor  * w,
-            struct ggml_tensor  * targets,
-            struct ggml_tensor  * weights,
+            struct ggml_tensor  * targets, // [K, n_tokens] I32
+            struct ggml_tensor  * weights, // [K, n_tokens] F32
             struct ggml_tensor  * bias, // may be NULL
             int                   n_tiles,
             int                   seq_chunk,

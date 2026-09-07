@@ -1498,6 +1498,9 @@ typedef struct {
     int32_t  n_tokens;
     int32_t  n_vocab;
     int32_t  has_bias;
+    // retro delta (plan DISTILL D6.5): sparse targets per position, ne[0] of the
+    // targets/weights tensors. 1 is the one-hot objective.
+    int32_t  n_topk;
     uint64_t nb_h;
     uint64_t nb_w;
     uint64_t nb_d;

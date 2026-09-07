@@ -1563,17 +1563,33 @@ static float fsce_w_dot_h(
 
 // Active tokens: a real target with a non-zero coefficient. Same predicate as
 // the CPU reference, evaluated on device because the targets only exist there.
+// retro delta (plan DISTILL D6.5): a position is active when any of its n_topk
+// entries names a real vocabulary row with a non-zero coefficient, and counts
+// once however many of them do.
+static bool fsce_position_active(
+        device const int   * targets,
+        device const float * weights,
+        int t, int n_topk, int n_vocab) {
+    for (int j = 0; j < n_topk; ++j) {
+        const int tgt = targets[t*n_topk + j];
+        if (tgt >= 0 && tgt < n_vocab && weights[t*n_topk + j] != 0.0f) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int fsce_count_active(
         device const int   * targets,
         device const float * weights,
         int n_tokens,
+        int n_topk,
         int n_vocab,
         threadgroup float * sh,
         ushort tpitg, ushort sgitg, ushort tiisg, ushort ntg) {
     float local = 0.0f;
     for (int i = tpitg; i < n_tokens; i += ntg) {
-        const int tgt = targets[i];
-        if (tgt >= 0 && tgt < n_vocab && weights[i] != 0.0f) {
+        if (fsce_position_active(targets, weights, i, n_topk, n_vocab)) {
             local += 1.0f;
         }
     }
@@ -1600,12 +1616,11 @@ kernel void kernel_fused_sparse_ce(
 
     // Uniform across the threadgroup (it depends on the token only), so the
     // reductions below can never be reached by some threads and not others.
+    const int n_topk = max(args.n_topk, 1);
     const int n_active = fsce_count_active(
-            targets, weights, args.n_tokens, args.n_vocab, sh, tpitg.x, sgitg, tiisg, ntg.x);
+            targets, weights, args.n_tokens, n_topk, args.n_vocab, sh, tpitg.x, sgitg, tiisg, ntg.x);
 
-    const int   tgt = targets[t];
-    const float wgt = weights[t];
-    if (!(tgt >= 0 && tgt < args.n_vocab && wgt != 0.0f) || n_active == 0) {
+    if (!fsce_position_active(targets, weights, t, n_topk, args.n_vocab) || n_active == 0) {
         return;
     }
 
@@ -1614,7 +1629,6 @@ kernel void kernel_fused_sparse_ce(
 
     float lmax = -INFINITY;
     float lsum = 0.0f;
-    float ztgt = 0.0f;
     for (int v = tpitg.x; v < args.n_vocab; v += ntg.x) {
         float z = fsce_w_dot_h<block_q, nl, dequantize_func>(w, h_col, args.nb_w, v, n_chunks);
         if (args.has_bias) {
@@ -1626,9 +1640,6 @@ kernel void kernel_fused_sparse_ce(
         } else {
             lsum += exp(z - lmax);
         }
-        if (v == tgt) {
-            ztgt = z;
-        }
     }
 
     // Merge the partial online log-sum-exps: rescale every thread's sum to the
@@ -1636,12 +1647,30 @@ kernel void kernel_fused_sparse_ce(
     // contributes lsum = 0, and exp(-inf - max) = 0, so it stays neutral.
     const float lmax_all = retro_tg_max(lmax, sh, sgitg, tiisg, ntg.x);
     const float lsum_all = retro_tg_sum(lsum*exp(lmax - lmax_all), sh, sgitg, tiisg, ntg.x);
-    // Exactly one thread saw the target row, so a sum broadcasts its value.
-    const float ztgt_all = retro_tg_sum(ztgt, sh, sgitg, tiisg, ntg.x);
+    const float lse = lmax_all + log(lsum_all);
+
+    // retro delta (plan DISTILL D6.5): the k target logits are recomputed here
+    // rather than captured in the sweep above - k dot products next to n_vocab
+    // of them - and the whole contribution is reduced in one sum. The K = 1
+    // term is then the previous wgt*(lse - ztgt) bit for bit, since summing a
+    // single non-zero over zeros is exact.
+    float contrib = 0.0f;
+    for (int j = tpitg.x; j < n_topk; j += ntg.x) {
+        const int   tgt = targets[t*n_topk + j];
+        const float wgt = weights[t*n_topk + j];
+        if (!(tgt >= 0 && tgt < args.n_vocab && wgt != 0.0f)) {
+            continue;
+        }
+        float z = fsce_w_dot_h<block_q, nl, dequantize_func>(w, h_col, args.nb_w, tgt, n_chunks);
+        if (args.has_bias) {
+            z += bias[tgt];
+        }
+        contrib += wgt*(lse - z);
+    }
+    const float contrib_all = retro_tg_sum(contrib, sh, sgitg, tiisg, ntg.x);
 
     if (tpitg.x == 0) {
-        const float lse = lmax_all + log(lsum_all);
-        atomic_fetch_add_explicit(dst, wgt*(lse - ztgt_all)/(float) n_active, memory_order_relaxed);
+        atomic_fetch_add_explicit(dst, contrib_all/(float) n_active, memory_order_relaxed);
     }
 }
 
@@ -1666,14 +1695,13 @@ kernel void kernel_fused_sparse_ce_back(
     const int t = tgpig.x;
     const int n_chunks = args.n_embd/16;
 
+    const int n_topk = max(args.n_topk, 1);
     const int n_active = fsce_count_active(
-            targets, weights, args.n_tokens, args.n_vocab, sh, tpitg.x, sgitg, tiisg, ntg.x);
+            targets, weights, args.n_tokens, n_topk, args.n_vocab, sh, tpitg.x, sgitg, tiisg, ntg.x);
 
-    const int   tgt = targets[t];
-    const float wgt = weights[t];
     device float * dst_col = (device float *)(dst + (size_t) t*args.nb_d);
 
-    if (!(tgt >= 0 && tgt < args.n_vocab && wgt != 0.0f) || n_active == 0) {
+    if (!fsce_position_active(targets, weights, t, n_topk, args.n_vocab) || n_active == 0) {
         for (int e = tpitg.x; e < args.n_embd; e += ntg.x) {
             dst_col[e] = 0.0f;
         }
@@ -1750,15 +1778,35 @@ kernel void kernel_fused_sparse_ce_back(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    const float coef = grad[0]*wgt/(float) n_active;
-    short k = 0;
-    for (int c = tpitg.x; c < n_chunks; c += ntg.x, ++k) {
-        float4x4 wt;
-        dequantize_func(
-                (device const block_q *)(w + (size_t) tgt*args.nb_w) + c/nl, (short) (c%nl), wt);
-        device float4 * d = (device float4 *)(dst_col + c*16);
-        for (short r = 0; r < 4; ++r) {
-            d[r] = coef*(acc[k][r] - wt[r]);
+    // retro delta (plan DISTILL D6.5): grad_h = sum_j coef_j*(acc - w[:,tgt_j]).
+    // Written as a sum of the previous per-target expression, not as
+    // (sum_j coef_j)*acc - sum_j coef_j*w_j, so a K = 1 position reproduces the
+    // one-hot gradient element for element.
+    {
+        short k = 0;
+        for (int c = tpitg.x; c < n_chunks; c += ntg.x, ++k) {
+            device float4 * d = (device float4 *)(dst_col + c*16);
+            for (short r = 0; r < 4; ++r) {
+                d[r] = 0.0f;
+            }
+        }
+    }
+    for (int j = 0; j < n_topk; ++j) {
+        const int   tgt = targets[t*n_topk + j];
+        const float wgt = weights[t*n_topk + j];
+        if (!(tgt >= 0 && tgt < args.n_vocab && wgt != 0.0f)) {
+            continue;
+        }
+        const float coef = grad[0]*wgt/(float) n_active;
+        short k = 0;
+        for (int c = tpitg.x; c < n_chunks; c += ntg.x, ++k) {
+            float4x4 wt;
+            dequantize_func(
+                    (device const block_q *)(w + (size_t) tgt*args.nb_w) + c/nl, (short) (c%nl), wt);
+            device float4 * d = (device float4 *)(dst_col + c*16);
+            for (short r = 0; r < 4; ++r) {
+                d[r] += coef*(acc[k][r] - wt[r]);
+            }
         }
     }
 }

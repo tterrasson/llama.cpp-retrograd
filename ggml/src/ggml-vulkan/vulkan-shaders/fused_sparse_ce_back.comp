@@ -13,7 +13,9 @@
 // weights are computed thread-per-vocab into shared memory, then consumed by
 // walking the column so every accumulation stays in F32 registers with no
 // shared-memory atomics. Finally
-// grad_h[:,t] = (grad * weight_t / n_active) * (acc[:,t] - w[:,target_t]).
+// grad_h[:,t] = sum_j (grad * weight[j,t] / n_active) * (acc[:,t] - w[:,target[j,t]]),
+// which for k = 1 is the one-hot gradient this operator started as (retro delta,
+// plan DISTILL D6.5).
 //
 // Both passes are bound by decoding the head, so both are organised around the
 // unit dequantize() actually returns -- a *pair* of weights -- rather than
@@ -70,6 +72,7 @@ layout(push_constant) uniform parameter {
     uint d_stride;
     uint has_bias; // retro delta: the optional per-vocab bias of the head
     uint n_tok;    // tokens per workgroup, 1..TOK_MAX
+    uint n_topk;   // retro delta (plan DISTILL D6.5): sparse targets per position
 } p;
 
 layout(binding = 0) readonly  buffer Grd {float data_grad[];};
@@ -194,18 +197,23 @@ void main() {
     const uint lid      = gl_LocalInvocationID.x;
     const uint n_active = data_count[0];
 
-    int   tgt[TOK_MAX];
-    float wgt[TOK_MAX];
-    uint  n_act = 0;
+    // retro delta (plan DISTILL D6.5): only the per-position activity is held in
+    // registers - k targets and k weights per token would not fit, and the write
+    // loop below re-reads the entries it needs anyway.
+    const uint n_topk = max(p.n_topk, 1u);
+    bool act[TOK_MAX];
+    uint n_act = 0;
     [[unroll]] for (uint tl = 0; tl < TOK_MAX; ++tl) {
-        tgt[tl] = -1;
-        wgt[tl] = 0.0f;
+        act[tl] = false;
         if (tl < n_here) {
-            const int   g = data_tgt[g_t_base + tl];
-            const float w = data_wgt[g_t_base + tl];
-            if (g >= 0 && uint(g) < p.n_vocab && w != 0.0f && n_active > 0u) {
-                tgt[tl] = g;
-                wgt[tl] = w;
+            for (uint j = 0; j < n_topk; ++j) {
+                const int   g = data_tgt[(g_t_base + tl) * n_topk + j];
+                const float w = data_wgt[(g_t_base + tl) * n_topk + j];
+                if (g >= 0 && uint(g) < p.n_vocab && w != 0.0f && n_active > 0u) {
+                    act[tl] = true;
+                }
+            }
+            if (act[tl]) {
                 n_act++;
             } else {
                 // An inactive token still owns its slice of grad_h.
@@ -231,7 +239,7 @@ void main() {
     for (uint v = lid; v < p.n_vocab; v += WG) {
         column_dots(v, n_here, z);
         [[unroll]] for (uint tl = 0; tl < TOK_MAX; ++tl) {
-            if (tl < n_here && wgt[tl] != 0.0f) {
+            if (tl < n_here && act[tl]) {
                 const float zz = z[tl];
                 if (zz > lmax[tl]) {
                     lsum[tl] = lsum[tl] * exp(lmax[tl] - zz) + 1.0f;
@@ -298,7 +306,7 @@ void main() {
             if (lid >= sub && lid < sub + VSUB) {
                 [[unroll]] for (uint tl = 0; tl < TOK_MAX; ++tl) {
                     if (tl < n_here) {
-                        sh_p[tl * VSUB + (lid - sub)] = (v < p.n_vocab && wgt[tl] != 0.0f)
+                        sh_p[tl * VSUB + (lid - sub)] = (v < p.n_vocab && act[tl])
                                 ? exp(zc[tl] - sh_lse[tl]) : 0.0f;
                     }
                 }
@@ -323,14 +331,24 @@ void main() {
 
     const float g = data_grad[0];
     [[unroll]] for (uint tl = 0; tl < TOK_MAX; ++tl) {
-        if (tl < n_here && wgt[tl] != 0.0f) {
-            const float coef  = g * wgt[tl] / float(n_active);
-            const uint  d_off = (g_t_base + tl) * p.d_stride;
+        if (tl < n_here && act[tl]) {
+            const uint d_off = (g_t_base + tl) * p.d_stride;
             uint k = 0;
             for (uint pidx = lid; pidx < n_pairs; pidx += WG, ++k) {
-                const vec2  wt  = w_pair(uint(tgt[tl]), pidx);
-                const uvec2 e   = pair_positions(pidx);
-                const vec2  val = coef * (acc[tl * npt + k] - wt);
+                const uvec2 e = pair_positions(pidx);
+                // Accumulated in a register and written once: data_dst is a
+                // writeonly binding, so a zero-then-add pass over it is not
+                // available - and would be a second traversal of grad_h anyway.
+                vec2 val = vec2(0.0f);
+                for (uint j = 0; j < n_topk; ++j) {
+                    const int   tgt = data_tgt[(g_t_base + tl) * n_topk + j];
+                    const float wgt = data_wgt[(g_t_base + tl) * n_topk + j];
+                    if (!(tgt >= 0 && uint(tgt) < p.n_vocab && wgt != 0.0f)) {
+                        continue;
+                    }
+                    const float coef = g * wgt / float(n_active);
+                    val += coef * (acc[tl * npt + k] - w_pair(uint(tgt), pidx));
+                }
                 data_dst[d_off + e.x] = val.x;
                 data_dst[d_off + e.y] = val.y;
             }

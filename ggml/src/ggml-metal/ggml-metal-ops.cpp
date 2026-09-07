@@ -6497,6 +6497,7 @@ int ggml_metal_op_fused_sparse_ce(ggml_metal_op_t ctx, int idx) {
         /*.n_tokens =*/ (int32_t) h->ne[1],
         /*.n_vocab  =*/ (int32_t) w->ne[1],
         /*.has_bias =*/ bias ? 1 : 0,
+        /*.n_topk   =*/ (int32_t) op->src[2]->ne[0], // retro delta (DISTILL D6.5)
         /*.nb_h     =*/ h->nb[1],
         /*.nb_w     =*/ w->nb[1],
         /*.nb_d     =*/ 0,
@@ -6538,6 +6539,7 @@ int ggml_metal_op_fused_sparse_ce_back(ggml_metal_op_t ctx, int idx) {
         /*.n_tokens =*/ (int32_t) h->ne[1],
         /*.n_vocab  =*/ (int32_t) w->ne[1],
         /*.has_bias =*/ bias ? 1 : 0,
+        /*.n_topk   =*/ (int32_t) op->src[3]->ne[0], // retro delta (DISTILL D6.5)
         /*.nb_h     =*/ h->nb[1],
         /*.nb_w     =*/ w->nb[1],
         /*.nb_d     =*/ op->nb[1],

@@ -1721,6 +1721,24 @@ extern "C" {
     // state (iteration counter, AdamW momenta, RNG) through the ggml-opt API.
     LLAMA_API ggml_opt_context_t llama_opt_context(struct llama_context * lctx);
 
+    // retro delta (plan DISTILL D6.5): a sparse target *distribution* per
+    // position, for offline top-k knowledge distillation. `ids` and `weights`
+    // are laid out [n_topk, n_positions]: entry j of position p is at
+    // p*n_topk + j. An entry with a negative id or a zero weight is skipped, and
+    // a position all of whose entries are skipped is masked exactly as a
+    // negative scalar label masks one. The weights are the teacher's
+    // renormalized probabilities, already scaled by whatever coefficient the
+    // position carries.
+    //
+    // Passing NULL (or ids/weights NULL) keeps the scalar labels of the call,
+    // and the run is then bit for bit the one that ran before this existed.
+    // n_topk must not exceed GGML_FUSED_SPARSE_CE_K_MAX.
+    typedef struct llama_opt_topk_labels {
+        const llama_token * ids;
+        const float       * weights;
+        uint32_t            n_topk;
+    } llama_opt_topk_labels;
+
     LLAMA_API void llama_opt_epoch(
             struct llama_context    * lctx,
             ggml_opt_dataset_t        dataset,
@@ -1744,7 +1762,8 @@ extern "C" {
             int64_t                   idata_split,
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval,
-            const float             * label_weights);
+            const float             * label_weights,
+            const struct llama_opt_topk_labels * topk);
 
     // retro delta: one differentiable packed multi-sequence training graph.
     // Sequence membership is CSR, allowing several independent prompt groups
@@ -1756,6 +1775,7 @@ extern "C" {
             const llama_token       * tokens,
             const llama_token       * labels,
             const float             * label_weights,
+            const struct llama_opt_topk_labels * topk,
             const llama_pos         * positions,
             const size_t            * seq_offsets,
             const llama_seq_id      * seq_ids,
