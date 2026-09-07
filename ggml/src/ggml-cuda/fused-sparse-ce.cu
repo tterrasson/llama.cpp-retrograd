@@ -20,21 +20,40 @@
 // participates in the softmax exactly like the CPU oracle. The bias never
 // receives a gradient, so the grad_h GEMMs are untouched.
 
+// retro delta (plan DISTILL D6.5): a position carries n_topk sparse targets
+// ([K, n_tokens] column-major), is active when any of them names a real
+// vocabulary row with a non-zero coefficient, and counts once when it does.
+static __device__ __forceinline__ bool fused_sparse_ce_active(
+        const int32_t * targets, const float * weights,
+        int64_t t, int64_t n_topk, int64_t n_vocab) {
+    for (int64_t j = 0; j < n_topk; ++j) {
+        const int32_t v = targets[t*n_topk + j];
+        if (v >= 0 && v < n_vocab && weights[t*n_topk + j] != 0.0f) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static __global__ void fused_sparse_ce_count_active(
         const int32_t * targets, const float * weights, int32_t * n_active,
-        int64_t n_tokens, int64_t n_vocab) {
+        int64_t n_tokens, int64_t n_topk, int64_t n_vocab) {
     const int64_t t = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
-    if (t < n_tokens && targets[t] >= 0 && targets[t] < n_vocab && weights[t] != 0.0f) {
+    if (t < n_tokens && fused_sparse_ce_active(targets, weights, t, n_topk, n_vocab)) {
         atomicAdd(n_active, 1);
     }
 }
 
-static __global__ void fused_sparse_ce_init(float * maxima, float * sums, float * target_logits, int64_t n_tokens) {
+static __global__ void fused_sparse_ce_init(
+        float * maxima, float * sums, float * target_logits,
+        int64_t n_tokens, int64_t n_topk) {
     const int64_t t = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
     if (t < n_tokens) {
         maxima[t] = -INFINITY;
         sums[t] = 0.0f;
-        target_logits[t] = 0.0f;
+        for (int64_t j = 0; j < n_topk; ++j) {
+            target_logits[t*n_topk + j] = 0.0f;
+        }
     }
 }
 
@@ -58,7 +77,8 @@ static __global__ void fused_sparse_ce_add_bias(
 static __global__ void fused_sparse_ce_update_lse(
         const float * logits, const int32_t * targets, float * maxima,
         float * sums, float * target_logits, int64_t tile_start,
-        int64_t tile_size, int64_t tile_stride, int64_t t0_tok, int64_t nt_tok) {
+        int64_t tile_size, int64_t tile_stride, int64_t t0_tok, int64_t nt_tok,
+        int64_t n_topk) {
     const int64_t lt = blockIdx.x;
     if (lt >= nt_tok || threadIdx.x != 0) {
         return;
@@ -76,9 +96,11 @@ static __global__ void fused_sparse_ce_update_lse(
             running_sum += expf(z - running_max);
         }
     }
-    const int64_t target = targets[t];
-    if (target >= tile_start && target < tile_start + tile_size) {
-        target_logits[t] = column[target - tile_start];
+    for (int64_t j = 0; j < n_topk; ++j) {
+        const int64_t target = targets[t*n_topk + j];
+        if (target >= tile_start && target < tile_start + tile_size) {
+            target_logits[t*n_topk + j] = column[target - tile_start];
+        }
     }
     maxima[t] = running_max;
     sums[t] = running_sum;
@@ -87,22 +109,35 @@ static __global__ void fused_sparse_ce_update_lse(
 static __global__ void fused_sparse_ce_finish_loss(
         const int32_t * targets, const float * weights, const int32_t * n_active,
         const float * maxima, const float * sums, const float * target_logits,
-        float * losses, int64_t n_tokens, int64_t n_vocab) {
+        float * losses, int64_t n_tokens, int64_t n_topk, int64_t n_vocab) {
     const int64_t t = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
     if (t >= n_tokens) {
         return;
     }
-    const bool active = targets[t] >= 0 && targets[t] < n_vocab && weights[t] != 0.0f && *n_active > 0;
-    losses[t] = active
-        ? weights[t]*(maxima[t] + logf(sums[t]) - target_logits[t])/(float) *n_active
-        : 0.0f;
+    if (!fused_sparse_ce_active(targets, weights, t, n_topk, n_vocab) || *n_active <= 0) {
+        losses[t] = 0.0f;
+        return;
+    }
+    // retro delta (plan DISTILL D6.5): sum_j w_j*(lse - z_j), accumulated in the
+    // per-entry form so the single term of a K = 1 position is the previous
+    // expression bit for bit.
+    const float lse = maxima[t] + logf(sums[t]);
+    float contrib = 0.0f;
+    for (int64_t j = 0; j < n_topk; ++j) {
+        const int32_t v = targets[t*n_topk + j];
+        const float   c = weights[t*n_topk + j];
+        if (v >= 0 && v < n_vocab && c != 0.0f) {
+            contrib += c*(lse - target_logits[t*n_topk + j]);
+        }
+    }
+    losses[t] = contrib/(float) *n_active;
 }
 
 static __global__ void fused_sparse_ce_make_probs(
         float * logits, const float * grad, const int32_t * targets,
         const float * weights, const int32_t * n_active, const float * maxima,
         const float * sums, int64_t tile_size, int64_t tile_stride,
-        int64_t t0_tok, int64_t nt_tok, int64_t n_vocab) {
+        int64_t t0_tok, int64_t nt_tok, int64_t n_topk, int64_t n_vocab) {
     const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
     const int64_t n = tile_size*nt_tok;
     if (i >= n) {
@@ -111,8 +146,19 @@ static __global__ void fused_sparse_ce_make_probs(
     const int64_t lt = i/tile_size;
     const int64_t v = i - lt*tile_size;
     const int64_t t = t0_tok + lt;
-    const bool active = targets[t] >= 0 && targets[t] < n_vocab && weights[t] != 0.0f && *n_active > 0;
-    const float coef = active ? *grad*weights[t]/(float) *n_active : 0.0f;
+    const bool active =
+        fused_sparse_ce_active(targets, weights, t, n_topk, n_vocab) && *n_active > 0;
+    // retro delta (plan DISTILL D6.5): the softmax half of the gradient is scaled
+    // by the position's total mass, sum_j w_j - one weight when K = 1.
+    float mass = 0.0f;
+    for (int64_t j = 0; j < n_topk; ++j) {
+        const int32_t vj = targets[t*n_topk + j];
+        const float   cj = weights[t*n_topk + j];
+        if (vj >= 0 && vj < n_vocab && cj != 0.0f) {
+            mass += cj;
+        }
+    }
+    const float coef = active ? *grad*mass/(float) *n_active : 0.0f;
     const int64_t offset = lt*tile_stride + v;
     logits[offset] = active ? coef*expf(logits[offset] - maxima[t])/sums[t] : 0.0f;
 }
@@ -127,7 +173,7 @@ template <bool gathered>
 static __global__ void fused_sparse_ce_subtract_target(
         const float * grad, const float * rows, const int32_t * targets,
         const float * weights, const int32_t * n_active, float * out,
-        int64_t n_embd, int64_t t0, int64_t nt, int64_t n_vocab) {
+        int64_t n_embd, int64_t t0, int64_t nt, int64_t n_topk, int64_t n_vocab) {
     const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
     if (i >= n_embd*nt) {
         return;
@@ -135,10 +181,20 @@ static __global__ void fused_sparse_ce_subtract_target(
     const int64_t lt = i/n_embd;
     const int64_t e  = i - lt*n_embd;
     const int64_t t  = t0 + lt;
-    const int32_t target = targets[t];
-    if (target >= 0 && target < n_vocab && weights[t] != 0.0f && *n_active > 0) {
-        const float coef = *grad*weights[t]/(float) *n_active;
-        out[i] -= coef*rows[(gathered ? lt : int64_t(target))*n_embd + e];
+    if (*n_active <= 0) {
+        return;
+    }
+    // retro delta (plan DISTILL D6.5): one subtraction per entry. The gathered
+    // capture is [n_embd, nt, K], so entry j of the chunk-local token lt sits at
+    // (lt*K + j).
+    for (int64_t j = 0; j < n_topk; ++j) {
+        const int32_t target = targets[t*n_topk + j];
+        const float   c      = weights[t*n_topk + j];
+        if (!(target >= 0 && target < n_vocab && c != 0.0f)) {
+            continue;
+        }
+        const float coef = *grad*c/(float) *n_active;
+        out[i] -= coef*rows[(gathered ? lt*n_topk + j : int64_t(target))*n_embd + e];
     }
 }
 
@@ -149,18 +205,22 @@ static __global__ void fused_sparse_ce_subtract_target(
 // every other intermediate of this operator.
 static __global__ void fused_sparse_ce_capture_target_rows(
         const float * w_tile, const int32_t * targets, float * target_rows,
-        int64_t n_embd, int64_t t0, int64_t nt, int64_t v0, int64_t nv) {
+        int64_t n_embd, int64_t t0, int64_t nt, int64_t n_topk, int64_t v0, int64_t nv) {
+    // retro delta (plan DISTILL D6.5): one captured row per entry, so the grid
+    // covers [n_embd, nt, K] and not [n_embd, nt].
     const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
-    if (i >= n_embd*nt) {
+    if (i >= n_embd*nt*n_topk) {
         return;
     }
-    const int64_t lt = i/n_embd;
-    const int64_t e  = i - lt*n_embd;
-    const int64_t target = targets[t0 + lt];
+    const int64_t slot = i/n_embd;
+    const int64_t e    = i - slot*n_embd;
+    const int64_t lt   = slot/n_topk;
+    const int64_t j    = slot - lt*n_topk;
+    const int64_t target = targets[(t0 + lt)*n_topk + j];
     if (target < v0 || target >= v0 + nv) {
         return;
     }
-    target_rows[lt*n_embd + e] = w_tile[(target - v0)*n_embd + e];
+    target_rows[slot*n_embd + e] = w_tile[(target - v0)*n_embd + e];
 }
 
 // retro delta: bounded per-tile F32 view of a possibly quantized output head.
@@ -209,23 +269,25 @@ struct fused_sparse_ce_work {
     ggml_cuda_pool_alloc<int32_t> n_active;
     ggml_cuda_pool_alloc<float> maxima;
     ggml_cuda_pool_alloc<float> sums;
+    // retro delta (plan DISTILL D6.5): one captured logit per entry, [K, n_tokens].
     ggml_cuda_pool_alloc<float> target_logits;
 
-    fused_sparse_ce_work(ggml_cuda_pool & pool, int64_t n_tokens) :
-        n_active(pool, 1), maxima(pool, n_tokens), sums(pool, n_tokens), target_logits(pool, n_tokens) {}
+    fused_sparse_ce_work(ggml_cuda_pool & pool, int64_t n_tokens, int64_t n_topk) :
+        n_active(pool, 1), maxima(pool, n_tokens), sums(pool, n_tokens),
+        target_logits(pool, n_tokens*n_topk) {}
 };
 
 static void fused_sparse_ce_prepare(
         cudaStream_t stream, const ggml_tensor * targets, const ggml_tensor * weights,
-        int64_t n_vocab, fused_sparse_ce_work & work) {
-    const int64_t n_tokens = ggml_nelements(targets);
+        int64_t n_topk, int64_t n_vocab, fused_sparse_ce_work & work) {
+    const int64_t n_tokens = targets->ne[1];
     const int threads = 256;
     CUDA_CHECK(cudaMemsetAsync(work.n_active.get(), 0, sizeof(int32_t), stream));
     fused_sparse_ce_count_active<<<(n_tokens + threads - 1)/threads, threads, 0, stream>>>(
         (const int32_t *) targets->data, (const float *) weights->data,
-        work.n_active.get(), n_tokens, n_vocab);
+        work.n_active.get(), n_tokens, n_topk, n_vocab);
     fused_sparse_ce_init<<<(n_tokens + threads - 1)/threads, threads, 0, stream>>>(
-        work.maxima.get(), work.sums.get(), work.target_logits.get(), n_tokens);
+        work.maxima.get(), work.sums.get(), work.target_logits.get(), n_tokens, n_topk);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -250,7 +312,7 @@ static int64_t fused_sparse_ce_seq_chunk(const ggml_tensor * dst, int64_t n_toke
 static void fused_sparse_ce_lse(
         ggml_backend_cuda_context & ctx, const float * h, fused_sparse_ce_head & head,
         const ggml_tensor * targets, const float * bias, int64_t n_embd,
-        int64_t t0, int64_t nt, int64_t n_vocab, int64_t tile_capacity,
+        int64_t t0, int64_t nt, int64_t n_topk, int64_t n_vocab, int64_t tile_capacity,
         float * logits, fused_sparse_ce_work & work) {
     cudaStream_t stream = ctx.stream();
     cublasHandle_t handle = ctx.cublas_handle();
@@ -271,7 +333,7 @@ static void fused_sparse_ce_lse(
         }
         fused_sparse_ce_update_lse<<<nt, 1, 0, stream>>>(
             logits, (const int32_t *) targets->data, work.maxima.get(), work.sums.get(),
-            work.target_logits.get(), v0, nv, tile_capacity, t0, nt);
+            work.target_logits.get(), v0, nv, tile_capacity, t0, nt, n_topk);
         CUDA_CHECK(cudaGetLastError());
     }
 }
@@ -369,16 +431,16 @@ static __global__ void k_fused_sparse_ce_decode(
         const int32_t * __restrict__ targets, const float * __restrict__ weights,
         const float * __restrict__ bias, float * __restrict__ maxima,
         float * __restrict__ sums, float * __restrict__ target_logits,
-        const int64_t n_embd, const int64_t n_vocab, const size_t nb_w, const bool has_bias) {
+        const int64_t n_embd, const int64_t n_topk, const int64_t n_vocab,
+        const size_t nb_w, const bool has_bias) {
     __shared__ float sw[CE_Q_ROWS*RETRO_QUANT_TILE];
     __shared__ float swarp[CE_Q_WARPS*CE_Q_ROWS];
     __shared__ float sz[CE_Q_ROWS];
 
     const int64_t t = blockIdx.x;
-    const int32_t target = targets[t];
     // An inactive token keeps the values fused_sparse_ce_init wrote, which is
     // exactly what fused_sparse_ce_finish_loss discards for it.
-    if (!(target >= 0 && target < n_vocab) || weights[t] == 0.0f) {
+    if (!fused_sparse_ce_active(targets, weights, t, n_topk, n_vocab)) {
         return;
     }
 
@@ -387,7 +449,6 @@ static __global__ void k_fused_sparse_ce_decode(
 
     float running_max = -INFINITY;
     float running_sum = 0.0f;
-    float logit_target = 0.0f;
 
     for (int64_t v0 = 0; v0 < n_vocab; v0 += CE_Q_ROWS) {
         const int nrows = (int) min((int64_t) CE_Q_ROWS, n_vocab - v0);
@@ -401,8 +462,11 @@ static __global__ void k_fused_sparse_ce_decode(
                 } else {
                     running_sum += expf(z - running_max);
                 }
-                if (v0 + r == target) {
-                    logit_target = z;
+                // retro delta (plan DISTILL D6.5): k captured logits per position.
+                for (int64_t j = 0; j < n_topk; ++j) {
+                    if (v0 + r == targets[t*n_topk + j]) {
+                        target_logits[t*n_topk + j] = z;
+                    }
                 }
             }
         }
@@ -411,7 +475,6 @@ static __global__ void k_fused_sparse_ce_decode(
     if (threadIdx.x == 0) {
         maxima[t] = running_max;
         sums[t] = running_sum;
-        target_logits[t] = logit_target;
     }
 }
 
@@ -429,7 +492,8 @@ static __global__ void k_fused_sparse_ce_back_decode(
         const char * __restrict__ w, const int32_t * __restrict__ targets,
         const float * __restrict__ weights, const float * __restrict__ bias,
         const int32_t * __restrict__ n_active, float * __restrict__ dst,
-        const int64_t n_embd, const int64_t n_vocab, const size_t nb_w, const bool has_bias) {
+        const int64_t n_embd, const int64_t n_topk, const int64_t n_vocab,
+        const size_t nb_w, const bool has_bias) {
     __shared__ float sw[CE_Q_ROWS*RETRO_QUANT_TILE];
     __shared__ float swarp[CE_Q_WARPS*CE_Q_ROWS];
     __shared__ float sz[CE_Q_ROWS];
@@ -446,9 +510,7 @@ static __global__ void k_fused_sparse_ce_back_decode(
     // path needs no staging buffer, unlike the tiled one above.
     float * dst_col = dst + t*n_embd;
 
-    const int32_t target = targets[t];
-    const float weight = weights[t];
-    if (!(target >= 0 && target < n_vocab) || weight == 0.0f || *n_active <= 0) {
+    if (!fused_sparse_ce_active(targets, weights, t, n_topk, n_vocab) || *n_active <= 0) {
         for (int64_t c = 0; c < n_chunks; ++c) {
             dst_col[c*RETRO_QUANT_TILE + tid] = 0.0f;
         }
@@ -505,13 +567,26 @@ static __global__ void k_fused_sparse_ce_back_decode(
         ssum = running_sum;
     }
     __syncthreads();
-    const float coef = grad[0]*weight/(float) *n_active;
     const float inv_sum = 1.0f/ssum;
+    // retro delta (plan DISTILL D6.5): grad_h = sum_j coef_j*(acc/Z - w[:,tgt_j]),
+    // written as a sum of the previous per-target expression so a K = 1 position
+    // reproduces it element for element.
     for (int64_t c = 0; c < n_chunks; ++c) {
-        __syncthreads();
-        loader::load(w + (int64_t) target*nb_w, c*RETRO_QUANT_TILE, n_embd, sw);
-        __syncthreads();
-        dst_col[c*RETRO_QUANT_TILE + tid] = coef*(acc[c]*inv_sum - sw[tid]);
+        dst_col[c*RETRO_QUANT_TILE + tid] = 0.0f;
+    }
+    for (int64_t j = 0; j < n_topk; ++j) {
+        const int32_t target = targets[t*n_topk + j];
+        const float   weight = weights[t*n_topk + j];
+        if (!(target >= 0 && target < n_vocab) || weight == 0.0f) {
+            continue;
+        }
+        const float coef = grad[0]*weight/(float) *n_active;
+        for (int64_t c = 0; c < n_chunks; ++c) {
+            __syncthreads();
+            loader::load(w + (int64_t) target*nb_w, c*RETRO_QUANT_TILE, n_embd, sw);
+            __syncthreads();
+            dst_col[c*RETRO_QUANT_TILE + tid] += coef*(acc[c]*inv_sum - sw[tid]);
+        }
     }
 }
 
@@ -537,28 +612,30 @@ static bool launch_fused_sparse_ce_decode(ggml_backend_cuda_context & ctx, ggml_
     const ggml_tensor * targets = dst->src[2], * weights = dst->src[3];
     const ggml_tensor * bias = dst->src[4];
     const int64_t n_embd = h->ne[0], n_tokens = h->ne[1], n_vocab = w->ne[1];
+    const int64_t n_topk = targets->ne[0]; // retro delta (DISTILL D6.5)
     if (!fused_sparse_ce_decode_fits<type>(n_embd)) {
         return false;
     }
 
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t stream = ctx.stream();
-    fused_sparse_ce_work work(pool, n_tokens);
-    fused_sparse_ce_prepare(stream, targets, weights, n_vocab, work);
+    fused_sparse_ce_work work(pool, n_tokens, n_topk);
+    fused_sparse_ce_prepare(stream, targets, weights, n_topk, n_vocab, work);
     k_fused_sparse_ce_decode<typename retro_quant_traits<type>::loader>
         <<<(unsigned) n_tokens, RETRO_QUANT_THREADS, 0, stream>>>(
             (const float *) h->data, (const char *) w->data,
             (const int32_t *) targets->data, (const float *) weights->data,
             bias ? (const float *) bias->data : nullptr,
             work.maxima.get(), work.sums.get(), work.target_logits.get(),
-            n_embd, n_vocab, w->nb[1], bias != nullptr);
+            n_embd, n_topk, n_vocab, w->nb[1], bias != nullptr);
     CUDA_CHECK(cudaGetLastError());
 
     ggml_cuda_pool_alloc<float> losses(pool, n_tokens);
     const int threads = 256;
     fused_sparse_ce_finish_loss<<<(n_tokens + threads - 1)/threads, threads, 0, stream>>>(
         (const int32_t *) targets->data, (const float *) weights->data, work.n_active.get(),
-        work.maxima.get(), work.sums.get(), work.target_logits.get(), losses.get(), n_tokens, n_vocab);
+        work.maxima.get(), work.sums.get(), work.target_logits.get(), losses.get(),
+        n_tokens, n_topk, n_vocab);
     CUDA_CHECK(cudaGetLastError());
     sum_f32_cuda(pool, losses.get(), (float *) dst->data, n_tokens, stream);
     return true;
@@ -570,19 +647,20 @@ static bool launch_fused_sparse_ce_back_decode(ggml_backend_cuda_context & ctx, 
     const ggml_tensor * targets = dst->src[3], * weights = dst->src[4];
     const ggml_tensor * bias = dst->src[5];
     const int64_t n_embd = h->ne[0], n_tokens = h->ne[1], n_vocab = w->ne[1];
+    const int64_t n_topk = targets->ne[0]; // retro delta (DISTILL D6.5)
     if (!fused_sparse_ce_decode_fits<type>(n_embd) || n_embd > CE_Q_MAXC*RETRO_QUANT_TILE) {
         return false;
     }
 
     cudaStream_t stream = ctx.stream();
-    fused_sparse_ce_work work(ctx.pool(), n_tokens);
-    fused_sparse_ce_prepare(stream, targets, weights, n_vocab, work);
+    fused_sparse_ce_work work(ctx.pool(), n_tokens, n_topk);
+    fused_sparse_ce_prepare(stream, targets, weights, n_topk, n_vocab, work);
     k_fused_sparse_ce_back_decode<typename retro_quant_traits<type>::loader>
         <<<(unsigned) n_tokens, RETRO_QUANT_THREADS, 0, stream>>>(
             (const float *) grad->data, (const float *) h->data, (const char *) w->data,
             (const int32_t *) targets->data, (const float *) weights->data,
             bias ? (const float *) bias->data : nullptr, work.n_active.get(),
-            (float *) dst->data, n_embd, n_vocab, w->nb[1], bias != nullptr);
+            (float *) dst->data, n_embd, n_topk, n_vocab, w->nb[1], bias != nullptr);
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
@@ -623,6 +701,7 @@ void ggml_cuda_fused_sparse_ce(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const ggml_tensor * targets = dst->src[2], * weights = dst->src[3];
     const ggml_tensor * bias = dst->src[4];
     const int64_t n_embd = h->ne[0], n_tokens = h->ne[1], n_vocab = w->ne[1];
+    const int64_t n_topk = targets->ne[0]; // retro delta (DISTILL D6.5)
     GGML_ASSERT(h->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
     GGML_ASSERT(targets->type == GGML_TYPE_I32 && weights->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(h) && ggml_is_contiguous(w));
@@ -635,8 +714,8 @@ void ggml_cuda_fused_sparse_ce(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t stream = ctx.stream();
     const float * bias_f32 = bias ? (const float *) bias->data : nullptr;
-    fused_sparse_ce_work work(pool, n_tokens);
-    fused_sparse_ce_prepare(stream, targets, weights, n_vocab, work);
+    fused_sparse_ce_work work(pool, n_tokens, n_topk);
+    fused_sparse_ce_prepare(stream, targets, weights, n_topk, n_vocab, work);
     const int64_t tile  = fused_sparse_ce_tile_size(dst, n_vocab);
     const int64_t chunk = fused_sparse_ce_seq_chunk(dst, n_tokens);
     fused_sparse_ce_head head(pool, w, n_embd, tile);
@@ -644,14 +723,15 @@ void ggml_cuda_fused_sparse_ce(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     for (int64_t t0 = 0; t0 < n_tokens; t0 += chunk) {
         const int64_t nt = std::min(chunk, n_tokens - t0);
         fused_sparse_ce_lse(ctx, (const float *) h->data, head, targets, bias_f32,
-            n_embd, t0, nt, n_vocab, tile, logits.get(), work);
+            n_embd, t0, nt, n_topk, n_vocab, tile, logits.get(), work);
     }
 
     ggml_cuda_pool_alloc<float> losses(pool, n_tokens);
     const int threads = 256;
     fused_sparse_ce_finish_loss<<<(n_tokens + threads - 1)/threads, threads, 0, stream>>>(
         (const int32_t *) targets->data, (const float *) weights->data, work.n_active.get(),
-        work.maxima.get(), work.sums.get(), work.target_logits.get(), losses.get(), n_tokens, n_vocab);
+        work.maxima.get(), work.sums.get(), work.target_logits.get(), losses.get(),
+        n_tokens, n_topk, n_vocab);
     CUDA_CHECK(cudaGetLastError());
     sum_f32_cuda(pool, losses.get(), (float *) dst->data, n_tokens, stream);
 }
@@ -661,6 +741,7 @@ void ggml_cuda_fused_sparse_ce_back(ggml_backend_cuda_context & ctx, ggml_tensor
     const ggml_tensor * targets = dst->src[3], * weights = dst->src[4];
     const ggml_tensor * bias = dst->src[5];
     const int64_t n_embd = h->ne[0], n_tokens = h->ne[1], n_vocab = w->ne[1];
+    const int64_t n_topk = targets->ne[0]; // retro delta (DISTILL D6.5)
     GGML_ASSERT(grad->type == GGML_TYPE_F32 && h->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(h) && ggml_is_contiguous(w) && ggml_is_contiguous(dst));
     GGML_ASSERT(!bias || (bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias)));
@@ -672,8 +753,8 @@ void ggml_cuda_fused_sparse_ce_back(ggml_backend_cuda_context & ctx, ggml_tensor
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t stream = ctx.stream();
     const float * bias_f32 = bias ? (const float *) bias->data : nullptr;
-    fused_sparse_ce_work work(pool, n_tokens);
-    fused_sparse_ce_prepare(stream, targets, weights, n_vocab, work);
+    fused_sparse_ce_work work(pool, n_tokens, n_topk);
+    fused_sparse_ce_prepare(stream, targets, weights, n_topk, n_vocab, work);
     const int64_t tile  = fused_sparse_ce_tile_size(dst, n_vocab);
     const int64_t chunk = fused_sparse_ce_seq_chunk(dst, n_tokens);
     fused_sparse_ce_head head(pool, w, n_embd, tile);
@@ -681,10 +762,13 @@ void ggml_cuda_fused_sparse_ce_back(ggml_backend_cuda_context & ctx, ggml_tensor
 
     // A quantized head is only ever materialized one vocab tile at a time, so the
     // rows the target subtraction needs are captured while their tile is live.
+    // retro delta (plan DISTILL D6.5): k rows per position, so the capture is
+    // [n_embd, chunk, K]. It is the one term of this operator that grows with k,
+    // and it is bounded by the token chunk like every other intermediate.
     const bool gather_targets = w->type != GGML_TYPE_F32;
     ggml_cuda_pool_alloc<float> target_rows(pool);
     if (gather_targets) {
-        target_rows.alloc(n_embd*chunk);
+        target_rows.alloc(n_embd*chunk*n_topk);
     }
 
     // retro delta (plan rl/OPTIMIZE feature 3): with offload_h the graph allocator
@@ -710,21 +794,21 @@ void ggml_cuda_fused_sparse_ce_back(ggml_backend_cuda_context & ctx, ggml_tensor
         if (gather_targets) {
             // A masked token (target < 0) is captured by no tile, and CUDA scratch
             // -- unlike host memory -- does not come zeroed.
-            CUDA_CHECK(cudaMemsetAsync(target_rows.get(), 0, n_embd*nt*sizeof(float), stream));
+            CUDA_CHECK(cudaMemsetAsync(target_rows.get(), 0, n_embd*nt*n_topk*sizeof(float), stream));
         }
         // Recompute this chunk's online log-sum-exp (checkpointing over the
         // sequence axis), then accumulate grad_h tile by tile.
         fused_sparse_ce_lse(ctx, (const float *) h->data, head, targets, bias_f32,
-            n_embd, t0, nt, n_vocab, tile, logits.get(), work);
+            n_embd, t0, nt, n_topk, n_vocab, tile, logits.get(), work);
         bool first = true;
         for (int64_t v0 = 0; v0 < n_vocab; v0 += tile) {
             const int64_t nv = std::min(tile, n_vocab - v0);
             const float * w_tile = head.rows(v0, nv, stream);
             if (gather_targets) {
-                const int64_t n_rows = n_embd*nt;
+                const int64_t n_rows = n_embd*nt*n_topk;
                 fused_sparse_ce_capture_target_rows<<<(n_rows + threads - 1)/threads, threads, 0, stream>>>(
                     w_tile, (const int32_t *) targets->data, target_rows.get(),
-                    n_embd, t0, nt, v0, nv);
+                    n_embd, t0, nt, n_topk, v0, nv);
                 CUDA_CHECK(cudaGetLastError());
             }
             CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
@@ -740,7 +824,7 @@ void ggml_cuda_fused_sparse_ce_back(ggml_backend_cuda_context & ctx, ggml_tensor
             fused_sparse_ce_make_probs<<<(n_probs + threads - 1)/threads, threads, 0, stream>>>(
                 logits.get(), (const float *) grad->data, (const int32_t *) targets->data,
                 (const float *) weights->data, work.n_active.get(), work.maxima.get(), work.sums.get(),
-                nv, tile, t0, nt, n_vocab);
+                nv, tile, t0, nt, n_topk, n_vocab);
             CUDA_CHECK(cudaGetLastError());
             const float * beta = first ? &beta0 : &beta1;
             CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
@@ -757,12 +841,12 @@ void ggml_cuda_fused_sparse_ce_back(ggml_backend_cuda_context & ctx, ggml_tensor
             fused_sparse_ce_subtract_target<true><<<sub_blocks, threads, 0, stream>>>(
                 (const float *) grad->data, target_rows.get(), (const int32_t *) targets->data,
                 (const float *) weights->data, work.n_active.get(), out,
-                n_embd, t0, nt, n_vocab);
+                n_embd, t0, nt, n_topk, n_vocab);
         } else {
             fused_sparse_ce_subtract_target<false><<<sub_blocks, threads, 0, stream>>>(
                 (const float *) grad->data, (const float *) w->data, (const int32_t *) targets->data,
                 (const float *) weights->data, work.n_active.get(), out,
-                n_embd, t0, nt, n_vocab);
+                n_embd, t0, nt, n_topk, n_vocab);
         }
         CUDA_CHECK(cudaGetLastError());
         if (inplace) {

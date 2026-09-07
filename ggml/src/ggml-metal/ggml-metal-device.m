@@ -2098,7 +2098,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             const bool is_back = op->op == GGML_OP_FUSED_SPARSE_CE_BACK;
             const struct ggml_tensor * h = op->src[is_back ? 1 : 0];
             const struct ggml_tensor * w = op->src[is_back ? 2 : 1];
+            const struct ggml_tensor * targets = op->src[is_back ? 3 : 2];
             if (w->type != GGML_TYPE_F32 && !ggml_metal_retro_is_dequantizable(w->type)) {
+                return false;
+            }
+            // retro delta (plan DISTILL D6.5): k sparse targets per position.
+            if (targets->ne[0] > GGML_FUSED_SPARSE_CE_K_MAX) {
                 return false;
             }
             return has_simdgroup_reduction &&

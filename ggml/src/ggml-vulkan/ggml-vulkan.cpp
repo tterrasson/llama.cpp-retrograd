@@ -2098,6 +2098,9 @@ struct vk_op_fused_sparse_ce_push_constants {
     uint32_t d_stride; // elements between grad_h columns (backward only)
     uint32_t has_bias; // 1 when the head carries a per-vocab bias [n_vocab]
     uint32_t n_tok;    // tokens per workgroup (the CE shaders' token tile)
+    // retro delta (plan DISTILL D6.5): sparse targets per position, ne[0] of the
+    // targets/weights tensors. 1 is the one-hot objective.
+    uint32_t n_topk;
 };
 
 // retro delta: tokens per workgroup for the fused CE shaders. Decoding the head
@@ -13997,8 +14000,8 @@ static vk_subbuffer ggml_vk_fused_sparse_ce_count(ggml_backend_vk_context * ctx,
 static void ggml_vk_fused_sparse_ce(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     const ggml_tensor * h       = dst->src[0]; // [n_embd, n_tokens] F32
     const ggml_tensor * w       = dst->src[1]; // [n_embd, n_vocab]  F32/F16/Q8_0
-    const ggml_tensor * targets = dst->src[2]; // [n_tokens] I32
-    const ggml_tensor * weights = dst->src[3]; // [n_tokens] F32
+    const ggml_tensor * targets = dst->src[2]; // [K, n_tokens] I32
+    const ggml_tensor * weights = dst->src[3]; // [K, n_tokens] F32
     const ggml_tensor * bias    = dst->src[4]; // [n_vocab] F32, may be null
 
     GGML_ASSERT(dst->buffer != nullptr);
@@ -14012,6 +14015,7 @@ static void ggml_vk_fused_sparse_ce(ggml_backend_vk_context * ctx, vk_context& s
         0,
         bias != nullptr ? 1u : 0u,
         ggml_vk_fused_sparse_ce_tile((uint32_t) h->ne[0]),
+        (uint32_t) targets->ne[0], // retro delta (DISTILL D6.5)
     };
 
     const vk_subbuffer count_buf = ggml_vk_fused_sparse_ce_count(ctx, subctx, targets, weights, pc);
@@ -14041,8 +14045,8 @@ static void ggml_vk_fused_sparse_ce_back(ggml_backend_vk_context * ctx, vk_conte
     const ggml_tensor * grad    = dst->src[0]; // scalar
     const ggml_tensor * h       = dst->src[1]; // [n_embd, n_tokens] F32
     const ggml_tensor * w       = dst->src[2]; // [n_embd, n_vocab]  F32/F16/Q8_0
-    const ggml_tensor * targets = dst->src[3]; // [n_tokens] I32
-    const ggml_tensor * weights = dst->src[4]; // [n_tokens] F32
+    const ggml_tensor * targets = dst->src[3]; // [K, n_tokens] I32
+    const ggml_tensor * weights = dst->src[4]; // [K, n_tokens] F32
     const ggml_tensor * bias    = dst->src[5]; // [n_vocab] F32, may be null
 
     GGML_ASSERT(dst->buffer != nullptr);
@@ -14056,6 +14060,7 @@ static void ggml_vk_fused_sparse_ce_back(ggml_backend_vk_context * ctx, vk_conte
         (uint32_t) (dst->nb[1] / sizeof(float)),
         bias != nullptr ? 1u : 0u,
         ggml_vk_fused_sparse_ce_tile((uint32_t) h->ne[0]),
+        (uint32_t) targets->ne[0], // retro delta (DISTILL D6.5)
     };
 
     const vk_subbuffer count_buf = ggml_vk_fused_sparse_ce_count(ctx, subctx, targets, weights, pc);
@@ -20678,6 +20683,13 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     return false;
                 }
                 if (targets->type != GGML_TYPE_I32 || weights->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                // retro delta (plan DISTILL D6.5): targets/weights are
+                // [K, n_tokens], K in 1..GGML_FUSED_SPARSE_CE_K_MAX.
+                if (targets->ne[1] != h->ne[1] || weights->ne[1] != h->ne[1] ||
+                    targets->ne[0] != weights->ne[0] || targets->ne[0] < 1 ||
+                    targets->ne[0] > GGML_FUSED_SPARSE_CE_K_MAX) {
                     return false;
                 }
                 // A head type is supported iff a pipeline was compiled for it and

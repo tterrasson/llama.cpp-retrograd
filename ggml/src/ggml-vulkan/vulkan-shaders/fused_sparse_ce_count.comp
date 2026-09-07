@@ -3,8 +3,9 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
 
 // retro delta: count the active tokens for the fused sparse cross-entropy.
-// A token is active when its target is a real vocab id and its GRPO weight is
-// non-zero. The result (n_active) is the divisor both the forward loss and the
+// A token is active when any of its n_topk entries names a real vocab id with a
+// non-zero weight, and counts once when it does (retro delta, plan DISTILL
+// D6.5: the mean is over positions, never over entries). The result (n_active) is the divisor both the forward loss and the
 // backward gradient use, computed on device so the semantics match the CPU
 // reference exactly (see docs/memory/GPUVOCAB.md). One thread per token.
 
@@ -16,6 +17,9 @@ layout(push_constant) uniform parameter {
     uint n_vocab;
     uint h_stride;
     uint d_stride;
+    uint has_bias;
+    uint n_tok;
+    uint n_topk; // retro delta (plan DISTILL D6.5)
 } p;
 
 layout(binding = 0) readonly  buffer Tgt   {int   data_tgt[];};
@@ -27,9 +31,13 @@ void main() {
     if (t >= p.n_tokens) {
         return;
     }
-    const int tgt = data_tgt[t];
-    const float wgt = data_wgt[t];
-    if (tgt >= 0 && uint(tgt) < p.n_vocab && wgt != 0.0f) {
-        atomicAdd(data_count[0], 1u);
+    const uint n_topk = max(p.n_topk, 1u);
+    for (uint j = 0; j < n_topk; ++j) {
+        const int   tgt = data_tgt[t * n_topk + j];
+        const float wgt = data_wgt[t * n_topk + j];
+        if (tgt >= 0 && uint(tgt) < p.n_vocab && wgt != 0.0f) {
+            atomicAdd(data_count[0], 1u);
+            return;
+        }
     }
 }

@@ -3073,7 +3073,10 @@ struct ggml_cplan ggml_graph_plan(
                         // column, which the backward reads after it has started
                         // writing grad_h over it (feature 3 in-place aliasing).
                         // n_embd = src[1]->ne[0], src[1] = h.
-                        cur = ggml_type_size(GGML_TYPE_F32)*2*node->src[1]->ne[0]*n_tasks;
+                        // retro delta (plan DISTILL D6.5): a third column, the
+                        // softmax accumulator, which the k target rows now read
+                        // after the result has started being written elsewhere.
+                        cur = ggml_type_size(GGML_TYPE_F32)*3*node->src[1]->ne[0]*n_tasks;
                     } break;
                 case GGML_OP_GATED_DELTA_NET:
                     {

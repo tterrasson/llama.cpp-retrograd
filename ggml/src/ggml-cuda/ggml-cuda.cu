@@ -5763,8 +5763,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     (back && (!grad || grad->type != GGML_TYPE_F32)) ||
                     h->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
                     targets->type != GGML_TYPE_I32 || weights->type != GGML_TYPE_F32 ||
-                    w->ne[0] != h->ne[0] || targets->ne[0] != h->ne[1] ||
-                    weights->ne[0] != h->ne[1] || !ggml_is_contiguous(h) ||
+                    w->ne[0] != h->ne[0] ||
+                    // retro delta (plan DISTILL D6.5): targets/weights are
+                    // [K, n_tokens], K in 1..GGML_FUSED_SPARSE_CE_K_MAX.
+                    targets->ne[1] != h->ne[1] || weights->ne[1] != h->ne[1] ||
+                    targets->ne[0] != weights->ne[0] || targets->ne[0] < 1 ||
+                    targets->ne[0] > GGML_FUSED_SPARSE_CE_K_MAX ||
+                    !ggml_is_contiguous(h) ||
                     !ggml_is_contiguous(w) || !ggml_is_contiguous(targets) ||
                     !ggml_is_contiguous(weights) || !ggml_is_contiguous(op) ||
                     (bias && (bias->type != GGML_TYPE_F32 || bias->ne[0] != w->ne[1] ||

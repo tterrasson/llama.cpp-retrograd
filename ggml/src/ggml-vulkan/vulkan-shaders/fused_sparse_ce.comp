@@ -10,9 +10,10 @@
 // online log-sum-exp in F32 per token of the tile; a tree reduction merges them
 // into each token's logsumexp. The [n_vocab, n_tokens] logits are never
 // materialized: each logit z[v,t] = dot(w[:,v], h[:,t]) is recomputed on the
-// fly. The per-token contribution weight_t*(logsumexp_t - z[target_t]) is
-// normalized by the active token count and atomically summed into the scalar
-// loss. All reductions are in F32 so a low-precision head never biases the
+// fly. The per-token contribution sum_j weight[j,t]*(logsumexp_t - z[target[j,t]])
+// is normalized by the active token count and atomically summed into the scalar
+// loss (retro delta, plan DISTILL D6.5: k sparse targets per position, k = 1
+// being the one-hot objective). All reductions are in F32 so a low-precision head never biases the
 // gradient.
 //
 // The head, not the hidden states, is what this kernel spends its time on: one
@@ -68,6 +69,7 @@ layout(push_constant) uniform parameter {
     uint d_stride;
     uint has_bias; // retro delta: the optional per-vocab bias of the head
     uint n_tok;    // tokens per workgroup, 1..TOK_MAX
+    uint n_topk;   // retro delta (plan DISTILL D6.5): sparse targets per position
 } p;
 
 layout(binding = 0) readonly buffer H   {float data_h[];};
@@ -93,7 +95,13 @@ layout(binding = 6) readonly buffer Bs  {float data_bias[];};
 
 shared float sh_max[WG];
 shared float sh_sum[WG];
-shared float sh_ztgt[TOK_MAX];
+// retro delta (plan DISTILL D6.5): the per-token log-sum-exp, published before
+// the k target logits are recomputed against it. It replaces the sh_ztgt capture
+// the main sweep used to do, which would have needed TOK_MAX*K slots and a test
+// per entry inside the hot loop.
+// sh_max doubles as the scratch of that second reduction: it has been consumed
+// by the time the k logits are known, so the shared footprint does not grow.
+shared float sh_lse[TOK_MAX];
 
 // First token of this workgroup's tile. Workgroup-uniform.
 uint g_t_base;
@@ -173,18 +181,20 @@ void main() {
     // Token metadata, read redundantly by every invocation: it is a broadcast of
     // a handful of scalars, and reading it this way keeps the arrays statically
     // indexed, hence in registers.
-    int   tgt[TOK_MAX];
-    float wgt[TOK_MAX];
-    uint  n_act = 0;
+    const uint n_topk = max(p.n_topk, 1u);
+    bool act[TOK_MAX];
+    uint n_act = 0;
     [[unroll]] for (uint tl = 0; tl < TOK_MAX; ++tl) {
-        tgt[tl] = -1;
-        wgt[tl] = 0.0f;
+        act[tl] = false;
         if (tl < n_here) {
-            const int   g = data_tgt[g_t_base + tl];
-            const float w = data_wgt[g_t_base + tl];
-            if (g >= 0 && uint(g) < p.n_vocab && w != 0.0f) {
-                tgt[tl] = g;
-                wgt[tl] = w;
+            for (uint j = 0; j < n_topk; ++j) {
+                const int   g = data_tgt[(g_t_base + tl) * n_topk + j];
+                const float w = data_wgt[(g_t_base + tl) * n_topk + j];
+                if (g >= 0 && uint(g) < p.n_vocab && w != 0.0f) {
+                    act[tl] = true;
+                }
+            }
+            if (act[tl]) {
                 n_act++;
             }
         }
@@ -192,11 +202,6 @@ void main() {
     if (n_act == 0u) {
         return; // workgroup-uniform: a tile of inactive tokens contributes nothing
     }
-
-    if (lid < TOK_MAX) {
-        sh_ztgt[lid] = 0.0f;
-    }
-    barrier();
 
     float lmax[TOK_MAX];
     float lsum[TOK_MAX];
@@ -209,16 +214,13 @@ void main() {
     for (uint v = lid; v < p.n_vocab; v += WG) {
         column_dots(v, n_here, z);
         [[unroll]] for (uint tl = 0; tl < TOK_MAX; ++tl) {
-            if (tl < n_here && wgt[tl] != 0.0f) {
+            if (tl < n_here && act[tl]) {
                 const float zz = z[tl];
                 if (zz > lmax[tl]) {
                     lsum[tl] = lsum[tl] * exp(lmax[tl] - zz) + 1.0f;
                     lmax[tl] = zz;
                 } else {
                     lsum[tl] += exp(zz - lmax[tl]);
-                }
-                if (v == uint(tgt[tl])) {
-                    sh_ztgt[tl] = zz;
                 }
             }
         }
@@ -247,10 +249,38 @@ void main() {
                 }
                 barrier();
             }
-            if (lid == 0 && wgt[tl] != 0.0f && n_active > 0u) {
-                const float lse = sh_max[0] + log(sh_sum[0]);
-                const float contrib = wgt[tl] * (lse - sh_ztgt[tl]) / float(n_active);
-                atomicAdd(data_dst[0], contrib);
+            if (lid == 0) {
+                sh_lse[tl] = sh_max[0] + log(sh_sum[0]);
+            }
+            barrier();
+
+            // retro delta (plan DISTILL D6.5): sum_j w_j*(lse - z_j). The k
+            // target logits are recomputed here - k columns next to the n_vocab
+            // the sweep above walked - and reduced in one tree sum, so a K = 1
+            // token contributes exactly the previous wgt*(lse - ztgt).
+            const float lse = sh_lse[tl];
+            float contrib = 0.0f;
+            if (act[tl] && n_active > 0u) {
+                for (uint j = lid; j < n_topk; j += WG) {
+                    const int   g = data_tgt[(g_t_base + tl) * n_topk + j];
+                    const float w = data_wgt[(g_t_base + tl) * n_topk + j];
+                    if (g >= 0 && uint(g) < p.n_vocab && w != 0.0f) {
+                        float zt[TOK_MAX];
+                        column_dots(uint(g), n_here, zt);
+                        contrib += w * (lse - zt[tl]);
+                    }
+                }
+            }
+            sh_max[lid] = contrib;
+            barrier();
+            [[unroll]] for (uint s = WG / 2u; s > 0u; s >>= 1) {
+                if (lid < s) {
+                    sh_max[lid] += sh_max[lid + s];
+                }
+                barrier();
+            }
+            if (lid == 0 && act[tl] && n_active > 0u) {
+                atomicAdd(data_dst[0], sh_max[0] / float(n_active));
             }
         }
     }

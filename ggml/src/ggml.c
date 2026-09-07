@@ -6430,8 +6430,15 @@ struct ggml_tensor * ggml_fused_sparse_ce(
     GGML_ASSERT(weights->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_matrix(h) && ggml_is_matrix(w));
     GGML_ASSERT(w->ne[0] == h->ne[0]);           // shared embedding dim
-    GGML_ASSERT(targets->ne[0] == h->ne[1]);     // one target per token
-    GGML_ASSERT(weights->ne[0] == h->ne[1]);     // one weight per token
+    // retro delta (plan DISTILL D6.5): [K, n_tokens]. A 1-D tensor of n_tokens
+    // entries is the K = 1 case of this layout only when n_tokens == 1, so the
+    // shape is required to be explicit: every construction site allocates 2-D.
+    GGML_ASSERT(ggml_is_matrix(targets) && ggml_is_matrix(weights));
+    GGML_ASSERT(targets->ne[1] == h->ne[1]);     // one target column per token
+    GGML_ASSERT(weights->ne[1] == h->ne[1]);     // one weight column per token
+    GGML_ASSERT(targets->ne[0] == weights->ne[0]);
+    GGML_ASSERT(targets->ne[0] >= 1 && targets->ne[0] <= GGML_FUSED_SPARSE_CE_K_MAX);
+    GGML_ASSERT(ggml_is_contiguous(targets) && ggml_is_contiguous(weights));
     // retro delta: optional fixed (non-trainable) per-vocab additive bias, e.g.
     // gemma4's logits-bias for suppressed tokens (see llm_graph_input_logits_bias).
     GGML_ASSERT(bias == NULL || (ggml_is_vector(bias) && bias->ne[0] == w->ne[1] && bias->type == GGML_TYPE_F32));
@@ -6471,6 +6478,12 @@ struct ggml_tensor * ggml_fused_sparse_ce_back(
     GGML_ASSERT(h->type == GGML_TYPE_F32);
     GGML_ASSERT(targets->type == GGML_TYPE_I32);
     GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_matrix(targets) && ggml_is_matrix(weights));
+    GGML_ASSERT(targets->ne[1] == h->ne[1]);
+    GGML_ASSERT(weights->ne[1] == h->ne[1]);
+    GGML_ASSERT(targets->ne[0] == weights->ne[0]);
+    GGML_ASSERT(targets->ne[0] >= 1 && targets->ne[0] <= GGML_FUSED_SPARSE_CE_K_MAX);
+    GGML_ASSERT(ggml_is_contiguous(targets) && ggml_is_contiguous(weights));
     GGML_ASSERT(bias == NULL || (ggml_is_vector(bias) && bias->ne[0] == w->ne[1] && bias->type == GGML_TYPE_F32));
     GGML_ASSERT(n_tiles >= 1);
     GGML_ASSERT(seq_chunk >= 0);
