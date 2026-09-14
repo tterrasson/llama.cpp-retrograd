@@ -1,7 +1,7 @@
-# The Retroback fork of llama.cpp
+# The Retrograd fork of llama.cpp
 
-This branch (`retroback/main` on `tterrasson/llama.cpp-retroback`) carries the
-changes Retroback needs to *train* a model with llama.cpp: backward passes for
+This branch (`retrograd/main` on `tterrasson/llama.cpp-retrograd`) carries the
+changes Retrograd needs to *train* a model with llama.cpp: backward passes for
 ops that only had a forward, three backends brought up to the same contract,
 memory-efficient training machinery, and the RIR generated-kernel integration.
 
@@ -18,8 +18,8 @@ git log --oneline upstream/master..HEAD  # one commit per patch family
 
 The second one is the important command. Each commit is
 `retro(<family>): <what> [n/N]`, where `<family>` is a key in
-`crates/retroback-ffi/runtime/llama.cpp.lock`'s `[upstream_status]` section in
-the Retroback repository. That file records, for every family, whether it
+`crates/retrograd-ffi/runtime/llama.cpp.lock`'s `[upstream_status]` section in
+the Retrograd repository. That file records, for every family, whether it
 belongs upstream and why. The history and the lockfile are meant to agree:
 a family in one and not the other is a bug in the bookkeeping.
 
@@ -110,6 +110,6 @@ The heavy ones, and why:
 
 ## Rebasing
 
-See `docs/LLAMA_CPP_UPSTREAM_REBASE.md` in the Retroback repository.
+See `docs/LLAMA_CPP_UPSTREAM_REBASE.md` in the Retrograd repository.
 `git config rerere.enabled true` is worth it here: the same conflicts recur
 sync after sync, and rerere replays the resolutions.

@@ -3,7 +3,7 @@
 // retro delta: single-launch replacement for the K-iteration host loop in
 // build_conv_state's rollback branch (delta-net-base.cpp,
 // [TAG_RECURRENT_ROLLBACK_SPLITS]). Only reached when a caller sets
-// n_rs_seq > 0; Retroback pins it to 0 (see retro_backend.cpp), so this is
+// n_rs_seq > 0; Retrograd pins it to 0 (see retro_backend.cpp), so this is
 // dead weight there but kept correct and tested for llama.cpp callers that do
 // enable rollback. One thread per (channel, seq); each thread
 // gathers its K overlapping causal-conv windows in a small inner loop. Slot 0

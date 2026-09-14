@@ -506,7 +506,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         // e.g. 97), which dominated the forward pass for callers running with a
         // full rollback budget. Implemented on CPU, CUDA, Vulkan and Metal.
         //
-        // Note that Retroback itself never reaches this branch: retro_backend.cpp
+        // Note that Retrograd itself never reaches this branch: retro_backend.cpp
         // pins n_rs_seq to 0 because the snapshots never pay for themselves (see
         // the measurements there). It is kept for llama.cpp callers that do
         // enable rollback. See docs/cuda/STATUS.md.

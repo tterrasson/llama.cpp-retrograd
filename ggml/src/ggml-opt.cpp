@@ -358,7 +358,7 @@ struct ggml_opt_optimizer_params ggml_opt_get_default_optimizer_params(void * us
     ggml_opt_optimizer_params result;
 
     // Generic ggml callers keep the historical unclipped behavior unless they
-    // opt in. Retroback overrides this with its validated default of 1.0.
+    // opt in. Retrograd overrides this with its validated default of 1.0.
     result.max_grad_norm = INFINITY;
     result.adamw.alpha = 0.001f;
     result.adamw.beta1 = 0.9f;
@@ -804,7 +804,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
                     break;
                 case GGML_OPT_OPTIMIZER_TYPE_SGD:
                     // SGD keeps the explicit multiply: its kernel is untouched
-                    // by the F16 work and retroback only trains with AdamW.
+                    // by the F16 work and retrograd only trains with AdamW.
                     opt_step = ggml_opt_step_sgd(opt_ctx->ctx_compute, node,
                             ggml_mul(opt_ctx->ctx_compute, grad, grad_scale), optimizer_params);
                     break;

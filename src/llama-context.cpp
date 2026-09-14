@@ -3946,7 +3946,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     if (opt_fused_ce && arch_softcaps_final &&
             model->hparams.f_final_logit_softcapping != 0.0f) {
         // ERROR level on purpose: this silently overrides an explicitly
-        // requested config option (chunked/fused CE), and the retroback runtime
+        // requested config option (chunked/fused CE), and the retrograd runtime
         // log filter only forwards ERROR when verbose=false.
         LLAMA_LOG_ERROR("%s: chunked/fused cross-entropy is incompatible with "
                 "final-logit softcapping (f_final_logit_softcapping=%.1f); the "
@@ -4409,7 +4409,7 @@ void llama_context::opt_epoch_iter(
                 int32_t n_active_labels = 0;
                 for (uint32_t pos_ubatch = 0; pos_ubatch < n_ubatch; ++pos_ubatch) {
                     const uint32_t ilabel = pos_ctx + pos_batch + pos_ubatch;
-                    // Negative labels are ignored by Retroback's masked SFT
+                    // Negative labels are ignored by Retrograd's masked SFT
                     // loss. The all-zero one-hot row is skipped downstream.
                     // retro delta: a weighted position scales its one-hot value,
                     // which the generalized cross-entropy backward turns into an

@@ -13216,7 +13216,7 @@ static void ggml_compute_forward_cross_entropy_loss_back_f32(
 
         // retro delta: scale the softmax term by the row's label mass so the
         // gradient stays exact for weighted labels (sum(labels) != 1), which
-        // Retroback uses to express detached policy-gradient coefficients:
+        // Retrograd uses to express detached policy-gradient coefficients:
         // grad(src0f) = (sum(src1f)*softmax(src0f) - src1f) * grad / n_active.
         // One-hot rows (label mass 1) are unchanged.
         float label_mass = 0.0f;

@@ -1,8 +1,8 @@
-# Agent notes — Retroback fork of llama.cpp
+# Agent notes — Retrograd fork of llama.cpp
 
 This checkout is **not** upstream llama.cpp. It is the long-lived fork
-`tterrasson/llama.cpp-retroback`, vendored as a git submodule of the Retroback
-workspace at `crates/retroback-ffi/runtime/vendor/llama.cpp`.
+`tterrasson/llama.cpp-retrograd`, vendored as a git submodule of the Retrograd
+workspace at `crates/retrograd-ffi/runtime/vendor/llama.cpp`.
 
 Upstream's own `AGENTS.md` was replaced by this file on purpose: its
 instructions (contributing guide, PR conventions, CI expectations) describe a
@@ -18,7 +18,7 @@ why, and what the commit history is supposed to look like. The short version:
   by one line;
 - every hunk in an upstream file carries a `// retro delta:` comment saying why.
 
-Build, test and rebase instructions live in the Retroback workspace, not here:
+Build, test and rebase instructions live in the Retrograd workspace, not here:
 `CLAUDE.md`, `docs/tests/notice.md` and `docs/LLAMA_CPP_UPSTREAM_REBASE.md` at
 the workspace root. Do not run raw `cmake`/`ctest` invocations to validate a
 change — use the lane scripts under `scripts/`.

@@ -5,7 +5,7 @@
 #include "generic_head.glsl"
 #include "types.glsl"
 
-// retro delta: backward of the (Retroback-weighted) cross-entropy loss. Per row i1:
+// retro delta: backward of the (Retrograd-weighted) cross-entropy loss. Per row i1:
 //   p          = softmax(logits[i1])
 //   label_mass = Sum_c labels[i1,c]
 //   dst[i1,c]  = (label_mass * p[c] - labels[i1,c]) * grad[0] / nactive
