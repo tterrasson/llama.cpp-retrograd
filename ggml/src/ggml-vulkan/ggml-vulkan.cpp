@@ -14271,7 +14271,7 @@ static void ggml_vk_ssm_scan_back(ggml_backend_vk_context * ctx, vk_context& sub
     ctx->prealloc_split_k_need_sync = true;
     ctx->prealloc_y_last_pipeline_used = nullptr;
     ctx->prealloc_y_last_tensor_used = nullptr;
-    ctx->prealloc_y_last_decode_vector_staging = false;
+    ctx->prealloc_y_last_k_padded = false;
 }
 
 static void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
