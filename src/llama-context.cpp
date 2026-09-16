@@ -4061,7 +4061,7 @@ int32_t llama_context::opt_preflight(llama_opt_preflight_cb callback, void * use
             break;
         }
 
-        auto * res = gf_res_prev.get();
+        auto * res = get_gf_res_prev();
         const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
         res->reset();
         std::vector<ggml_tensor *> gradient_checkpoints;
@@ -4187,7 +4187,12 @@ int32_t llama_context::opt_preflight(llama_opt_preflight_cb callback, void * use
 
     // same invalidation as opt_epoch_iter: a later llama_decode must never
     // satisfy can_reuse() against the preflight graph
-    gf_res_prev->reset();
+    for (auto & res : gf_res_prev) {
+        if (res) {
+            res->reset();
+        }
+    }
+    gf_res_prev_active = nullptr;
     memory->clear(true);
     llama_batch_free(batch);
 
@@ -4469,7 +4474,12 @@ void llama_context::opt_epoch_iter(
     // context freed above. Reset the cached graph result so a following
     // llama_decode (e.g. policy-gradient rollout scoring between optimizer
     // steps) can never satisfy can_reuse() against a dangling training graph.
-    gf_res_prev->reset();
+    for (auto & res : gf_res_prev) {
+        if (res) {
+            res->reset();
+        }
+    }
+    gf_res_prev_active = nullptr;
 }
 
 bool llama_context::opt_step_packed_sequences(
