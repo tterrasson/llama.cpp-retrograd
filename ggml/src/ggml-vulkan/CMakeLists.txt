@@ -66,6 +66,11 @@ if (Vulkan_FOUND)
                              ggml-vulkan-rir.cpp
                              ggml-vulkan-rir.h
                              ../../include/ggml-vulkan.h
+                             ggml-vulkan-types.h
+                             ggml-vulkan-push-constants.h
+                             ggml-vulkan-common.h
+                             ggml-vulkan-buffers.cpp
+                             ggml-vulkan-debug.cpp
                             )
 
     set(VULKAN_SHADER_GEN_CMAKE_ARGS "")
