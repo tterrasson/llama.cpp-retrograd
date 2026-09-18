@@ -1083,6 +1083,10 @@ typedef struct {
     int32_t  sv1, sv2, sv3;
     int32_t  sb1, sb2, sb3;
     int32_t  kda;
+    // Columns of the S_v*S_v state one threadgroup owns. Launch geometry, not
+    // a tensor shape: the grid's x axis is ceil(S_v/ncols) column blocks and
+    // the other ports have no equivalent. See GDN_BACK_COLS.
+    int32_t  ncols;
     float    scale;
 } ggml_metal_kargs_gated_delta_net_back;
 

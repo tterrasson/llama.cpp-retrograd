@@ -6291,10 +6291,13 @@ int ggml_metal_op_ssm_scan_back(ggml_metal_op_t ctx, int idx) {
 
 // retro delta: analytic backward for GATED_DELTA_NET (Qwen3-Next / KDA),
 // mirroring the CPU reference (ggml-cpu/ops.cpp) and the CUDA/Vulkan ports.
-// Single dispatch: one threadgroup per (head, sequence) unit recomputes the
-// S_prev trajectory into scratch appended after the packed destination, then
-// reverse-scans it. Shared grad_q/grad_k use device atomics (see the kernel),
-// so the destination is zero-filled first.
+// Single dispatch over a (column block, (head, sequence) unit) grid: each
+// threadgroup recomputes its own columns of the S_prev trajectory into scratch
+// appended after the packed destination, then reverse-scans them. Outputs that
+// several threadgroups reach - grad_q/grad_k under GQA broadcast, grad_g and
+// grad_beta across column blocks - use device atomics (see the kernel), so the
+// destination is zero-filled first. The scratch stays per unit: column blocks
+// take disjoint slices of it, so splitting does not enlarge it.
 size_t ggml_metal_op_gated_delta_net_back_extra_tmp(const ggml_tensor * op) {
     GGML_ASSERT(op->op == GGML_OP_GATED_DELTA_NET_BACK);
 
@@ -6310,6 +6313,28 @@ size_t ggml_metal_op_gated_delta_net_back_extra_tmp(const ggml_tensor * op) {
     const int64_t per_unit = n_tokens*SS + 4*SS;
     return sizeof(float)*per_unit*H*n_seqs;
 }
+
+// How many of the state's S_v columns one threadgroup owns. The grid carries
+// ceil(S_v/GDN_BACK_COLS) column blocks per (head, sequence) unit, because the
+// unit axis alone (H*n_seqs threadgroups) is far below occupancy for a
+// n_tokens-step dependent chain.
+//
+// Four is measured, not derived. On Apple M5 at Qwen3.5's shape (S_v=128,
+// H=16, 512 tokens), tests/metal_ops.rs gated_delta_net_back_metal_timing
+// reads, per launch:
+//
+//     columns per block  128     64     32     16      8      4      2
+//     one sequence      80.6   67.6   66.1   51.2   47.0   45.3   53.5  ms
+//     four sequences       -  244.6  244.0  199.9  186.7  184.5  215.7  ms
+//
+// The two rows have the same optimum although their grids differ by 4x, hence
+// a block width rather than a target threadgroup count. Wider than four:
+// threadgroup size dominates - it crosses a dozen barriers per token. Narrower:
+// the per-token vectors indexed by the row axis (k, q and the gate) are re-read
+// in full by every block, and at two columns they cost more than the extra
+// parallelism buys. The one-sequence row is the binding shape in training,
+// since micro-batches of one sequence are the norm.
+static constexpr int64_t GDN_BACK_COLS = 4;
 
 int ggml_metal_op_gated_delta_net_back(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
@@ -6337,6 +6362,9 @@ int ggml_metal_op_gated_delta_net_back(ggml_metal_op_t ctx, int idx) {
 
     const float scale = 1.0f / sqrtf((float) S_v);
 
+    const int64_t ncols        = std::min<int64_t>(S_v, GDN_BACK_COLS);
+    const int64_t n_col_blocks = (S_v + ncols - 1)/ncols;
+
     ggml_metal_kargs_gated_delta_net_back args = {
         /*.S_v      =*/ S_v,
         /*.H        =*/ H,
@@ -6360,6 +6388,7 @@ int ggml_metal_op_gated_delta_net_back(ggml_metal_op_t ctx, int idx) {
         /*.sb2 =*/ (int32_t) (src_beta->nb[2]/sizeof(float)),
         /*.sb3 =*/ (int32_t) (src_beta->nb[3]/sizeof(float)),
         /*.kda      =*/ kda,
+        /*.ncols    =*/ (int32_t) ncols,
         /*.scale    =*/ scale,
     };
 
@@ -6370,11 +6399,17 @@ int ggml_metal_op_gated_delta_net_back(ggml_metal_op_t ctx, int idx) {
     bid_scratch.offs += ggml_nbytes(op);
 
     auto pipeline = ggml_metal_library_get_pipeline_gated_delta_net_back(lib, op);
-    // One threadgroup per (head, sequence). Each step of the sequential token
-    // scan is O(S_v^2) and is spread across the threadgroup.
-    const int nth = std::min<int64_t>(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), 256);
-    // Nine per-token vectors of S_v, plus one reduction slot per SIMD group.
-    const size_t smem = sizeof(float)*(9*(size_t) S_v + (size_t) ((nth + 31)/32));
+    // One SIMD group per column of the block: that is how the reductions over
+    // the contiguous row axis are written. A pipeline that cannot host that
+    // many threads gets fewer groups than columns, which the kernel's loops
+    // already stride for.
+    const int nth = (int) std::min<int64_t>(
+            ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), 32*ncols);
+    // Nine per-token vectors of S_v, plus one reduction slot per SIMD group,
+    // padded to the 16 bytes setThreadgroupMemoryLength requires (an S_v that
+    // is not a multiple of four would otherwise abort the encoder).
+    const size_t smem = GGML_PAD(
+            sizeof(float)*(9*(size_t) S_v + (size_t) ((nth + 31)/32)), 16);
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -6389,7 +6424,7 @@ int ggml_metal_op_gated_delta_net_back(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, bid_scratch,                          9);
     ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, (int64_t) H*n_seqs, 1, 1, nth, 1, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, n_col_blocks, (int64_t) H*n_seqs, 1, nth, 1, 1);
 
     return 1;
 }
