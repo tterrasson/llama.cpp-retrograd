@@ -7111,10 +7111,11 @@ static void ggml_acc_or_set(
         // stored in F16 (notably the differentiable training KV cache).
         // ggml_acc only accepts F32 operands, so promote the zero initializer
         // instead of inheriting the activation's storage type.
-        struct ggml_tensor * a_zero = src->type == GGML_TYPE_F32
-                ? ggml_scale(ctx, src, 0.0f)
-                : ggml_fill(ctx,
-                        ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, src->ne), 0.0f);
+        // retro delta: views in the unfused delta-net graph can have non-padded
+        // strides, which SCALE rejects. A gradient initializer only needs the
+        // shape, not the activation's data or layout (nor any NaNs it contains).
+        struct ggml_tensor * a_zero = ggml_fill(ctx,
+                ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, src->ne), 0.0f);
         cgraph->grads[isrc] = ggml_acc_impl(ctx, a_zero, tensor, nb1, nb2, nb3, offset, false);
     }
     ggml_format_name(cgraph->grads[isrc], "grad for %s", cgraph->visited_hash_set.keys[isrc]->name);
@@ -7232,7 +7233,14 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc0, grad);
             }
             if (src1_needs_grads) {
-                ggml_sub_or_set(ctx, cgraph, isrc1, grad);
+                // retro delta: SUB broadcasts its right operand just like ADD.
+                // Delta-net's chunk decay subtracts one gate from a full chunk;
+                // its gradient must sum those uses back to the operand's shape.
+                struct ggml_tensor * tmp = grad;
+                if (!ggml_are_same_shape(src0, src1)) {
+                    tmp = ggml_repeat_back(ctx, tmp, src1);
+                }
+                ggml_sub_or_set(ctx, cgraph, isrc1, tmp);
             }
         } break;
         case GGML_OP_MUL: {
@@ -7385,7 +7393,10 @@ static void ggml_compute_backward(
             if (src0_needs_grads) {
                 float s;
                 memcpy(&s, tensor->op_params, sizeof(float));
-                ggml_add_or_set(ctx, cgraph, isrc0, ggml_scale_impl(ctx, grad, s, 0.0, false));
+                // retro delta: a downstream PERMUTE can return a strided
+                // gradient even though SCALE's forward input was contiguous.
+                struct ggml_tensor * grad_padded = ggml_is_padded_1d(grad) ? grad : ggml_cont(ctx, grad);
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_scale_impl(ctx, grad_padded, s, 0.0, false));
             }
         } break;
         case GGML_OP_SET: {

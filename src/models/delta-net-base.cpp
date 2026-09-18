@@ -259,7 +259,9 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         ggml_tensor * o_ch = ggml_add(ctx0, attn_inter, v_attn);
         cb(o_ch, "dnet_add_ch_attn_out", il);
 
-        v = ggml_set_inplace(ctx0, v, o_ch, v->nb[1], v->nb[2], v->nb[3], chunk * v->nb[2]);
+        // retro delta: the unfused training graph needs v's previous value for
+        // backward. In-place SET aliases it and is rejected by autodiff.
+        v = ggml_set(ctx0, v, o_ch, v->nb[1], v->nb[2], v->nb[3], chunk * v->nb[2]);
 
         // kgdmulvnew = (key_gdiff).transpose(-1, -2) @ v_new
         // TODO: head broadcast might not work here - probably will need a transpose
