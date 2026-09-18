@@ -377,10 +377,14 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         return;
     }
 
-    // Q2: every supported training type decodes inside the tiled kernel and
-    // never allocates dequantization scratch. The legacy path remains below only
-    // for partial K/IQ/MXFP4 super-blocks.
-    if (ggml_cuda_out_prod_quant_native(ctx, src0, src1, dst)) {
+    // retro delta: the fused decoder serializes the entire reduction in each
+    // 256x32 tile. On training projections (thousands of reduction elements)
+    // this costs milliseconds per node even for short ubatches. Reuse bounded
+    // dequantize+SGEMM for wide, contiguous projections; it keeps true F32
+    // gradients and the existing scratch budget. Small reductions/outputs and
+    // strided weights retain the scratch-free kernel.
+    const bool use_gemm = ne01 >= 128 && ne10 >= OUT_PROD_Q_BN && ggml_is_contiguous(src0);
+    if (!use_gemm && ggml_cuda_out_prod_quant_native(ctx, src0, src1, dst)) {
         return;
     }
 
