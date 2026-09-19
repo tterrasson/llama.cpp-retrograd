@@ -975,6 +975,14 @@ struct ggml_tensor * ggml_opt_grad_acc(ggml_opt_context_t opt_ctx, struct ggml_t
     return ggml_graph_get_grad_acc(opt_ctx->gb_opt, node);
 }
 
+struct ggml_tensor * ggml_opt_grad_acc_by_name(ggml_opt_context_t opt_ctx, const char * name) {
+    if (!opt_ctx || !name) {
+        return nullptr;
+    }
+    const auto slot = opt_ctx->grad_acc_by_name.find(name);
+    return slot == opt_ctx->grad_acc_by_name.end() ? nullptr : slot->second;
+}
+
 // ====== Optimizer state access (retro delta) ======
 
 int64_t ggml_opt_iter(ggml_opt_context_t opt_ctx) {

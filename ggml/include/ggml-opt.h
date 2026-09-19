@@ -205,6 +205,17 @@ extern "C" {
     // get the gradient accumulator for a node from the forward graph
     GGML_API struct ggml_tensor * ggml_opt_grad_acc(ggml_opt_context_t opt_ctx, struct ggml_tensor * node);
 
+    // retro delta: the same accumulator, keyed by parameter name.
+    //
+    // ggml_opt_grad_acc() reads the graph, and a dynamic-graph context drops
+    // its graphs at the end of every ggml_opt_eval() - so the gradient the
+    // update step just consumed is unreachable the moment the step returns.
+    // The accumulators themselves live in ctx_static and outlive the graph,
+    // exactly like the momenta below, and the name is what indexes them.
+    // Returns NULL before the first optimizer graph is built and for a name
+    // that is not a parameter of it.
+    GGML_API struct ggml_tensor * ggml_opt_grad_acc_by_name(ggml_opt_context_t opt_ctx, const char * name);
+
     // retro delta: optimizer-state access for training checkpoints.
     //
     // The AdamW momenta are allocated lazily, by the first ggml_opt_alloc that
