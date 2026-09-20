@@ -125,6 +125,8 @@ void ggml_compute_forward_opt_step_adamw(const struct ggml_compute_params * para
 void ggml_compute_forward_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_fwht(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_opt_step_sgd(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_opt_step_gefen_stats(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_opt_step_gefen(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 #ifdef __cplusplus
 }
 #endif

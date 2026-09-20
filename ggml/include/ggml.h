@@ -601,6 +601,12 @@ extern "C" {
         GGML_OP_CROSS_ENTROPY_LOSS_BACK,
         GGML_OP_OPT_STEP_ADAMW,
         GGML_OP_OPT_STEP_SGD,
+        // retro delta: the two phases of the fixed-block Gefen update. The
+        // first is pure and the second mutates; they are separate ops because
+        // the second needs the first's answer for the whole block before it
+        // may overwrite any of the state the first read.
+        GGML_OP_OPT_STEP_GEFEN_STATS,
+        GGML_OP_OPT_STEP_GEFEN,
 
         GGML_OP_GLU,
 
@@ -3094,6 +3100,62 @@ extern "C" {
         struct ggml_tensor *  a,
         struct ggml_tensor *  grad,
         struct ggml_tensor *  sgd_params); // alpha, weight decay
+
+    // retro delta: which fixed-block state Gefen keeps. A checkpoint written
+    // under one must not be readable as the other, so this selects a layout
+    // version rather than parameterizing one.
+    enum ggml_opt_gefen_variant {
+        // F32 first moment per element, F32 second moment per block: 4N + 4K.
+        GGML_OPT_GEFEN_VARIANT_SHARED_V    = 0,
+        // Byte-indexed first moment against a shared codebook, F32 scale and
+        // second moment per block: N + 8K.
+        GGML_OPT_GEFEN_VARIANT_QUANTIZED_M = 1,
+    };
+
+    // The index a zero Gefen block stores. The uniform codebook has no exact
+    // zero - a zero block decodes through its zero scale - so this value only
+    // has to be canonical, and it is named so two implementations cannot pick
+    // different ones and write checkpoints that compare unequal for no reason.
+    #define GGML_GEFEN_ZERO_BLOCK_INDEX 127
+
+    // retro delta: fixed-block Gefen, phase A. Pure: it reads the clipped
+    // gradient and the old state and answers, per quantization block, the new
+    // scale and the new second moment as F32 [2, n_blocks]. Under the shared_v
+    // variant there is no scale to compute and the first row is zero.
+    //
+    //   grad     : F32, the parameter's shape
+    //   moment   : F32 first moment (shared_v) or I8 byte indices (quantized_m)
+    //   scales   : F32 [n_blocks], NULL under shared_v
+    //   v        : F32 [n_blocks]
+    //   codebook : F32 [levels], NULL under shared_v
+    //   params   : alpha, beta1, beta2, eps, wd, beta1h, beta2h, grad_scale
+    GGML_API struct ggml_tensor * ggml_opt_step_gefen_stats(
+        struct ggml_context * ctx,
+        struct ggml_tensor *  grad,
+        struct ggml_tensor *  moment,
+        struct ggml_tensor *  scales,
+        struct ggml_tensor *  v,
+        struct ggml_tensor *  codebook,
+        struct ggml_tensor *  params,
+        int                   variant,    // ggml_opt_gefen_variant
+        int                   block_size);
+
+    // retro delta: fixed-block Gefen, phase B. Mutates the weights, the first
+    // moment, the scales and the second moments; `stats` is phase A's answer,
+    // which is what lets one block's new scale be stored without any element of
+    // that block having lost its old one.
+    GGML_API struct ggml_tensor * ggml_opt_step_gefen(
+        struct ggml_context * ctx,
+        struct ggml_tensor *  a,
+        struct ggml_tensor *  grad,
+        struct ggml_tensor *  moment,
+        struct ggml_tensor *  scales,
+        struct ggml_tensor *  v,
+        struct ggml_tensor *  stats,
+        struct ggml_tensor *  codebook,
+        struct ggml_tensor *  params,
+        int                   variant,    // ggml_opt_gefen_variant
+        int                   block_size);
 
     // build forward multiple tensors and select one of them for computing
     // this is useful for creating graphs that have constant topology but compute different things based on the input

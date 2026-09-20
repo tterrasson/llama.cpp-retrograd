@@ -59,8 +59,60 @@ static const struct ggml_opt_slot_def ggml_opt_slots_adamw[] = {
     { "v", GGML_TYPE_F32, GGML_OPT_SLOT_SHAPE_PARAMETER, 0, GGML_OPT_SLOT_INIT_ZERO, 0 },
 };
 
+// Muon keeps one F32 momentum and nothing else; the Newton-Schulz workspace is
+// graph scratch, not state, so it survives no step.
+static const struct ggml_opt_slot_def ggml_opt_slots_muon[] = {
+    { "momentum", GGML_TYPE_F32, GGML_OPT_SLOT_SHAPE_PARAMETER, 0, GGML_OPT_SLOT_INIT_ZERO, 0 },
+};
+
+// Gefen's two variants are two slot tables, which is why the variant moves the
+// layout version rather than parameterizing one: 4N + 4K against N + 8K, and a
+// payload written under one is not readable as the other.
+static const struct ggml_opt_slot_def ggml_opt_slots_gefen_shared_v[] = {
+    { "m", GGML_TYPE_F32, GGML_OPT_SLOT_SHAPE_PARAMETER, 0, GGML_OPT_SLOT_INIT_ZERO, 0 },
+    { "v", GGML_TYPE_F32, GGML_OPT_SLOT_SHAPE_BLOCKS,    0, GGML_OPT_SLOT_INIT_ZERO, 0 },
+};
+
+static const struct ggml_opt_slot_def ggml_opt_slots_gefen_quantized_m[] = {
+    { "indices",        GGML_TYPE_I8,  GGML_OPT_SLOT_SHAPE_PARAMETER, 0,
+      GGML_OPT_SLOT_INIT_CODE, GGML_GEFEN_ZERO_BLOCK_INDEX },
+    { "scales",         GGML_TYPE_F32, GGML_OPT_SLOT_SHAPE_BLOCKS,    0, GGML_OPT_SLOT_INIT_ZERO, 0 },
+    { "second_moments", GGML_TYPE_F32, GGML_OPT_SLOT_SHAPE_BLOCKS,    0, GGML_OPT_SLOT_INIT_ZERO, 0 },
+};
+
+static const struct ggml_opt_slot_def ggml_opt_shared_slots_gefen[] = {
+    { "codebook", GGML_TYPE_F32, GGML_OPT_SLOT_SHAPE_FIXED, GGML_OPT_GEFEN_CODEBOOK_LEVELS,
+      GGML_OPT_SLOT_INIT_UNIFORM_CODEBOOK, 0 },
+};
+
+struct ggml_opt_optimizer_layout ggml_opt_default_optimizer_layout(void) {
+    struct ggml_opt_optimizer_layout layout = {};
+    layout.muon.ns_steps    = GGML_OPT_MUON_NS_STEPS;
+    layout.muon.nesterov    = true;
+    layout.gefen.variant    = GGML_OPT_GEFEN_VARIANT_SHARED_V;
+    layout.gefen.block_size = GGML_OPT_GEFEN_BLOCK_SIZE;
+    return layout;
+}
+
+static int64_t ggml_opt_gefen_block_size(const struct ggml_opt_optimizer_layout * layout) {
+    const int64_t declared = layout ? layout->gefen.block_size : 0;
+    return declared > 0 ? declared : GGML_OPT_GEFEN_BLOCK_SIZE;
+}
+
+static enum ggml_opt_gefen_variant ggml_opt_gefen_variant_of(
+        const struct ggml_opt_optimizer_layout * layout) {
+    return layout ? layout->gefen.variant : GGML_OPT_GEFEN_VARIANT_SHARED_V;
+}
+
+static int32_t ggml_opt_muon_ns_steps(const struct ggml_opt_optimizer_layout * layout) {
+    const int32_t declared = layout ? layout->muon.ns_steps : 0;
+    return declared > 0 ? declared : GGML_OPT_MUON_NS_STEPS;
+}
+
 const struct ggml_opt_slot_def * ggml_opt_optimizer_slots(
-        enum ggml_opt_optimizer_type optimizer, int64_t * n_slots) {
+        enum ggml_opt_optimizer_type             optimizer,
+        const struct ggml_opt_optimizer_layout * layout,
+        int64_t                                * n_slots) {
     switch (optimizer) {
         case GGML_OPT_OPTIMIZER_TYPE_ADAMW:
             if (n_slots) {
@@ -74,20 +126,71 @@ const struct ggml_opt_slot_def * ggml_opt_optimizer_slots(
                 *n_slots = 0;
             }
             return nullptr;
+        case GGML_OPT_OPTIMIZER_TYPE_MUON:
+            if (n_slots) {
+                *n_slots = (int64_t) (sizeof(ggml_opt_slots_muon)/sizeof(ggml_opt_slots_muon[0]));
+            }
+            return ggml_opt_slots_muon;
+        case GGML_OPT_OPTIMIZER_TYPE_GEFEN: {
+            // The only table whose shapes are not a constant: the block size is
+            // declared per run. Answered into per-thread storage, which the
+            // caller reads before its next call - the same contract every other
+            // table has, minus the promise that the pointer is a constant.
+            static thread_local struct ggml_opt_slot_def resolved[3];
+            const struct ggml_opt_slot_def * declared;
+            int64_t count;
+            if (ggml_opt_gefen_variant_of(layout) == GGML_OPT_GEFEN_VARIANT_QUANTIZED_M) {
+                declared = ggml_opt_slots_gefen_quantized_m;
+                count    = (int64_t) (sizeof(ggml_opt_slots_gefen_quantized_m)
+                        /sizeof(ggml_opt_slots_gefen_quantized_m[0]));
+            } else {
+                declared = ggml_opt_slots_gefen_shared_v;
+                count    = (int64_t) (sizeof(ggml_opt_slots_gefen_shared_v)
+                        /sizeof(ggml_opt_slots_gefen_shared_v[0]));
+            }
+            for (int64_t i = 0; i < count; ++i) {
+                resolved[i] = declared[i];
+                if (resolved[i].shape == GGML_OPT_SLOT_SHAPE_BLOCKS) {
+                    resolved[i].n_block = ggml_opt_gefen_block_size(layout);
+                }
+            }
+            if (n_slots) {
+                *n_slots = count;
+            }
+            return resolved;
+        }
         default:
             GGML_ABORT("unknown optimizer");
     }
 }
 
 const struct ggml_opt_slot_def * ggml_opt_optimizer_shared_slots(
-        enum ggml_opt_optimizer_type optimizer, int64_t * n_slots) {
+        enum ggml_opt_optimizer_type             optimizer,
+        const struct ggml_opt_optimizer_layout * layout,
+        int64_t                                * n_slots) {
     switch (optimizer) {
         case GGML_OPT_OPTIMIZER_TYPE_ADAMW:
         case GGML_OPT_OPTIMIZER_TYPE_SGD:
+        case GGML_OPT_OPTIMIZER_TYPE_MUON:
             if (n_slots) {
                 *n_slots = 0;
             }
             return nullptr;
+        case GGML_OPT_OPTIMIZER_TYPE_GEFEN:
+            // An unquantized first moment has nothing to look up, so the
+            // shared scope is empty under shared_v and carries the codebook
+            // under quantized_m.
+            if (ggml_opt_gefen_variant_of(layout) != GGML_OPT_GEFEN_VARIANT_QUANTIZED_M) {
+                if (n_slots) {
+                    *n_slots = 0;
+                }
+                return nullptr;
+            }
+            if (n_slots) {
+                *n_slots = (int64_t) (sizeof(ggml_opt_shared_slots_gefen)
+                        /sizeof(ggml_opt_shared_slots_gefen[0]));
+            }
+            return ggml_opt_shared_slots_gefen;
         default:
             GGML_ABORT("unknown optimizer");
     }
@@ -99,6 +202,11 @@ int64_t ggml_opt_optimizer_n_params(enum ggml_opt_optimizer_type optimizer) {
         // the stochastic rounding of an F16 parameter needs.
         case GGML_OPT_OPTIMIZER_TYPE_ADAMW: return 8;
         case GGML_OPT_OPTIMIZER_TYPE_SGD:   return 2;
+        // alpha, momentum, wd, ns_epsilon. The iteration count and the Nesterov
+        // choice are structural and belong to the layout, not here.
+        case GGML_OPT_OPTIMIZER_TYPE_MUON:  return 4;
+        // alpha, beta1, beta2, eps, wd, beta1h, beta2h.
+        case GGML_OPT_OPTIMIZER_TYPE_GEFEN: return 7;
         default: GGML_ABORT("unknown optimizer");
     }
 }
@@ -196,6 +304,10 @@ struct ggml_opt_context {
     enum ggml_opt_optimizer_type optimizer = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
     ggml_opt_get_param_optimizer get_param_optimizer    = nullptr;
     void *                       get_param_optimizer_ud = nullptr;
+    // The structural half of every optimizer this run may build a step for.
+    // Fixed at ggml_opt_init: a slot's block count and a step's node count are
+    // part of what a checkpoint records, not values a schedule moves.
+    struct ggml_opt_optimizer_layout layout = {};
 };
 
 // The optimizer that owns one parameter: the run's, unless the caller answers
@@ -345,6 +457,20 @@ static void ggml_opt_fill_slots(ggml_opt_context_t opt_ctx) {
     }
 }
 
+// One owner's shared slot by name, or null before the state is allocated.
+// Shared state is allocated once per owner, so the lookup is a scan of a list
+// with one entry per (owner, slot) and not per parameter.
+static struct ggml_tensor * ggml_opt_shared_slot(
+        ggml_opt_context_t opt_ctx, enum ggml_opt_optimizer_type owner, const char * name) {
+    const char * owner_name = ggml_opt_optimizer_name(owner);
+    for (const ggml_opt_slot & slot : opt_ctx->shared_slots) {
+        if (slot.owner == owner_name && slot.name == name) {
+            return slot.tensor;
+        }
+    }
+    return nullptr;
+}
+
 // retro delta: one optimizer's update, as a graph.
 //
 // The one place an optimizer's arithmetic is written. Its inputs are the
@@ -375,6 +501,114 @@ static struct ggml_tensor * ggml_opt_build_step(
             GGML_ASSERT(n_slots == 0 && "sgd keeps no per-parameter state");
             GGML_UNUSED(slots);
             return ggml_opt_step_sgd(ctx, param, ggml_mul(ctx, grad, grad_scale), step_args);
+        case GGML_OPT_OPTIMIZER_TYPE_MUON: {
+            GGML_ASSERT(n_slots == 1 && "muon declares one slot per parameter");
+            struct ggml_tensor * momentum = slots[0].tensor;
+            GGML_ASSERT(ggml_are_same_shape(momentum, param) &&
+                    "optimizer parameter changed shape between graph builds");
+            // F32 weights first; an F16 writeback has to preserve the intended
+            // rounding and is separate work.
+            GGML_ASSERT(param->type == GGML_TYPE_F32);
+            // Eligibility admits exactly two nontrivial logical dimensions, so
+            // the two trailing axes are the matrix and nothing else.
+            GGML_ASSERT(param->ne[2] == 1 && param->ne[3] == 1);
+
+            // ggml's ne[0] is the fastest axis and is the mathematical column
+            // index; ne[1] is the row index. Every orientation below is stated
+            // in those terms and nowhere in ggml's.
+            const int64_t rows = param->ne[1];
+            const int64_t cols = param->ne[0];
+
+            struct ggml_tensor * alpha = ggml_view_1d(ctx, step_args, 1, 0*sizeof(float));
+            struct ggml_tensor * mu    = ggml_view_1d(ctx, step_args, 1, 1*sizeof(float));
+            struct ggml_tensor * wd    = ggml_view_1d(ctx, step_args, 1, 2*sizeof(float));
+            struct ggml_tensor * eps   = ggml_view_1d(ctx, step_args, 1, 3*sizeof(float));
+            struct ggml_tensor * one_minus_mu = ggml_scale_bias(ctx, mu, -1.0f, 1.0f);
+
+            struct ggml_tensor * g = ggml_mul(ctx, grad, grad_scale);
+            // M = mu*M + (1-mu)*g, computed before anything writes M back, so
+            // every read of the old momentum is inside this node.
+            struct ggml_tensor * m_new = ggml_add(ctx,
+                    ggml_mul(ctx, momentum, mu),
+                    ggml_mul(ctx, g, one_minus_mu));
+            struct ggml_tensor * u = opt_ctx->layout.muon.nesterov
+                    ? ggml_add(ctx, ggml_mul(ctx, g, one_minus_mu), ggml_mul(ctx, m_new, mu))
+                    : m_new;
+
+            // Orient so rows <= columns; the iteration below forms an r x r
+            // Gram matrix and r is the dimension that must be the smaller one.
+            const bool transposed = rows > cols;
+            struct ggml_tensor * x = transposed ? ggml_cont(ctx, ggml_transpose(ctx, u)) : u;
+
+            struct ggml_tensor * frobenius = ggml_add(ctx,
+                    ggml_sqrt(ctx, ggml_sum(ctx, ggml_sqr(ctx, x))), eps);
+            x = ggml_div(ctx, x, frobenius);
+
+            // A = X X^T; X = a*X + (b*A + c*A^2) X, quintic, frozen v1
+            // coefficients. This is approximate orthogonalization: it is not
+            // asked to converge, only to be the same five steps every time.
+            const int32_t ns_steps = ggml_opt_muon_ns_steps(&opt_ctx->layout);
+            for (int32_t step = 0; step < ns_steps; ++step) {
+                struct ggml_tensor * a  = ggml_mul_mat(ctx, x, x);
+                struct ggml_tensor * a2 = ggml_mul_mat(ctx, a, a);
+                struct ggml_tensor * p  = ggml_add(ctx,
+                        ggml_scale(ctx, a,  -4.7750f),
+                        ggml_scale(ctx, a2,  2.0315f));
+                struct ggml_tensor * xt = ggml_cont(ctx, ggml_transpose(ctx, x));
+                x = ggml_add(ctx, ggml_scale(ctx, x, 3.4445f), ggml_mul_mat(ctx, xt, p));
+            }
+            if (transposed) {
+                x = ggml_cont(ctx, ggml_transpose(ctx, x));
+            }
+
+            // sqrt(max(1, rows/cols)) on the *original* logical dimensions, so
+            // the factor does not follow the orientation the iteration chose.
+            const float shape_scale = sqrtf(std::max(1.0f, (float) rows/(float) cols));
+            struct ggml_tensor * keep = ggml_scale_bias(ctx, ggml_mul(ctx, alpha, wd), -1.0f, 1.0f);
+            struct ggml_tensor * w_new = ggml_sub(ctx,
+                    ggml_mul(ctx, param, keep),
+                    ggml_mul(ctx, ggml_scale(ctx, x, shape_scale), alpha));
+
+            // Two writes, one returned. The helper's contract is that the
+            // caller roots what it returns, so a step with an auxiliary write
+            // roots that write itself or it is built and never executed.
+            ggml_build_forward_expand(opt_ctx->gb_opt, ggml_cpy(ctx, m_new, momentum));
+            return ggml_cpy(ctx, w_new, param);
+        }
+        case GGML_OPT_OPTIMIZER_TYPE_GEFEN: {
+            const enum ggml_opt_gefen_variant variant =
+                    ggml_opt_gefen_variant_of(&opt_ctx->layout);
+            const int block_size = (int) ggml_opt_gefen_block_size(&opt_ctx->layout);
+            GGML_ASSERT(param->type == GGML_TYPE_F32);
+
+            struct ggml_tensor * moment   = nullptr;
+            struct ggml_tensor * scales   = nullptr;
+            struct ggml_tensor * second   = nullptr;
+            struct ggml_tensor * codebook = nullptr;
+            if (variant == GGML_OPT_GEFEN_VARIANT_QUANTIZED_M) {
+                GGML_ASSERT(n_slots == 3 && "quantized_m keeps indices, scales and second moments");
+                moment = slots[0].tensor;
+                scales = slots[1].tensor;
+                second = slots[2].tensor;
+                codebook = ggml_opt_shared_slot(opt_ctx, GGML_OPT_OPTIMIZER_TYPE_GEFEN, "codebook");
+                GGML_ASSERT(codebook && "quantized_m declares a shared codebook that was not allocated");
+            } else {
+                GGML_ASSERT(n_slots == 2 && "shared_v keeps a first moment and a per-block second moment");
+                moment = slots[0].tensor;
+                second = slots[1].tensor;
+            }
+
+            // Phase A is pure and phase B mutates. The split is the whole
+            // reason a block's new scale can be stored at all: every element of
+            // the block is read against the old one first, and the dependency
+            // between the two nodes is what orders them.
+            struct ggml_tensor * stats = ggml_opt_step_gefen_stats(
+                    ctx, grad, moment, scales, second, codebook, step_args,
+                    (int) variant, block_size);
+            return ggml_opt_step_gefen(
+                    ctx, param, grad, moment, scales, second, stats, codebook, step_args,
+                    (int) variant, block_size);
+        }
         default:
             GGML_ABORT("unknown optimizer");
     }
@@ -635,6 +869,19 @@ struct ggml_opt_optimizer_params ggml_opt_get_default_optimizer_params(void * us
     result.sgd.alpha   = 1e-3f;
     result.sgd.wd      = 0.0f;
 
+    // An orthogonalized update is not in AdamW's units, which is why this rate
+    // is twenty times the one above rather than derived from it.
+    result.muon.alpha      = 0.02f;
+    result.muon.momentum   = 0.95f;
+    result.muon.wd         = 0.0f;
+    result.muon.ns_epsilon = 1e-7f;
+
+    result.gefen.alpha = 1e-3f;
+    result.gefen.beta1 = 0.9f;
+    result.gefen.beta2 = 0.999f;
+    result.gefen.eps   = 1e-8f;
+    result.gefen.wd    = 0.0f;
+
     return result;
 }
 
@@ -659,6 +906,7 @@ struct ggml_opt_params ggml_opt_default_params(
         /*optimizer       =*/ GGML_OPT_OPTIMIZER_TYPE_ADAMW,
         /*get_param_optimizer    =*/ nullptr,
         /*get_param_optimizer_ud =*/ nullptr,
+        /*layout                 =*/ ggml_opt_default_optimizer_layout(),
     };
 }
 
@@ -772,7 +1020,8 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             n_param++;
             if (need_slots) {
                 int64_t n_defs = 0;
-                ggml_opt_optimizer_slots(ggml_opt_owner_of(opt_ctx, node), &n_defs);
+                ggml_opt_optimizer_slots(
+                        ggml_opt_owner_of(opt_ctx, node), &opt_ctx->layout, &n_defs);
                 n_slot_tensors += (int) n_defs;
             }
         }
@@ -930,7 +1179,8 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
                     owners.push_back(owner);
                 }
                 int64_t n_defs = 0;
-                const struct ggml_opt_slot_def * defs = ggml_opt_optimizer_slots(owner, &n_defs);
+                const struct ggml_opt_slot_def * defs =
+                        ggml_opt_optimizer_slots(owner, &opt_ctx->layout, &n_defs);
                 const size_t begin = opt_ctx->slots.size();
                 for (int64_t slot = 0; slot < n_defs; ++slot) {
                     opt_ctx->slots.push_back(ggml_opt_slot_alloc(
@@ -944,7 +1194,8 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             // which is every optimizer this build can run.
             for (const enum ggml_opt_optimizer_type owner : owners) {
                 int64_t n_defs = 0;
-                const struct ggml_opt_slot_def * defs = ggml_opt_optimizer_shared_slots(owner, &n_defs);
+                const struct ggml_opt_slot_def * defs =
+                        ggml_opt_optimizer_shared_slots(owner, &opt_ctx->layout, &n_defs);
                 GGML_ASSERT(n_defs <= GGML_OPT_MAX_SHARED_SLOTS &&
                         "an optimizer declares more shared slots than the static context was sized for");
                 for (int64_t slot = 0; slot < n_defs; ++slot) {
@@ -1084,9 +1335,16 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
                 step_args[type] = ggml_concat(opt_ctx->ctx_compute, declared, grad_scale, 0);
                 break;
             case GGML_OPT_OPTIMIZER_TYPE_SGD:
-                // SGD keeps the explicit multiply: its kernel is untouched by
-                // the F16 work and takes a scaled gradient instead.
+            case GGML_OPT_OPTIMIZER_TYPE_MUON:
+                // Both keep the explicit multiply: SGD's kernel is untouched by
+                // the F16 work, and Muon's step is a graph whose first node can
+                // scale the gradient as cheaply as its kernel would.
                 step_args[type] = declared;
+                break;
+            case GGML_OPT_OPTIMIZER_TYPE_GEFEN:
+                // Two phases read the scale, so it travels with the
+                // coefficients rather than as a full-size scaled gradient.
+                step_args[type] = ggml_concat(opt_ctx->ctx_compute, declared, grad_scale, 0);
                 break;
             default:
                 GGML_ABORT("unknown optimizer");
@@ -1147,6 +1405,7 @@ ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
     result->get_opt_pars     = params.get_opt_pars;
     result->get_opt_pars_ud  = params.get_opt_pars_ud;
     result->optimizer        = params.optimizer;
+    result->layout                 = params.layout;
     result->get_param_optimizer    = params.get_param_optimizer;
     result->get_param_optimizer_ud = params.get_param_optimizer_ud;
 
@@ -1842,6 +2101,38 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
                     values[0] = opt_pars.sgd.alpha;
                     values[1] = opt_pars.sgd.wd;
                 } break;
+                case GGML_OPT_OPTIMIZER_TYPE_MUON: {
+                    GGML_ASSERT(opt_pars.muon.alpha > 0.0f);
+                    GGML_ASSERT(opt_pars.muon.momentum >= 0.0f);
+                    GGML_ASSERT(opt_pars.muon.momentum <= 1.0f);
+                    GGML_ASSERT(opt_pars.muon.wd >= 0.0f);
+                    GGML_ASSERT(opt_pars.muon.wd <= 1.0f);
+                    GGML_ASSERT(opt_pars.muon.ns_epsilon > 0.0f);
+                    values[0] = opt_pars.muon.alpha;
+                    values[1] = opt_pars.muon.momentum;
+                    values[2] = opt_pars.muon.wd;
+                    values[3] = opt_pars.muon.ns_epsilon;
+                } break;
+                case GGML_OPT_OPTIMIZER_TYPE_GEFEN: {
+                    GGML_ASSERT(opt_pars.gefen.alpha > 0.0f);
+                    GGML_ASSERT(opt_pars.gefen.beta1 >= 0.0f);
+                    GGML_ASSERT(opt_pars.gefen.beta1 <= 1.0f);
+                    GGML_ASSERT(opt_pars.gefen.beta2 >= 0.0f);
+                    GGML_ASSERT(opt_pars.gefen.beta2 <= 1.0f);
+                    GGML_ASSERT(opt_pars.gefen.eps >= 0.0f);
+                    GGML_ASSERT(opt_pars.gefen.wd >= 0.0f);
+                    GGML_ASSERT(opt_pars.gefen.wd <= 1.0f);
+                    values[0] = opt_pars.gefen.alpha;
+                    values[1] = opt_pars.gefen.beta1;
+                    values[2] = opt_pars.gefen.beta2;
+                    values[3] = opt_pars.gefen.eps;
+                    values[4] = opt_pars.gefen.wd;
+                    // The same bias corrections AdamW applies, over the same
+                    // iteration counter: a per-block second moment changes what
+                    // is averaged, not how long it has been averaging.
+                    values[5] = 1.0f / (1.0f - powf(opt_pars.gefen.beta1, opt_ctx->iter));
+                    values[6] = 1.0f / (1.0f - powf(opt_pars.gefen.beta2, opt_ctx->iter));
+                } break;
                 default:
                     GGML_ABORT("unknown optimizer");
             }
@@ -2115,6 +2406,10 @@ GGML_API const char * ggml_opt_optimizer_name(enum ggml_opt_optimizer_type o) {
             return "adamw";
         case GGML_OPT_OPTIMIZER_TYPE_SGD:
             return "sgd";
+        case GGML_OPT_OPTIMIZER_TYPE_MUON:
+            return "muon";
+        case GGML_OPT_OPTIMIZER_TYPE_GEFEN:
+            return "gefen";
         default:
             return "undefined";
     };

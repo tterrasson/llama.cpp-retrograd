@@ -124,6 +124,8 @@ int ggml_metal_op_moe_reduce        (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_tri               (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_opt_step_adamw    (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_opt_step_sgd      (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_opt_step_gefen_stats(ggml_metal_op_t ctx, int idx); // retro delta
+int ggml_metal_op_opt_step_gefen      (ggml_metal_op_t ctx, int idx); // retro delta
 // retro delta: the encoder of a pair whose native kernel is retired.
 // RMS_NORM_BACK and L2_NORM_BACK both route here and
 // neither has an entry of its own any more — the generated variant is the only

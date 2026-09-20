@@ -1727,6 +1727,12 @@ extern "C" {
         // GGML_TYPE_F32 keeps the bit-exact default. Ignored without
         // gradient_checkpointing.
         enum ggml_type checkpoint_type;
+
+        // retro delta: the structural half of the optimizer descriptor - the
+        // Newton-Schulz iteration count, the Gefen variant and its block size.
+        // Passed through to ggml_opt_init verbatim, because the allocator and
+        // the update graph are the two readers and both live below here.
+        struct ggml_opt_optimizer_layout optimizer_layout;
     };
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);

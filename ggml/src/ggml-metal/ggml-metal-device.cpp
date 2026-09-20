@@ -2603,6 +2603,47 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_opt_step_sgd(ggm
     return res;
 }
 
+// retro delta: fixed-block Gefen. The variant is a layout version rather than a
+// parameter, so it selects the kernel instead of travelling in the arguments.
+static const char * ggml_metal_gefen_variant_suffix(const ggml_tensor * op) {
+    return ggml_get_op_params_i32(op, 0) == GGML_OPT_GEFEN_VARIANT_QUANTIZED_M
+            ? "quantized_m" : "shared_v";
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_opt_step_gefen_stats(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_OPT_STEP_GEFEN_STATS);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_opt_step_gefen_stats_%s", ggml_metal_gefen_variant_suffix(op));
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_opt_step_gefen(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_OPT_STEP_GEFEN);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_opt_step_gefen_%s", ggml_metal_gefen_variant_suffix(op));
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_silu_back(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_SILU_BACK);
 

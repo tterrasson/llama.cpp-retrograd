@@ -13405,6 +13405,215 @@ void ggml_compute_forward_opt_step_sgd(const ggml_compute_params * params, ggml_
     }
 }
 
+// retro delta: fixed-block Gefen, the CPU reference for both variants.
+//
+// One worker owns a whole quantization block in both phases, which is what
+// makes the two-phase split a pure read followed by an ordered write rather
+// than a race: no element of a block loses its old scale before every element
+// of that block has been read against it.
+
+// The uniform codebook's nearest entry for a value in [-1, 1], with ties going
+// to the lower index. Byte patterns, never signed offsets.
+static inline uint8_t ggml_gefen_nearest_code(float value, int64_t levels) {
+    const float top = (float) (levels - 1);
+    float position = (value + 1.0f) * 0.5f * top;
+    if (!(position > 0.0f)) {
+        // Catches NaN as well, which has no nearest entry to speak of.
+        return 0;
+    }
+    if (position >= top) {
+        return (uint8_t) (levels - 1);
+    }
+    // ceil(x - 1/2) is nearest-with-ties-to-the-lower-index; the usual
+    // floor(x + 1/2) would send an exact midpoint upwards.
+    const float rounded = ceilf(position - 0.5f);
+    return (uint8_t) rounded;
+}
+
+struct ggml_gefen_block_range {
+    int64_t first;
+    int64_t last; // exclusive
+};
+
+// Complete blocks per worker: a block is the unit of ownership, so a worker
+// never shares one with another.
+static struct ggml_gefen_block_range ggml_gefen_blocks_for(int ith, int nth, int64_t n_blocks) {
+    const int64_t per = (n_blocks + nth - 1)/nth;
+    struct ggml_gefen_block_range range;
+    range.first = MIN(per*ith, n_blocks);
+    range.last  = MIN(range.first + per, n_blocks);
+    return range;
+}
+
+static void ggml_compute_forward_opt_step_gefen_stats_f32(
+        const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * grad     = dst->src[0];
+    const ggml_tensor * moment   = dst->src[1];
+    const ggml_tensor * scales   = dst->src[2];
+    const ggml_tensor * v        = dst->src[3];
+    const ggml_tensor * codebook = dst->src[4];
+    const ggml_tensor * gefen    = dst->src[5];
+
+    const int32_t variant    = ggml_get_op_params_i32(dst, 0);
+    const int64_t block_size = ggml_get_op_params_i32(dst, 1);
+    GGML_ASSERT(block_size > 0);
+    GGML_ASSERT(ggml_nelements(gefen) == 8);
+
+    const float * gefen_ptr = ggml_get_data_f32(gefen);
+    const float beta1  = gefen_ptr[1];
+    const float beta2  = gefen_ptr[2];
+    const float gscale = gefen_ptr[7];
+
+    const int64_t n_elements = ggml_nelements(grad);
+    const int64_t n_blocks   = ggml_nelements(v);
+    const int64_t levels     = codebook ? ggml_nelements(codebook) : 0;
+
+    const float   * g     = (const float   *) grad->data;
+    const float   * v_old = (const float   *) v->data;
+    const uint8_t * i_old = variant == GGML_OPT_GEFEN_VARIANT_QUANTIZED_M
+            ? (const uint8_t *) moment->data : NULL;
+    const float   * s_old = scales ? (const float *) scales->data : NULL;
+    const float   * code  = codebook ? (const float *) codebook->data : NULL;
+    float         * out   = (float *) dst->data;
+
+    const struct ggml_gefen_block_range range =
+            ggml_gefen_blocks_for(params->ith, params->nth, n_blocks);
+
+    for (int64_t b = range.first; b < range.last; ++b) {
+        const int64_t i0 = b*block_size;
+        const int64_t i1 = MIN(i0 + block_size, n_elements);
+
+        float sum_sq  = 0.0f;
+        float max_abs = 0.0f;
+        for (int64_t i = i0; i < i1; ++i) {
+            const float gi = g[i]*gscale;
+            sum_sq += gi*gi;
+            if (i_old) {
+                // The same recomputed first moment the update will use, so the
+                // scale a block is quantized against is the scale of the values
+                // actually being quantized.
+                const float decoded = s_old[b]*code[i_old[i] < levels ? i_old[i] : levels - 1];
+                const float mi = beta1*decoded + (1.0f - beta1)*gi;
+                max_abs = MAX(max_abs, fabsf(mi));
+            }
+        }
+        // The mean is over the block's actual elements, so a partial trailing
+        // block is not diluted by the padding it does not have.
+        const float mean_sq = sum_sq/(float) (i1 - i0);
+        out[2*b + 0] = max_abs;
+        out[2*b + 1] = beta2*v_old[b] + (1.0f - beta2)*mean_sq;
+    }
+
+    GGML_UNUSED(moment);
+}
+
+void ggml_compute_forward_opt_step_gefen_stats(
+        const ggml_compute_params * params, ggml_tensor * dst) {
+    ggml_compute_forward_opt_step_gefen_stats_f32(params, dst);
+}
+
+static void ggml_compute_forward_opt_step_gefen_f32(
+        const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0     = dst->src[0];
+    const ggml_tensor * grad     = dst->src[1];
+    const ggml_tensor * moment   = dst->src[2];
+    const ggml_tensor * scales   = dst->src[3];
+    const ggml_tensor * v        = dst->src[4];
+    const ggml_tensor * stats    = dst->src[5];
+    const ggml_tensor * codebook = dst->src[6];
+    const ggml_tensor * gefen    = dst->src[7];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src0));
+
+    const int32_t variant    = ggml_get_op_params_i32(dst, 0);
+    const int64_t block_size = ggml_get_op_params_i32(dst, 1);
+    GGML_ASSERT(block_size > 0);
+    GGML_ASSERT(ggml_nelements(gefen) == 8);
+
+    const float * gefen_ptr = ggml_get_data_f32(gefen);
+    const float alpha  = gefen_ptr[0];
+    const float beta1  = gefen_ptr[1];
+    const float eps    = gefen_ptr[3];
+    const float wd     = gefen_ptr[4];
+    const float beta1h = gefen_ptr[5];
+    const float beta2h = gefen_ptr[6];
+    const float gscale = gefen_ptr[7];
+    const float keep   = 1.0f - alpha*wd;
+
+    const int64_t n_elements = ggml_nelements(src0);
+    const int64_t n_blocks   = ggml_nelements(v);
+    const int64_t levels     = codebook ? ggml_nelements(codebook) : 0;
+
+    float       * w       = (float       *) src0->data;
+    const float * g       = (const float *) grad->data;
+    const float * st      = (const float *) stats->data;
+    float       * v_state = (float       *) v->data;
+    float       * s_state = scales ? (float *) scales->data : NULL;
+    float       * m_state = variant == GGML_OPT_GEFEN_VARIANT_SHARED_V
+            ? (float *) moment->data : NULL;
+    uint8_t     * i_state = variant == GGML_OPT_GEFEN_VARIANT_QUANTIZED_M
+            ? (uint8_t *) moment->data : NULL;
+    const float * code    = codebook ? (const float *) codebook->data : NULL;
+
+    const struct ggml_gefen_block_range range =
+            ggml_gefen_blocks_for(params->ith, params->nth, n_blocks);
+
+    for (int64_t b = range.first; b < range.last; ++b) {
+        const int64_t i0 = b*block_size;
+        const int64_t i1 = MIN(i0 + block_size, n_elements);
+
+        const float scale_new = st[2*b + 0];
+        const float v_new     = st[2*b + 1];
+        const float denom     = sqrtf(v_new*beta2h) + eps;
+        // Read once, before any element of this block overwrites it.
+        const float scale_old = s_state ? s_state[b] : 0.0f;
+
+        for (int64_t i = i0; i < i1; ++i) {
+            const float gi = g[i]*gscale;
+            float mi;
+            if (i_state) {
+                const float decoded = scale_old*code[i_state[i] < levels ? i_state[i] : levels - 1];
+                mi = beta1*decoded + (1.0f - beta1)*gi;
+            } else {
+                mi = beta1*m_state[i] + (1.0f - beta1)*gi;
+            }
+            // Decoupled, and against the old weight: decaying an already
+            // updated weight adds a cross term AdamW does not have.
+            w[i] = w[i]*keep - alpha*(mi*beta1h)/denom;
+            if (i_state) {
+                // A zero block has no direction to quantize; its scale carries
+                // the zero and the index only has to be canonical.
+                i_state[i] = scale_new > 0.0f
+                        ? ggml_gefen_nearest_code(mi/scale_new, levels)
+                        : (uint8_t) GGML_GEFEN_ZERO_BLOCK_INDEX;
+            } else {
+                m_state[i] = mi;
+            }
+        }
+        if (s_state) {
+            s_state[b] = scale_new;
+        }
+        v_state[b] = v_new;
+    }
+}
+
+void ggml_compute_forward_opt_step_gefen(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_opt_step_gefen_f32(params, dst);
+            }
+            break;
+        default:
+            {
+                GGML_ABORT("fatal error - gefen is F32 only");
+            }
+    }
+}
+
 static inline float ggml_fwht_load(const float value) {
     return value;
 }

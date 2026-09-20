@@ -1466,6 +1466,16 @@ typedef struct {
     int64_t  np;
 } ggml_metal_kargs_opt_step_sgd;
 
+// retro delta: fixed-block Gefen, shared by both phases. `zero_code` travels
+// from the host rather than being restated here so the canonical index has one
+// definition (ggml.h) for every backend.
+typedef struct {
+    int64_t  np;
+    int64_t  bs;
+    int32_t  levels;
+    int32_t  zero_code;
+} ggml_metal_kargs_opt_step_gefen;
+
 typedef struct {
     int64_t ne;
 } ggml_metal_kargs_silu_back;
