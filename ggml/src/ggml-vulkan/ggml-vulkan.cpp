@@ -3092,7 +3092,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_l2_norm_f32, "l2_norm_f32", l2_norm_f32_len, l2_norm_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
     // retro delta: every RIR variant this build carries, created from the
-    // registry alone (docs/INT_RIR_V3.md §R0).
+    // registry alone.
     //
     // Binding count, constant-buffer size, entrypoint, workgroup and subgroup
     // width all come from the registry row; the SPIR-V comes from the artifact
@@ -3622,7 +3622,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
     }
 
-    // retro delta: fused sparse cross-entropy (docs/memory/GPUVOCAB.md). One
+    // retro delta: fused sparse cross-entropy. One
     // workgroup per token; wg_denoms {1,1,1} so the dispatch element count is the
     // token count itself. A single generic shader per direction is compiled once
     // per head type (the head is dequantized via dequant_funcs.glsl), so adding a
@@ -4466,8 +4466,8 @@ vk_device ggml_vk_get_device(size_t idx) {
         // device whose native subgroup is 32 satisfies that outright; otherwise the
         // pipelines can *ask* for 32 through VK_EXT_subgroup_size_control, which is
         // what unblocks AMD in wave64 — there the native subgroup is 64 but 32 is
-        // selectable, and without this the whole backward fell back to the CPU
-        // (docs/backends/UNIFY.md 3.1). A device that can neither report 32 nor
+        // selectable, and without this the whole backward fell back to the CPU.
+        // A device that can neither report 32 nor
         // select it keeps the fallback, and its FA-back pipelines are not created at
         // all: requesting an unsupported size asserts inside ggml_vk_create_pipeline.
         // Not qualifiable on this project's hardware — no wave64 GPU is accessible.
@@ -8401,7 +8401,7 @@ static void ggml_vk_flash_attn_back(
 
     const int32_t grad_mask = ggml_get_op_params_i32(dst, 3);
 
-    // retro delta (OPTIM_V3 O4): bit 6 asks the dQ shader to fold the row
+    // retro delta: bit 6 asks the dQ shader to fold the row
     // log-sum-exp into the sweep that accumulates dQ instead of giving it a pass
     // of its own. Opt-in, like the CUDA side: the two-sweep form is the default
     // and the oracle until a measurement clears the folded one. A push constant
@@ -9886,7 +9886,7 @@ void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_c
 static bool ggml_vk_rir_try(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * node);
 
 void ggml_vk_add(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    // retro delta: RIR selection chain (docs/INT_RIR_V3.md §R2). Guarded by
+    // retro delta: RIR selection chain. Guarded by
     // `do_add_rms_partials`, and that guard is a correctness condition, not a
     // performance one: when it is set, this ADD also has to write the partial
     // sums the following RMS_NORM will consume, and the generated variant only
@@ -9910,10 +9910,10 @@ void ggml_vk_add(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_t
 }
 
 void ggml_vk_out_prod(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    // retro delta: RIR selection chain (docs/INT_RIR_V3.md §R2). One generated
-    // variant per src0 dtype since §P5 — F32, plus each quantized format whose
-    // decoder lowering can expand — and the node's own type picks between them
-    // (docs/INT_RIR_V4.md §P5). What is left is the broadcast over ne2/ne3 and
+    // retro delta: RIR selection chain. One generated
+    // variant per src0 dtype: F32, plus each quantized format whose
+    // decoder lowering can expand — and the node's own type picks between them.
+    // What is left is the broadcast over ne2/ne3 and
     // the formats with no portable decoder: both fail the portable contract and
     // reach the native shader below.
     if (ggml_vk_rir_try(ctx, subctx, dst)) {
@@ -9952,7 +9952,7 @@ void ggml_vk_sub(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_t
 }
 
 void ggml_vk_mul(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    // retro delta: RIR selection chain (docs/INT_RIR_V3.md §R2). No fusion
+    // retro delta: RIR selection chain. No fusion
     // guard is needed here: a MUL that starts a fused snake is dispatched by
     // `ggml_vk_snake_dispatch_fused` and never reaches this encoder.
     if (ggml_vk_rir_try(ctx, subctx, dst)) {
@@ -10266,7 +10266,7 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
 }
 
 // Vulkan keeps the sequential reference reachable, but defaults to the
-// chunkwise formulation from docs/optims/OPTIMS_V4.md part A. Unlike CUDA, the
+// chunkwise formulation. Unlike CUDA, the
 // Vulkan path cannot read gates back while retaining an asynchronous recorded
 // command stream. Its outer chunks therefore depend only on (T, C, K), and each
 // workgroup checks its own gate range on-device; an unsafe chunk locally uses a
@@ -10592,7 +10592,7 @@ static void ggml_vk_conv_rs_gather(ggml_backend_vk_context * ctx, vk_context& su
     });
 }
 
-// retro delta: fused sparse cross-entropy (docs/memory/GPUVOCAB.md).
+// retro delta: fused sparse cross-entropy.
 // Both the forward loss and the backward gradient normalize by the number of
 // active tokens; a small count pre-pass computes it on device into a scratch
 // buffer so the semantics match the CPU oracle without any host readback.
@@ -10863,7 +10863,7 @@ void ggml_vk_upscale(ggml_backend_vk_context * ctx, vk_context& subctx, const gg
 }
 
 void ggml_vk_scale(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
-    // retro delta: RIR selection chain (docs/INT_RIR_V3.md §R2).
+    // retro delta: RIR selection chain.
     if (ggml_vk_rir_try(ctx, subctx, dst)) {
         return;
     }
@@ -11156,7 +11156,7 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
     ggml_tensor * rms = cgraph->nodes[node_idx];
     const ggml_tensor * src0 = rms->src[0];
 
-    // retro delta: RIR selection chain (docs/FUTURE_V1.md §7), guarded by both
+    // retro delta: RIR selection chain, guarded by both
     // of this encoder's other jobs - for the same reason Metal guards its own
     // on `n_fuse == 1`. A generated variant computes one node in one dispatch,
     // so taking a node that starts a fused RMS_NORM chain (MUL, ADD, ROPE,
@@ -11346,13 +11346,13 @@ void ggml_vk_l2_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const gg
     ggml_vk_op_f32<vk_op_unary_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_L2_NORM, std::move(p));
 }
 
-// retro delta: RIR dispatch on Vulkan (docs/INT_RIR.md §8). The decision is
+// retro delta: RIR dispatch on Vulkan. The decision is
 // taken **before** any encoding — after submission there is no safe fallback.
 // The portable half of the contract (element types, rank, agreement of the
 // axis extents, stride alignment, u32 representability) is decided from the
 // registry row by `ggml_rir_evaluate_portable`; what is left below is what
 // needs this device to answer: a built pipeline, a dispatchable grid and
-// descriptor offsets the shader can bind (docs/INT_RIR_V2.md §P1).
+// descriptor offsets the shader can bind.
 static bool ggml_vk_rir_tensor_offset_ok(ggml_backend_vk_context * ctx, const ggml_tensor * t) {
     vk_buffer buffer = nullptr;
     size_t offset = 0;
@@ -11378,8 +11378,7 @@ static vk_pipeline ggml_vk_rir_pipeline(ggml_backend_vk_context * ctx, const rir
     // Keyed on the artifact the registry publishes, which is what the creation
     // loop above keyed it on. Resolving by kernel name instead would send every
     // node of a pair to one lowering while the counters still read `rir > 0` —
-    // exactly the silent failure the lane asserts against (docs/INT_RIR_V3.md
-    // §R1).
+    // exactly the silent failure the lane asserts against.
     auto it = ctx->device->pipeline_rir.find(v->artifact);
     return it == ctx->device->pipeline_rir.end() ? nullptr : it->second;
 }
@@ -11391,7 +11390,7 @@ static vk_pipeline ggml_vk_rir_pipeline(ggml_backend_vk_context * ctx, const rir
 //
 // Pure and counter-free: the same answer serves the require-preflight, which
 // asks about a node it will not encode, and the dispatch site, which is the
-// only one entitled to count (docs/INT_RIR_V2.md §P0).
+// only one entitled to count.
 static int32_t ggml_vk_rir_device_check(void * device_ctx, const ggml_tensor * node) {
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) device_ctx;
 
@@ -11477,8 +11476,8 @@ static bool ggml_vk_rir_try(ggml_backend_vk_context * ctx, vk_context& subctx, c
     return true;
 }
 
-// retro delta: the whole encoder of a pair whose native kernel has been retired
-// (docs/INT_RIR_V4.md §P6). RMS_NORM_BACK and L2_NORM_BACK both route here and
+// retro delta: the whole encoder of a pair whose native kernel has been retired.
+// RMS_NORM_BACK and L2_NORM_BACK both route here and
 // neither adds a line: the generated variant is the only implementation, so
 // there is no second branch to write and no push-constant struct to keep in
 // step with a shader.
@@ -11496,7 +11495,7 @@ static void ggml_vk_rir_only(ggml_backend_vk_context * ctx, vk_context& subctx, 
 }
 
 void ggml_vk_unary(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
-    // retro delta: RIR selection chain (docs/FUTURE_V1.md §7). The family is
+    // retro delta: RIR selection chain. The family is
     // selected by `op_params`, not by the op, so the registry row carries a
     // `ggml_op_variant` and `ggml_rir_variant_fits_op_variant` is what keeps a
     // node from being encoded by an arbitrary member. The eight members RIR
@@ -12066,7 +12065,7 @@ void ggml_vk_mean(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_
 }
 
 void ggml_vk_cumsum(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
-    // retro delta: RIR selection chain (docs/INT_RIR_V2.md §P2). The registry
+    // retro delta: RIR selection chain. The registry
     // pins this pair to `observe_generated`, so today the call always measures
     // and returns false; promoting it to `prefer_generated` is a one-line
     // change of the integration table, not of this file.
@@ -13054,7 +13053,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     case GGML_OP_RMS_NORM:
         ggml_vk_rms_norm(ctx, compute_ctx, cgraph, node_idx, (float *)node->op_params);
         break;
-    // retro delta: natif retiré (docs/INT_RIR_V4.md §P6)
+    // retro delta: natif retiré
     case GGML_OP_RMS_NORM_BACK:
         ggml_vk_rir_only(ctx, compute_ctx, node);
 
@@ -13063,7 +13062,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         ggml_vk_l2_norm(ctx, compute_ctx, src0, node);
 
         break;
-    // retro delta: natif retiré (docs/INT_RIR_V4.md §P6)
+    // retro delta: natif retiré
     case GGML_OP_L2_NORM_BACK:
         ggml_vk_rir_only(ctx, compute_ctx, node);
 
@@ -14842,7 +14841,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     // retro delta: under RIR mode `require`, every targeted node must have an
     // eligible variant *before* anything is encoded — a graph that would fall
-    // back to a native kernel fails here instead (docs/INT_RIR_V2.md §P0).
+    // back to a native kernel fails here instead.
     if (!ggml_rir_preflight_graph(RIR_BACKEND_VULKAN, cgraph, ggml_vk_rir_device_check, ctx)) {
         char msg[512];
         ggml_rir_violation_format(msg, sizeof(msg));
@@ -14852,7 +14851,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     // retro delta: under RETRO_RIR_CENSUS, rank the ops of the *real* graph by
     // node count and traffic — including the ones RIR does not cover, which is
-    // the only place they are visible (docs/INT_RIR_V3.md §5).
+    // the only place they are visible.
     ggml_rir_census_graph(RIR_BACKEND_VULKAN, cgraph);
 
     ctx->device->diag_cgraph = nullptr;
@@ -16240,7 +16239,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 // Metal that acceptance is now backed by a probe
                 // (flash_attn_back_vulkan_matches_cpu_with_attention_sinks) — the
                 // project rule is that a supports_op only advertises what a probe
-                // exercises. See docs/backends/UNIFY.md 6.9.
+                // exercises.
                 if (sinks && (sinks->type != GGML_TYPE_F32 || !ggml_is_contiguous(sinks))) {
                     return false;
                 }
@@ -16431,7 +16430,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
                    op->src[0]->type == GGML_TYPE_F32;
         // retro delta: the two backward reductions whose native Vulkan kernel is
-        // retired (docs/INT_RIR_V4.md §P6). The two cases above them were a
+        // retired. The two cases above them were a
         // hand-written restatement of a contract, and the *history of this very
         // spot* is the argument for not writing it twice: the native
         // `rms_norm_back` shader still reads a flat `src[1]`, the native
@@ -16787,7 +16786,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_FUSED_SPARSE_CE:
         case GGML_OP_FUSED_SPARSE_CE_BACK:
             {
-                // retro delta: fused sparse cross-entropy (docs/memory/GPUVOCAB.md).
+                // retro delta: fused sparse cross-entropy.
                 const bool back = op->op == GGML_OP_FUSED_SPARSE_CE_BACK;
                 // The forward atomically sums the scalar loss.
                 if (!back && !device->buffer_float32_atomic_add) {
@@ -16803,8 +16802,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 // retro delta: the optional per-vocab bias is supported (it shifts
                 // every logit inside w_dot_h, in both directions), so Vulkan now
-                // sits with CUDA and Metal rather than refusing the node — see
-                // docs/backends/UNIFY.md 2.2. It must be a contiguous F32 vector
+                // sits with CUDA and Metal rather than refusing the node.
+                // It must be a contiguous F32 vector
                 // covering the vocabulary, which is what ggml_fused_sparse_ce asserts.
                 if (bias != nullptr) {
                     if (bias->type != GGML_TYPE_F32 || !ggml_is_contiguous(bias) ||

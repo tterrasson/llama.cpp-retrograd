@@ -27,7 +27,7 @@ struct fa_back_mma_args {
     int64_t window_nwin, window_stride, window_stream0;
     float scale, softcap;
     bool has_mask, want_dq, want_dk, want_dv;
-    // retro delta (OPTIM_V3 O4): true makes the dQ kernel sweep the KV cache once,
+    // retro delta: true makes the dQ kernel sweep the KV cache once,
     // folding the log-sum-exp into the pass that accumulates dQ. Opt-in
     // (GGML_CUDA_FA_BACK_FUSED_LSE=1) because it is a second summation order and
     // no measurement has cleared it yet; the two-sweep form stays the default and

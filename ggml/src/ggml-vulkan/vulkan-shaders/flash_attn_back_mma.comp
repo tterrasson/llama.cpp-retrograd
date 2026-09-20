@@ -41,7 +41,7 @@ const uint FLAG_GRAD_Q = 4u;
 const uint FLAG_GRAD_K = 8u;
 const uint FLAG_GRAD_V = 16u;
 const uint FLAG_WINDOW = 32u;
-// retro delta (OPTIM_V3 O4): set to fold the log-sum-exp into the sweep that
+// retro delta: set to fold the log-sum-exp into the sweep that
 // accumulates dQ, which removes a whole pass of K loads and one of the three
 // cooperative-matrix products per tile. See flash_attn_back_q.comp: opt-in, the
 // two-sweep form is the default.

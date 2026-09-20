@@ -616,7 +616,7 @@ extern "C" {
         // retro delta: fused sparse cross-entropy over a projection head. Computes
         // the weighted cross-entropy loss (and its gradient wrt the hidden states)
         // by streaming the vocabulary in tiles, so the full [n_vocab, n_tokens]
-        // logits are never materialized. See docs/memory/03-vocab-logits-chunked-ce.md.
+        // logits are never materialized.
         GGML_OP_FUSED_SPARSE_CE,
         GGML_OP_FUSED_SPARSE_CE_BACK,
 
@@ -2805,7 +2805,7 @@ extern "C" {
             int64_t               K);
 
     // retro delta: same op, with the formulation pinned instead of left to the
-    // backend default (docs/optims/OPTIMS_V4.md part A). Two implementations of
+    // backend default. Two implementations of
     // the same gradients exist: the per-token sequential scan, and a chunkwise
     // one that replaces the scan inside a chunk of `chunk` tokens by six matrix
     // products and a unit-triangular solve. `chunk`:
@@ -3021,12 +3021,12 @@ extern "C" {
     //   weights : [n_tokens]          F32 per-token coefficient (may be negative)
     //   bias    : [n_vocab] F32, or NULL for no bias
     // Result is the scalar loss, already averaged over the active tokens.
-    // retro delta (plan rl/OPTIMIZE feature 1): seq_chunk caps how many tokens of
+    // retro delta: seq_chunk caps how many tokens of
     // the flattened (batch x seq) axis are processed at once, bounding the tiled
     // logits intermediate to [n_vocab/n_tiles, seq_chunk] instead of
     // [n_vocab/n_tiles, n_tokens]. 0 means "all tokens at once" (unchanged). The
     // result is invariant to seq_chunk; only the peak footprint changes.
-    // retro delta (plan rl/OPTIMIZE feature 3): offload_h authorizes the backward
+    // retro delta: offload_h authorizes the backward
     // to run in place over `h` — the graph allocator may then hand grad_h the very
     // buffer holding the hidden states, so the [n_embd, n_tokens] activations and
     // their gradient never coexist on the device. The backward evicts one token

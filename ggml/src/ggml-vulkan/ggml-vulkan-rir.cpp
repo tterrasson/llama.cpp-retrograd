@@ -1,5 +1,4 @@
-// retro delta: the one translation unit that sees the RIR shader blobs
-// (docs/INT_RIR_V3.md §R0).
+// retro delta: the one translation unit that sees the RIR shader blobs.
 //
 // It exists so that nothing else does. The generated header below gains two
 // `extern` lines per new kernel; keeping that inside ggml-vulkan.cpp meant

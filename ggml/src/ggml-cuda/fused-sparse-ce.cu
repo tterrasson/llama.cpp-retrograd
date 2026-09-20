@@ -70,7 +70,7 @@ static __global__ void fused_sparse_ce_add_bias(
     logits[t*tile_stride + v] += bias[v0 + v];
 }
 
-// retro delta (plan rl/OPTIMIZE feature 1): logits holds only the current token
+// retro delta: logits holds only the current token
 // chunk [tile_size, nt_tok], so it is indexed by the local token lt while the
 // per-token state (maxima/sums/target_logits/targets) is indexed by the global
 // token t0_tok + lt.
@@ -296,7 +296,7 @@ static int64_t fused_sparse_ce_tile_size(const ggml_tensor * dst, int64_t n_voca
     return std::min<int64_t>(1024, (n_vocab + requested_tiles - 1)/requested_tiles);
 }
 
-// retro delta (plan rl/OPTIMIZE feature 1): op_params[1] caps how many tokens of
+// retro delta: op_params[1] caps how many tokens of
 // the flattened (batch x seq) axis are processed per pass. 0 means "all tokens"
 // (unchanged). The logits intermediate is then [tile_capacity, seq_chunk] instead
 // of [tile_capacity, n_tokens], so its peak no longer grows with sequence length.
@@ -339,7 +339,7 @@ static void fused_sparse_ce_lse(
 }
 
 // ---------------------------------------------------------------------------
-// retro delta (OPTIM_V3 O5): in-kernel decode of a quantized head.
+// retro delta: in-kernel decode of a quantized head.
 //
 // The path above bounds its scratch by the vocab tile, but it still *writes*
 // every head element it needs as F32 and reads it back through cuBLAS: one
@@ -365,7 +365,7 @@ static void fused_sparse_ce_lse(
 // Opt-in through GGML_CUDA_CE_QHEAD=1. The dequantize+cuBLAS path stays the
 // default and the oracle: it uses tensor-core SGEMM for the two products, this
 // one does not, so which is faster at a given (n_embd, n_vocab, n_tokens) is a
-// measurement and not a claim (OPTIM_V3 O5 point 4).
+// measurement and not a claim.
 #define CE_Q_ROWS  8   // vocabulary rows decoded per pass; 8 KiB of shared tile
 #define CE_Q_WARPS (RETRO_QUANT_THREADS/WARP_SIZE)
 // Embedding chunks one thread accumulates in the backward. 32*256 = 8192 is the
@@ -771,7 +771,7 @@ void ggml_cuda_fused_sparse_ce_back(ggml_backend_cuda_context & ctx, ggml_tensor
         target_rows.alloc(n_embd*chunk*n_topk);
     }
 
-    // retro delta (plan rl/OPTIMIZE feature 3): with offload_h the graph allocator
+    // retro delta: with offload_h the graph allocator
     // gives grad_h the buffer of `h`, so writing a column would destroy the hidden
     // state the very next vocab tile still has to read. Accumulate the chunk into a
     // [n_embd, chunk] staging buffer instead and copy it back once the chunk is

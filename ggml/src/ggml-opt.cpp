@@ -989,7 +989,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
                 ggml_opt_copy_recompute_backend,
                 opt_ctx->backend_sched);
         // retro delta: measure what this build retains while the graph and its
-        // checkpoint list are both still in hand (docs/OPTIM_V3.md §7, O7). One
+        // checkpoint list are both still in hand. One
         // walk per backward build, which is the same cadence as the build itself.
         //
         // Measured on gb_grad rather than gb_opt: the optimizer step appended on
@@ -1631,7 +1631,7 @@ static bool ggml_opt_measure_checkpoint_profile(
     // Signed deltas, so an interval's open and close cancel exactly. The cast of
     // a tensor's byte count to int64_t cannot lose anything: ggml_nbytes is
     // bounded by the tensor's allocation, and no allocation approaches 2^63
-    // (docs/CONVERSIONS.md, narrowing with a proof written beside it).
+    // (a narrowing with a proof written beside it).
     struct sweep_event { int node; int64_t d_count; int64_t d_bytes; };
     std::vector<sweep_event> events;
     events.reserve(2*intervals.size());

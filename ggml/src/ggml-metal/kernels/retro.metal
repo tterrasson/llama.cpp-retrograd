@@ -844,7 +844,7 @@ kernel void kernel_opt_step_adamw_f16(
 }
 
 // retro delta: `kernel_rms_norm_back_f32` and `kernel_l2_norm_back_f32` stood
-// here. Both are retired (docs/INT_RIR_V4.md §P6): their (op, backend) pairs
+// here. Both are retired: their (op, backend) pairs
 // declare no restriction on the ggml domain, so the generated RIR variants —
 // `rir_rms_norm_back*` and `rir_l2_norm_back*` in kernels/rir.metal — are the
 // only implementation, and `ggml_rir_supports_op` is the whole answer Metal
@@ -1175,8 +1175,8 @@ kernel void kernel_ssm_scan_back_grad_f32(
 // dst[i0,i1,i2,i3] = Σ_k src0[i0,k,i02,i03] * src1[i1,k,i2,i3]
 // with GQA broadcast i02 = i2/dps2, i03 = i3/dps3.
 //
-// Tiled GEMM over the contraction axis ne01, ported from the Vulkan P2 shader
-// (docs/optims/VRAM_2.md 3.2, docs/backends/UNIFY.md 6.1). The previous
+// Tiled GEMM over the contraction axis ne01, ported from the Vulkan P2 shader.
+// The previous
 // shape was one dst element per thread with the reduction advanced one k at a
 // time, which paid two threadgroup barriers per k, loaded 16 of 64 threads'
 // worth of operands per step, and yielded a single fused multiply-add per pair
@@ -1547,8 +1547,8 @@ kernel void kernel_cross_entropy_loss_back_f32(
 // (fused_sparse_ce{,_back}.comp), which is the right lineage for Metal: the
 // head is read *in the kernel* through the per-type dequantizers, so no F32
 // scratch copy of it is ever allocated -- unlike the CUDA path, which
-// dequantizes into a tiled buffer. See docs/backends/UNIFY.md 6.3 and the CPU
-// oracle ggml_compute_forward_fused_sparse_ce_f32.
+// dequantizes into a tiled buffer. See the CPU oracle
+// ggml_compute_forward_fused_sparse_ce_f32.
 //
 // One threadgroup per token. The [n_vocab, n_tokens] logits are never
 // materialized: each logit z[v,t] = dot(w[:,v], h[:,t]) (+ bias[v]) is

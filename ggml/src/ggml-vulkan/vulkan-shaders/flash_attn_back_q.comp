@@ -51,7 +51,7 @@ layout(binding = 8) readonly buffer KvIdxs { int       kv_idxs[]; };
 const uint FLAG_MASK   = 1u;
 const uint FLAG_SINKS  = 2u;
 const uint FLAG_GRAD_Q = 4u;
-// retro delta (OPTIM_V3 O4): set to fold the row log-sum-exp into the sweep that
+// retro delta: set to fold the row log-sum-exp into the sweep that
 // accumulates dQ -- the accumulators are rescaled by exp(m_old - m_new) as the
 // maximum moves and divided by the final sum once. Same algebra as the two
 // sweeps below, half the Q.K work, a different summation order; hence opt-in

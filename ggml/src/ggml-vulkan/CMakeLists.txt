@@ -62,7 +62,7 @@ if (Vulkan_FOUND)
     ggml_add_backend_library(ggml-vulkan
                              ggml-vulkan.cpp
                              # retro delta: the only unit that sees the RIR
-                             # shader blobs (docs/INT_RIR_V3.md §R0)
+                             # shader blobs
                              ggml-vulkan-rir.cpp
                              ggml-vulkan-rir.h
                              ../../include/ggml-vulkan.h
@@ -208,7 +208,7 @@ if (Vulkan_FOUND)
     set (_ggml_vk_genshaders_cmd "${_ggml_vk_genshaders_dir}/vulkan-shaders-gen${_ggml_vk_host_suffix}")
     set (_ggml_vk_header     "${CMAKE_CURRENT_BINARY_DIR}/ggml-vulkan-shaders.hpp")
     # retro delta: the RIR shaders declare themselves apart, so adding a
-    # generated kernel leaves ggml-vulkan.cpp untouched (docs/INT_RIR_V3.md §R0)
+    # generated kernel leaves ggml-vulkan.cpp untouched
     set (_ggml_vk_rir_header "${CMAKE_CURRENT_BINARY_DIR}/ggml-vulkan-rir-shaders.hpp")
     set (_ggml_vk_input_dir  "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders")
     set (_ggml_vk_output_dir "${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders.spv")

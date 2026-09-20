@@ -9,7 +9,7 @@
 #include "ggml-metal-device.h"
 #include "ggml-metal-fusion.h"
 #include "ggml-metal-tuning.h"
-#include "ggml-rir/ggml-rir.h" // retro delta: RIR variants (docs/INT_RIR.md)
+#include "ggml-rir/ggml-rir.h" // retro delta: RIR variants
 
 #include <cassert>
 #include <algorithm>
@@ -529,8 +529,8 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_opt_step_sgd(ctx, idx);
             } break;
-        // retro delta: the two pairs whose native kernel is retired
-        // (docs/INT_RIR_V4.md §P6). They add no op-specific code at all: the
+        // retro delta: the two pairs whose native kernel is retired.
+        // They add no op-specific code at all: the
         // generated variant is the only implementation, and a node that reaches
         // here is one `ggml_rir_supports_op` already admitted.
         case GGML_OP_RMS_NORM_BACK: // retro delta
@@ -864,7 +864,7 @@ int ggml_metal_op_acc(ggml_metal_op_t ctx, int idx) {
 int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
-    // retro delta: RIR selection chain (docs/INT_RIR_V3.md §R2). This encoder
+    // retro delta: RIR selection chain. This encoder
     // serves a dozen ops; only GGML_OP_SCALE has a registry row, and every
     // other one leaves here with no variant found and no site counted.
     if (const int n = ggml_metal_op_rir_try(ctx, idx)) {
@@ -1127,7 +1127,7 @@ int ggml_metal_op_cumsum(ggml_metal_op_t ctx, int idx) {
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
-    // retro delta: RIR selection chain (docs/INT_RIR_V2.md §P2). The registry
+    // retro delta: RIR selection chain. The registry
     // pins this pair to `observe_generated`, so today the call always measures
     // and returns 0; promoting it to `prefer_generated` is a one-line change of
     // the integration table, not of this file.
@@ -4204,7 +4204,7 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
         }
     }
 
-    // retro delta: RIR selection chain (docs/INT_RIR_V3.md §R2). Placed *after*
+    // retro delta: RIR selection chain. Placed *after*
     // the fusion lookahead rather than at the top of the encoder, and the guard
     // is the point: a generated variant computes one node, so taking a node
     // that starts a chain of `n_fuse` ADDs would silently trade a fused
@@ -4508,7 +4508,7 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
         }
     }
 
-    // retro delta: RIR selection chain (docs/FUTURE_V1.md §7). Placed *after* the
+    // retro delta: RIR selection chain. Placed *after* the
     // fusion lookahead and guarded on it, for the reason the elementwise band
     // already established: a generated variant computes one node, so taking a
     // node that starts a NORM+MUL+ADD chain would trade one dispatch for three.
@@ -6003,10 +6003,10 @@ int ggml_metal_op_opt_step_sgd(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-// retro delta: the RIR dispatch path (docs/INT_RIR.md §6.2). No
+// retro delta: the RIR dispatch path. No
 // constant-buffer layout is retyped here: the generated params struct comes
 // from the same `shader_params_layout` that produced the MSL one, so the two
-// cannot drift (docs/INT_RIR_V2.md §P1).
+// cannot drift.
 
 // The device half of the RIR contract for this backend, in the shape
 // ggml_rir_evaluate and ggml_rir_preflight_graph consume.
@@ -6015,18 +6015,18 @@ int ggml_metal_op_opt_step_sgd(ggml_metal_op_t ctx, int idx) {
 // agreement, stride alignment and u32 representability are portable, decided by
 // `ggml_rir_evaluate_portable` from the registry row; restating them per backend
 // is what let Metal and Vulkan disagree about the same variant. Nothing below
-// names an op, so promoting a second one adds no case (docs/INT_RIR_V2.md §P1).
+// names an op, so promoting a second one adds no case.
 //
 // Pure and counter-free: the *same* answer has to serve the require-preflight,
 // which asks about a node it will not encode, and the dispatch site, which is
-// the only one entitled to count (docs/INT_RIR_V2.md §P0).
+// the only one entitled to count.
 int32_t ggml_metal_rir_device_check(void * device_ctx, const ggml_tensor * node) {
     ggml_metal_library_t lib = (ggml_metal_library_t) device_ctx;
 
     // Per node, not per op: with more than one lowering per (op, backend) the
     // variant whose pipeline and threadgroup are checked here must be the one
     // the dispatch site will encode, and which one that is depends on this
-    // node's shape (docs/INT_RIR_V3.md §R1).
+    // node's shape.
     const rir_variant_desc * v =
         ggml_rir_find_variant_for_node(node->op, RIR_BACKEND_METAL, node);
     if (v == nullptr) {
@@ -6050,8 +6050,7 @@ int32_t ggml_metal_rir_device_check(void * device_ctx, const ggml_tensor * node)
 
 // Encodes a RIR variant with nothing kernel-specific in the code: the buffers,
 // the constant buffer and the grid all come from the registry row. What is
-// still Metal's is the pipeline object, the encoder and the buffer ids
-// (docs/INT_RIR_V2.md §P1).
+// still Metal's is the pipeline object, the encoder and the buffer ids.
 static int ggml_metal_op_rir_dispatch(ggml_metal_op_t ctx, int idx, const rir_variant_desc * v) {
     ggml_tensor * op = ctx->node(idx);
     ggml_metal_encoder_t enc = ctx->enc;
@@ -6062,7 +6061,7 @@ static int ggml_metal_op_rir_dispatch(ggml_metal_op_t ctx, int idx, const rir_va
     // static_assert; the filler places the fields. Both come from the manifest,
     // so no field of this struct is named here.
     // Capacity published by ggml-rir.h, checked there against the generated
-    // maximum (docs/INT_RIR_V3.md §R0).
+    // maximum.
     alignas(16) char args[RIR_PUSH_CONSTANT_CAPACITY];
     if (!ggml_rir_fill_params(v, op, args, v->push_constant_bytes)) {
         GGML_ABORT("ggml-rir: %s params layout mismatch (registry says %u bytes)",
@@ -6102,8 +6101,8 @@ int ggml_metal_op_rir_try(ggml_metal_op_t ctx, int idx) {
     return n;
 }
 
-// The whole encoder of a pair whose native kernel has been retired
-// (docs/INT_RIR_V4.md §P6): there is no second branch, and that is the shape a
+// The whole encoder of a pair whose native kernel has been retired:
+// there is no second branch, and that is the shape a
 // finished promotion has. Two ops share it and neither adds a line.
 //
 // It cannot return 0. `ggml_rir_supports_op` is what admitted this node, and it
@@ -6187,10 +6186,10 @@ int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
     // so its kernel takes s01/s02/s03 in bytes instead.
     const int64_t es0 = op->src[0]->type == GGML_TYPE_F32 ? es : 1;
 
-    // retro delta: RIR selection chain (docs/INT_RIR.md §5). One generated
-    // variant per src0 dtype since §P5 — F32, plus each quantized format whose
-    // decoder lowering can expand — and the node's own type picks between them
-    // (docs/INT_RIR_V4.md §P5). What is left is the broadcast over ne2/ne3 and
+    // retro delta: RIR selection chain. One generated
+    // variant per src0 dtype: F32, plus each quantized format whose
+    // decoder lowering can expand — and the node's own type picks between them.
+    // What is left is the broadcast over ne2/ne3 and
     // the formats with no portable decoder: both fail the portable contract and
     // fall through to the native kernel below.
     if (const int n = ggml_metal_op_rir_try(ctx, idx)) {

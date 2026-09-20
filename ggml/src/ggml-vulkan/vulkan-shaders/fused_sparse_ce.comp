@@ -31,8 +31,8 @@
 // The head is dequantized through the backend's generic per-type helpers
 // (dequant_funcs.glsl), so a single shader source covers every quant type: the
 // generator (vulkan-shaders-gen.cpp) compiles one variant per DATA_A_* type,
-// exactly like get_rows_quant / mul_mat_vec. See docs/memory/GPUVOCAB.md and the
-// CPU oracle ggml_compute_forward_fused_sparse_ce_f32.
+// exactly like get_rows_quant / mul_mat_vec. See the CPU oracle
+// ggml_compute_forward_fused_sparse_ce_f32.
 
 // types.glsl defines A_TYPE / QUANT_K / QUANT_R for the head's DATA_A_* type;
 // dequant_funcs.glsl then provides dequantize()/get_dm() reading data_a, and needs

@@ -7,8 +7,8 @@
 
 // retro delta: the in-kernel decoders a training op uses to read a frozen
 // quantized tensor without ever materializing an F32 copy of it in the CUDA
-// pool. Two ops need exactly that -- OUT_PROD's src0 (OPTIMS_V4 Q2) and the
-// output head of FUSED_SPARSE_CE[_BACK] (OPTIM_V3 O5) -- and O5 point 1 asks for
+// pool. Two ops need exactly that -- OUT_PROD's src0 and the
+// output head of FUSED_SPARSE_CE[_BACK] -- and O5 point 1 asks for
 // one table of formats, not a second one, so the loaders live here rather than
 // inside either kernel's translation unit.
 //

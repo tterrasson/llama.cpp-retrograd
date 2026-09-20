@@ -16,7 +16,7 @@ namespace wmma = nvcuda::wmma;
 // D = dot(dO, O), and only recomputes the row LSE before accumulating dQ. The KV
 // kernel runs one warp per (batch, KV head, gradient-window row) and reduces all
 // contributing query rows in a fixed order before writing dK/dV once. This
-// removes the redundant forward-output reconstruction (OPTIMS_V4 F1) and the
+// removes the redundant forward-output reconstruction and the
 // contended, non-deterministic atomics (F3).
 //
 // dK/dV only cover the gradient window (the KV rows written at this step) when
@@ -198,7 +198,7 @@ static __global__ void flash_attn_back_mma_q_kernel(
     }
     __syncthreads();
 
-    // retro delta (OPTIM_V3 O4): the two sweeps of the KV cache below are one
+    // retro delta: the two sweeps of the KV cache below are one
     // sweep when the log-sum-exp is folded into the pass that accumulates dQ.
     // Pass 1 existed only to know row_m/row_l before dividing by them; the
     // online form rescales the dQ accumulators by exp(m_old - m_new) instead and
@@ -617,7 +617,7 @@ static __global__ void flash_attn_back_kernel(
     // F1: only recompute the row normalization. O is already an input of the
     // backward node, so reconstructing it by streaming V a second time was pure
     // duplicate work. The local LSE pass is the compatibility fallback described
-    // in OPTIMS_V4 B.4; it scans K only and preserves the existing graph ABI.
+    // here; it scans K only and preserves the existing graph ABI.
     float m = -INFINITY;
     float l = 0.0f;
     for (int64_t kv0 = 0; kv0 < nkv; kv0 += tkv) {
@@ -979,7 +979,7 @@ void ggml_cuda_flash_attn_back(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     // O4 point 1: the before/after of the folded log-sum-exp has to be measurable
     // in one session, on one machine, without a rebuild -- same rule
     // GGML_CUDA_FA_BACK_MMA already follows for the MMA path itself. The default
-    // is the two-sweep form: §11 does not move a default before its gate.
+    // is the two-sweep form: a default does not move before its gate.
     const char * fused_env = getenv("GGML_CUDA_FA_BACK_FUSED_LSE");
     const bool fused_lse = fused_env != nullptr && std::atoi(fused_env) != 0;
     if (use_mma) {

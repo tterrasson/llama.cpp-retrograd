@@ -446,7 +446,7 @@ static __global__ __launch_bounds__(GDN_BACK_BLOCK) void gated_delta_net_back_ke
 }
 
 // ===========================================================================
-// Chunkwise backward -- docs/optims/OPTIMS_V4.md part A.
+// Chunkwise backward.
 //
 // The kernel above is correct and 1200x slower than its own forward: it is one
 // block per (head, sequence) walking the tokens one at a time, so every one of
@@ -499,7 +499,7 @@ static __global__ __launch_bounds__(GDN_BACK_BLOCK) void gated_delta_net_back_ke
 //     put 1 to 43 pairs out of 256 over the bound on a typical node. A token
 //     step here costs ~0.8 ms, so a fallback chunk costs seconds and the node
 //     regresses by ~50x. The layout has to adapt to the gates, and adapting it
-//     is what needs the gates on the host. See docs/optims/OPTIMS_V4.md A.9.
+//     is what needs the gates on the host.
 // ===========================================================================
 
 #define GDN_CHUNK_BLOCK      256

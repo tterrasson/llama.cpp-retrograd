@@ -441,7 +441,7 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
 
     switch (op->op) {
         case GGML_OP_FLASH_ATTN_BACK:
-            // Native extended streaming backward (OPTIMS_V4 B): F32 Q/O/dO,
+            // Native extended streaming backward: F32 Q/O/dO,
             // F16 or F32 K/V, optional F16 mask and F32 attention sinks.
             return src0 && src1 && op->src[2] && op->src[4] && op->src[5] &&
                 src0->type == GGML_TYPE_F32 &&

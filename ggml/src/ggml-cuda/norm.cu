@@ -697,8 +697,8 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
 
-// retro delta: `ggml_cuda_op_l2_norm_back` and its two kernels are gone
-// (docs/CUDA_v1.md §C5, §C7). The generated RIR variant is the only
+// retro delta: `ggml_cuda_op_l2_norm_back` and its two kernels are gone.
+// The generated RIR variant is the only
 // implementation of GGML_OP_L2_NORM_BACK on CUDA, as it already was on Metal
 // and Vulkan: the pair declares no domain restriction, and the lane measured it
 // claiming 60/60 of the test-backend-ops matrix at 0.99 against this kernel

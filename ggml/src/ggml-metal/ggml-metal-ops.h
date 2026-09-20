@@ -28,7 +28,7 @@ int ggml_metal_op_n_nodes(ggml_metal_op_t ctx);
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
 
 // retro delta: the device half of the RIR contract for Metal, in the shape
-// ggml_rir_evaluate/ggml_rir_preflight_graph consume (docs/INT_RIR_V2.md §P0).
+// ggml_rir_evaluate/ggml_rir_preflight_graph consume.
 // `device_ctx` is a ggml_metal_library_t; returns a ggml_rir_reject.
 int32_t ggml_metal_rir_device_check(void * device_ctx, const struct ggml_tensor * node);
 
@@ -37,7 +37,7 @@ int32_t ggml_metal_rir_device_check(void * device_ctx, const struct ggml_tensor 
 // dispatchable variant for this (op, backend) and its contract matches, and 0
 // when the native kernel below must run. Every op integrated with RIR opens
 // with `if (const int n = ggml_metal_op_rir_try(ctx, idx)) { return n; }`
-// — that one line is the whole integration (docs/INT_RIR_V2.md §P2).
+// — that one line is the whole integration.
 int ggml_metal_op_rir_try(ggml_metal_op_t ctx, int idx);
 
 //
@@ -124,8 +124,8 @@ int ggml_metal_op_moe_reduce        (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_tri               (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_opt_step_adamw    (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_opt_step_sgd      (ggml_metal_op_t ctx, int idx);
-// retro delta: the encoder of a pair whose native kernel is retired
-// (docs/INT_RIR_V4.md §P6). RMS_NORM_BACK and L2_NORM_BACK both route here and
+// retro delta: the encoder of a pair whose native kernel is retired.
+// RMS_NORM_BACK and L2_NORM_BACK both route here and
 // neither has an entry of its own any more — the generated variant is the only
 // implementation, so there is nothing op-specific left to name.
 int ggml_metal_op_rir_only          (ggml_metal_op_t ctx, int idx); // retro delta

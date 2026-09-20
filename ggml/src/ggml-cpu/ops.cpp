@@ -4555,7 +4555,7 @@ static void ggml_compute_forward_out_prod_q_f32(
     //       for i0:
     //         dst[i0,i1,i2,i3] += src0[i0,i01,i2,i3] * src1[i1,i01,i2,i3]
 
-    // OPTIMS_V4 Q2 (CPU): decode one quantization-aligned tile on the worker
+    // Decode one quantization-aligned tile on the worker
     // stack and consume it immediately.  The former per-worker buffer scaled as
     // ne0*nth even though OUT_PROD never needs a whole decoded row alive.
     // 256 is divisible by every block size admitted by this path.
@@ -11691,7 +11691,7 @@ static void ggml_compute_forward_gated_delta_net_back_f32(
 // chunk-to-chunk state adjoint stays sequential, so the serial chain is
 // n_tokens/C steps instead of n_tokens, and the state trajectory held live
 // shrinks from n_tokens*S_v^2 to one entry state per chunk. This is the CPU
-// reference the CUDA kernel of docs/optims/OPTIMS_V4.md part A is validated
+// reference the chunkwise CUDA kernel is validated
 // against, and the milestone that de-risks it: the adjoints below are checked
 // against ggml_compute_forward_gated_delta_net_back_f32 in plain arithmetic
 // before any kernel exists.

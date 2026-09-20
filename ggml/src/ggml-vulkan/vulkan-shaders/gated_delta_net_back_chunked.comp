@@ -5,7 +5,7 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
-// retro delta: Vulkan adaptation of docs/optims/OPTIMS_V4.md part A.
+// retro delta: Vulkan adaptation of the chunkwise backward.
 //
 // CUDA expresses the chunkwise recurrence as batched cuBLAS GEMMs and chooses a
 // gate-dependent layout on the host. Neither maps cleanly to Vulkan's recorded,

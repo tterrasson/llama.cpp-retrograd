@@ -1,5 +1,4 @@
-// retro delta: the RIR launch stubs, addressed by artifact name
-// (docs/CUDA_v1.md §C2, §3.1).
+// retro delta: the RIR launch stubs, addressed by artifact name.
 //
 // This header is hand-written and stable: it names no kernel. Adding a
 // generated kernel changes only `rir_cuda_launchers.h` — which the generator
@@ -29,7 +28,7 @@ typedef void (*ggml_cuda_rir_launch_fn)(void * const * bufs, const void * params
 // such kernel.
 ggml_cuda_rir_launch_fn ggml_cuda_rir_launcher(const char * artifact);
 
-// retro delta: the CUDA adapter (docs/CUDA_v1.md §C4).
+// retro delta: the CUDA adapter.
 //
 // Three entry points, and everything else about the dispatch lives in
 // `ggml-rir.cpp`: the mode, the policy, the site attribution, the counters, the
@@ -44,13 +43,13 @@ struct ggml_tensor;
 //
 // It is called from inside `ggml_cuda_compute_forward`, which is reached only
 // when `ggml_cuda_try_fuse` found nothing — so a RIR site is always **after**
-// the fusion test, never before (docs/CUDA_v1.md §3.6). That ordering is a
+// the fusion test, never before. That ordering is a
 // constraint the `ggml-vulkan.cpp` template does not teach, Vulkan fusing far
 // less.
 bool ggml_cuda_rir_try(ggml_backend_cuda_context * ctx, const ggml_tensor * node);
 
-// The whole encoder of a pair whose **native kernel has been retired**
-// (docs/CUDA_v1.md §C7). `L2_NORM_BACK` routes here and adds no line: the
+// The whole encoder of a pair whose **native kernel has been retired**.
+// `L2_NORM_BACK` routes here and adds no line: the
 // generated variant is the only implementation, so there is no second branch to
 // write.
 //

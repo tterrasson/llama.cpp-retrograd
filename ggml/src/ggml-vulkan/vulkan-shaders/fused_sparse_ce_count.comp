@@ -7,7 +7,7 @@
 // non-zero weight, and counts once when it does (retro delta, plan DISTILL
 // D6.5: the mean is over positions, never over entries). The result (n_active) is the divisor both the forward loss and the
 // backward gradient use, computed on device so the semantics match the CPU
-// reference exactly (see docs/memory/GPUVOCAB.md). One thread per token.
+// reference exactly. One thread per token.
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 

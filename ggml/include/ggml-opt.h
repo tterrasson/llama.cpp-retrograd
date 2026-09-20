@@ -369,7 +369,7 @@ extern "C" {
     // retro delta: what the retained checkpoints actually cost, and for how long.
     //
     // The two questions activation offloading has to answer before a single copy
-    // is written (docs/OPTIM_V3.md §7, O7 plan step 1): how many bytes the
+    // is written: how many bytes the
     // checkpoints hold against the device peak, and whether any of them are held
     // long enough for a host round-trip to hide behind compute. Neither is
     // answerable from the checkpoint list alone — the list has shapes, not

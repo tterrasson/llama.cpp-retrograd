@@ -1,4 +1,4 @@
-// retro delta: the CUDA half of the RIR dispatch contract (docs/CUDA_v1.md §C4).
+// retro delta: the CUDA half of the RIR dispatch contract.
 //
 // A fork-owned translation unit reached from `ggml-cuda.cu` by one line per
 // site, per RETRO_FORK.md: nothing here is a hunk in an upstream file, and the
@@ -7,7 +7,7 @@
 // What the contract leaves to a backend is its queue, its buffers and its
 // pipeline object. On CUDA that is the stream, the tensor pointers, and a
 // function pointer — there is no descriptor set, no pipeline cache and no
-// extension to negotiate (§3.1, §3.3). So this file is shorter than its Vulkan
+// extension to negotiate. So this file is shorter than its Vulkan
 // counterpart, and everything it does *not* do — the mode, the policy, the site
 // attribution, the counters, the `require` abort, and the whole portable half of
 // the contract — is `ggml-rir.cpp`'s, once, for three backends.
@@ -21,14 +21,14 @@
 #include <cstring>
 #include <mutex>
 
-// The two device limits §3.3 leaves as *real* constraints on CUDA, read once
+// The two device limits that are *real* constraints on CUDA, read once
 // per device instead of per node.
 //
 // `smpb` comes from `ggml_cuda_info()`, which already holds it. The grid bounds
 // and the block ceiling are queried rather than written down: 65 535 on y and z
 // has been true since sm_30 and 1 024 threads per block since sm_20, but a
-// constant this file believes is a constant nothing checks — and §C3 settled
-// that an unevaluated requirement is a rejection, not a shrug.
+// constant this file believes is a constant nothing checks, and an
+// unevaluated requirement is a rejection, not a shrug.
 struct rir_cuda_limits {
     int max_grid[3];
     int max_threads_per_block;
@@ -55,7 +55,7 @@ static const rir_cuda_limits & rir_cuda_limits_of(int device) {
 // Every scalar a generated kernel dereferences is at most four bytes wide — an
 // F32 element, or the `uint32_t` a packed header is read through; a vector
 // lowering reads its `w` components one at a time from a byte address, so it
-// asks for no wider alignment than a scalar one (docs/CUDA_v1.md §5.1).
+// asks for no wider alignment than a scalar one.
 //
 // The kernel has no misalignment parameter, so the tensor pointer must be exact.
 // In practice a CUDA buffer is 256-byte aligned and a view offset is a multiple
@@ -93,7 +93,7 @@ int32_t ggml_cuda_rir_device_check(void * device_ctx, const ggml_tensor * node) 
         }
     }
     // The block the launch stub hard-codes, and the shared storage the lowering
-    // declared — the two budgets `KernelNeeds` publishes (§5.4). Both are
+    // declared — the two budgets `KernelNeeds` publishes. Both are
     // properties of the compiled kernel, so a device that cannot run them is a
     // build that cannot run here, which the site says rather than answering
     // elsewhere.
@@ -134,7 +134,7 @@ static void ggml_cuda_rir_launch(ggml_backend_cuda_context * ctx, const rir_vari
 
     // The bytes the generated `rir_<kernel>_params` expects, laid out by the
     // portable half. Its size is checked at *compile* time of the fork by the
-    // stub's `static_assert` (§5.3), so this runtime check is the one Vulkan
+    // stub's `static_assert`, so this runtime check is the one Vulkan
     // needs and CUDA keeps only against a registry that disagrees with itself.
     uint32_t params[RIR_PUSH_CONSTANT_CAPACITY / sizeof(uint32_t)] = {};
     if (!ggml_rir_fill_params(v, node, params, v->push_constant_bytes)) {
@@ -168,7 +168,7 @@ void ggml_cuda_rir_only(ggml_backend_cuda_context * ctx, const ggml_tensor * nod
 bool ggml_cuda_rir_graph_begin(ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph) {
     // Under RETRO_RIR_CENSUS, rank the ops of the *real* graph by node count and
     // traffic — including the ones RIR does not cover, which is the only place
-    // they are visible (docs/CUDA_v1.md §C1). Off by default, and it costs
+    // they are visible. Off by default, and it costs
     // nothing when nobody asked for it.
     ggml_rir_census_graph(RIR_BACKEND_CUDA, cgraph);
     // And under `require`, refuse the whole graph before anything is launched

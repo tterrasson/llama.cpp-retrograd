@@ -511,7 +511,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         // Note that Retrograd itself never reaches this branch: retro_backend.cpp
         // pins n_rs_seq to 0 because the snapshots never pay for themselves (see
         // the measurements there). It is kept for llama.cpp callers that do
-        // enable rollback. See docs/cuda/STATUS.md.
+        // enable rollback.
 
         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
 

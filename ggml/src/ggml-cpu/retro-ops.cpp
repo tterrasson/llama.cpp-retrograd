@@ -6,7 +6,7 @@
 // function in place -- gated delta net backward, flash attention backward --
 // the code stays in ops.cpp, because there is no seam to cut along.
 //
-// Adding a CPU kernel to the fork belongs here (docs/RETRO_FORK.md).
+// Adding a CPU kernel to the fork belongs here.
 
 #include "ops.h"
 #include "retro-ops.h"
@@ -409,20 +409,19 @@ void ggml_compute_forward_ssm_scan_back(
 // demand as dot(w[:,v], h[:,t]) with an online (running) log-sum-exp in F32, so
 // the [n_vocab, n_tokens] logits are never materialized. Reproduces exactly the
 // weighted, active-row-normalized loss of ggml_cross_entropy_loss applied to
-// mul_mat(w, h) with labels = weights[t]*onehot(targets[t]). See
-// docs/memory/03-vocab-logits-chunked-ce.md.
+// mul_mat(w, h) with labels = weights[t]*onehot(targets[t]).
 //
 // retro delta: an optional fixed per-vocab bias (src[4] forward / src[5]
 // backward, may be NULL) is added to every z[v,t] before the log-sum-exp and
 // target-logit terms, matching ADD(MUL_MAT(w,h), bias) output heads (e.g.
 // gemma4's suppressed-token logits bias). The bias never receives a gradient.
 //
-// retro delta (plan rl/OPTIMIZE feature 1): op_params[0] (vocab tile count) and
+// retro delta: op_params[0] (vocab tile count) and
 // op_params[1] (seq_chunk, the flattened-token chunk size) are honored only by
 // the CUDA kernel, where they bound the materialized logits intermediate. The
 // CPU reference already streams one token and one vocab row at a time with only
 // O(n_embd) scratch, so it is exact and invariant to both parameters and reads
-// neither. See docs/rl/OPTIMIZE.md.
+// neither.
 
 // retro delta (plan DISTILL D6.5): a position is active when at least one of its
 // k entries names a real vocabulary row with a non-zero coefficient. With k = 1
@@ -605,7 +604,7 @@ static void ggml_compute_forward_fused_sparse_ce_back_f32(
     ggml_to_float_t const to_float = ggml_get_type_traits(w->type)->to_float;
     GGML_ASSERT(w->type == GGML_TYPE_F32 || to_float);
 
-    // retro delta (plan rl/OPTIMIZE feature 3): with offload_h the allocator may
+    // retro delta: with offload_h the allocator may
     // hand `dst` the very buffer of `h`, so grad_col and h_col alias. Copy the
     // column out before the first write; done unconditionally (O(n_embd) next to
     // the O(n_vocab*n_embd) body) so there is a single arithmetic path and the

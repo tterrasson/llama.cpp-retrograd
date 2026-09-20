@@ -7,7 +7,7 @@
 #import "ggml-metal-common.h"
 #import "ggml-metal-ops.h"
 #import "ggml-metal-fusion.h"
-#import "ggml-rir/ggml-rir.h" // retro delta: RIR require preflight (docs/INT_RIR_V2.md)
+#import "ggml-rir/ggml-rir.h" // retro delta: RIR require preflight
 
 #import <Foundation/Foundation.h>
 
@@ -480,7 +480,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
     // retro delta: under RIR mode `require`, every targeted node must have an
     // eligible variant *before* anything is encoded — a graph that would fall
-    // back to a native kernel fails here instead (docs/INT_RIR_V2.md §P0).
+    // back to a native kernel fails here instead.
     if (!ggml_rir_preflight_graph(RIR_BACKEND_METAL, gf, ggml_metal_rir_device_check, ctx->lib)) {
         char msg[512];
         ggml_rir_violation_format(msg, sizeof(msg));
@@ -490,7 +490,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
     // retro delta: under RETRO_RIR_CENSUS, rank the ops of the *real* graph by
     // node count and traffic — including the ones RIR does not cover, which is
-    // the only place they are visible (docs/INT_RIR_V3.md §5).
+    // the only place they are visible.
     ggml_rir_census_graph(RIR_BACKEND_METAL, gf);
 
     // number of nodes encoded by the main thread (empirically determined)

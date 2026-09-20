@@ -1,4 +1,4 @@
-// retro delta: RIR integration support (docs/INT_RIR.md in the parent repo).
+// retro delta: RIR integration support.
 //
 // The RIR policy, the per-op counters and the AOT registry lookups shared by
 // the backend adapters. The dispatch itself lives in each backend, next to
@@ -18,7 +18,7 @@ extern "C" {
 #endif
 
 // RETRO_RIR_MODE=off|observe|prefer|require, read once before any backend
-// context is created. **Absent is `prefer`** (docs/INT_RIR_V4.md §P6): a pair
+// context is created. **Absent is `prefer`**: a pair
 // the registry promoted is what this build dispatches, and asking for it is not
 // the caller's job. `observe` computes eligibility and counts it but always
 // runs the native kernel; `prefer` dispatches the RIR variant when its
@@ -31,7 +31,7 @@ extern "C" {
 // `require` is `prefer` plus a graph preflight: every node whose (op, backend)
 // is integrated must be eligible before anything is encoded, and a node that is
 // not turns the whole graph_compute into GGML_STATUS_FAILED instead of a silent
-// native fallback (docs/INT_RIR_V2.md §P0).
+// native fallback.
 typedef enum ggml_rir_mode {
     GGML_RIR_MODE_OFF     = 0,
     GGML_RIR_MODE_OBSERVE = 1,
@@ -43,7 +43,7 @@ typedef enum ggml_rir_mode {
 ggml_rir_mode ggml_rir_get_mode(void);
 
 // Set the policy programmatically, so it can be a versioned runtime option
-// rather than only an environment variable (docs/INT_RIR.md §9.4). Takes
+// rather than only an environment variable. Takes
 // precedence over RETRO_RIR_MODE.
 //
 // Returns 0 on success. Returns non-zero, and changes nothing, once the mode has
@@ -67,11 +67,11 @@ ggml_rir_mode ggml_rir_get_dispatch_mode(void);
 // It can only *lower* the effective mode, never raise it — raising it would
 // claim a pipeline that was never created at device init. That asymmetry is
 // what keeps `retro_probe_op_run_ex(..., NATIVE, ...)` honest without
-// reintroducing a mid-run policy change (docs/INT_RIR.md §9.4).
+// reintroducing a mid-run policy change.
 void ggml_rir_set_force_native(bool force);
 bool ggml_rir_get_force_native(void);
 
-// Stable rejection taxonomy (docs/INT_RIR.md §5.1). Order is ABI.
+// Stable rejection taxonomy. Order is ABI.
 typedef enum ggml_rir_reject {
     GGML_RIR_MATCHED              = 0,
     GGML_RIR_REJECT_WRONG_OP      = 1,
@@ -86,8 +86,8 @@ typedef enum ggml_rir_reject {
     GGML_RIR_REJECT_POLICY_NATIVE = 10,
     GGML_RIR_REJECT_DEVICE_GRID   = 11,
     GGML_RIR_REJECT_DEVICE_ALIGNMENT = 12,
-    // The node names a **member of an op family** no registered kernel writes
-    // (docs/FUTURE_V1.md §7). A portable-contract reason, appended rather than
+    // The node names a **member of an op family** no registered kernel writes.
+    // A portable-contract reason, appended rather than
     // inserted: 2–7 and 13 are the contract, 8–12 are the device, and the
     // numbers are ABI — `rir-gen` checks each name against its value here.
     GGML_RIR_REJECT_OP_VARIANT    = 13,
@@ -106,8 +106,7 @@ typedef struct ggml_rir_counters {
     uint64_t fallback_pipeline;  // reject: pipeline absent/not built
     // Same rejections, one bucket per ggml_rir_reject. The three aggregates
     // above answer "how much fell back"; this answers "widen what first",
-    // which is the question a coverage run on a real graph has to settle
-    // (docs/INT_RIR.md §11 phase D).
+    // which is the question a coverage run on a real graph has to settle.
     uint64_t reject_by_reason[GGML_RIR_REJECT_COUNT];
 } ggml_rir_counters;
 
@@ -121,7 +120,7 @@ void ggml_rir_count_dispatched(const char * variant_id);
 void ggml_rir_count_native(void);
 void ggml_rir_count_reject(ggml_rir_reject why);
 
-// Per-site breakdown (docs/INT_RIR.md §9.2). The aggregate above answers "how
+// Per-site breakdown. The aggregate above answers "how
 // much of everything fell back"; with more than one integrated op that is no
 // longer actionable, because two ops on two backends land in the same bucket.
 //
@@ -142,16 +141,16 @@ void ggml_rir_site_end(void);
 // dtype in practice; the cap only bounds the row, and an overflow is reported
 // rather than dropped.
 //
-// Sixteen since FUTURE V1 §5: `OUT_PROD` reads ten standard quantized formats
+// Sixteen because `OUT_PROD` reads ten standard quantized formats
 // plus two, and its F32 fallback — thirteen at one site. The cap that used to
 // hold them turned three of the twelve into `[overflow]`, which is the lane
 // refusing to call a report complete rather than folding them into a neighbour.
-// Thirty-two since FUTURE V1 §7: `GGML_OP_UNARY` is a family of fourteen
+// Thirty-two because `GGML_OP_UNARY` is a family of fourteen
 // kernels behind one op and one dispatch site, and each publishes two workgroup
 // widths — twenty-eight rows for one pair. A site that cannot hold its variants
 // reports `[overflow]`, which the lane refuses to count; the cap said so, out
 // loud, at the first node.
-// Forty-eight since docs/CUDA_v1.md §C6: the same family gains a **third**
+// Forty-eight because the same family gains a **third**
 // lowering on CUDA, the flattened dispatch, so `GGML_OP_UNARY` publishes
 // forty-two rows at one site. The cap said so again, at generation this time —
 // `the_forks_variant_caps_hold_for_the_widest_pair` reads the tables and the
@@ -183,7 +182,7 @@ ggml_rir_site_counters ggml_rir_site_snapshot(uint32_t index);
 // Which implementation actually ran, for the op-at-a-time probe path. The
 // counters answer "how often"; this answers "what ran, and why not the other
 // one", which is the only thing that can prove a test is not silently green
-// on the native kernel (docs/INT_RIR.md §9.1).
+// on the native kernel.
 typedef enum ggml_rir_impl {
     GGML_RIR_IMPL_UNKNOWN = 0,
     GGML_RIR_IMPL_NATIVE  = 1,
@@ -225,8 +224,7 @@ const rir_variant_desc * ggml_rir_find_variant(const char * kernel, rir_backend 
 //
 // This is the lookup a backend needs once a kernel has more than one lowering:
 // a Vulkan pipeline is built from a per-variant SPIR-V blob, so the object and
-// the registry row must be matched on the variant and not on the kernel
-// (docs/INT_RIR_V3.md §R1).
+// the registry row must be matched on the variant and not on the kernel.
 const rir_variant_desc * ggml_rir_find_variant_named(const char * kernel, const char * variant,
                                                      rir_backend backend);
 
@@ -237,11 +235,11 @@ const rir_variant_desc * ggml_rir_find_variant_named(const char * kernel, const 
 // A variant returned here is *registered*, not necessarily *dispatchable*: an
 // OBSERVE_GENERATED pair has a variant whose contract is evaluated and counted
 // while the native kernel keeps running. Ask `ggml_rir_op_policy` before
-// encoding anything (docs/INT_RIR_V2.md §P2).
+// encoding anything.
 //
 // This is what makes the registry's `priority` and `rir_op_policies` load-bearing
-// instead of descriptive: a backend must not name a kernel string of its own
-// (docs/INT_RIR_V2.md §P1). `ggml_op` is an `enum ggml_op`, taken as int32_t so
+// instead of descriptive: a backend must not name a kernel string of its own.
+// `ggml_op` is an `enum ggml_op`, taken as int32_t so
 // the header stays usable from C and Objective-C.
 const rir_variant_desc * ggml_rir_find_variant_for_op(int32_t ggml_op, rir_backend backend);
 
@@ -253,7 +251,7 @@ const rir_variant_desc * ggml_rir_find_variant_for_op(int32_t ggml_op, rir_backe
 //
 // Every dispatch site and the require-preflight go through this one, because a
 // contract evaluated against one variant and encoded with another is exactly
-// the drift the registry exists to prevent (docs/INT_RIR_V3.md §R1).
+// the drift the registry exists to prevent.
 const rir_variant_desc * ggml_rir_find_variant_for_node(int32_t ggml_op, rir_backend backend,
                                                         const struct ggml_tensor * node);
 
@@ -264,8 +262,7 @@ bool ggml_rir_variant_fits_shape(const rir_variant_desc * v, const struct ggml_t
 
 // Whether the *axis* half of a variant's contract holds for `node`: every
 // binding sharing an axis agrees on its extent, and every **folded** axis
-// divides the extent it is replayed under (`ggml_can_repeat`,
-// docs/FUTURE_V1.md §6).
+// divides the extent it is replayed under (`ggml_can_repeat`).
 //
 // A fourth claim of the same family, and the one that lets two kernels of the
 // same op be told apart by shape: `mul` claims three equal shapes, `mul_repeat`
@@ -279,7 +276,7 @@ bool ggml_rir_variant_fits_axes(const rir_variant_desc * v, const struct ggml_te
 // tensor whose contiguous stride is one element. It is a claim in the same
 // sense as a shape rule — evaluated before a variant is selected, so a
 // permuted view falls to the pair's scalar fallback instead of falling out of
-// RIR entirely (docs/INT_RIR_V4.md §P1).
+// RIR entirely.
 bool ggml_rir_variant_fits_layout(const rir_variant_desc * v, const struct ggml_tensor * node);
 
 // Whether the *dtypes* a variant declares hold for `node`, binding by binding.
@@ -287,14 +284,13 @@ bool ggml_rir_variant_fits_layout(const rir_variant_desc * v, const struct ggml_
 // A third claim of the same family as the two above, and the one that lets a
 // single ggml op be served by several kernels: `OUT_PROD` publishes an F32 row
 // and one row per quantized `src0` format lowering can decode, and what picks
-// between them is the node's own type (docs/INT_RIR_V4.md §P5). Evaluated
+// between them is the node's own type. Evaluated
 // before selection, so a type no row claims falls to the pair's fallback and
 // leaves through the portable contract with `dtype` — never onto a row that
 // would reinterpret its bytes.
 bool ggml_rir_variant_fits_dtype(const rir_variant_desc * v, const struct ggml_tensor * node);
 
-// Whether the **member of an op family** a variant declares is the node's own
-// (docs/FUTURE_V1.md §7).
+// Whether the **member of an op family** a variant declares is the node's own.
 //
 // The fourth claim of the same family, and the one that makes `GGML_OP_UNARY`
 // integrable at all: it is not one op but twenty-two functions behind one
@@ -319,13 +315,12 @@ bool ggml_rir_variant_fits_op_variant(const rir_variant_desc * v, const struct g
 rir_policy ggml_rir_op_policy(int32_t ggml_op, rir_backend backend);
 
 // The parts of this op's ggml domain the RIR kernel does **not** claim, as a
-// bitmask of `ggml_rir_reject` values — `rir_op_policy.assumed_domain`
-// (docs/INT_RIR_V4.md §P4).
+// bitmask of `ggml_rir_reject` values — `rir_op_policy.assumed_domain`.
 //
 // This is what makes a native fallback *checkable* rather than merely counted.
 // A pair's `reject_by_reason` must be a subset of this mask: a bit that is set
-// is a restriction the registry published and §11 lets the native kernel be
-// kept for, a bit that is clear is a node the kernel said it would serve and
+// is a restriction the registry published and the native kernel is kept
+// for, a bit that is clear is a node the kernel said it would serve and
 // did not. The lane and the real-graph test both assert exactly that, per site.
 //
 // The granularity is the category, not the node — "some dtypes are out of
@@ -346,10 +341,10 @@ uint32_t ggml_rir_op_assumed_domain(const char * ggml_op_spelling, rir_backend b
 bool ggml_rir_op_is_targeted(int32_t ggml_op, rir_backend backend);
 
 // Whether the **native kernel of this pair no longer exists** in this build:
-// `rir_op_policy.native_retired` (docs/INT_RIR_V4.md §P6). The registry only
-// ever sets it on a pair whose `assumed_domain` is empty, because §11 lets a
-// native kernel be kept for a published restriction — and therefore only lets
-// it be removed when there is none.
+// `rir_op_policy.native_retired`. The registry only
+// ever sets it on a pair whose `assumed_domain` is empty: a native kernel is
+// kept for a published restriction, so it can only be removed when there is
+// none.
 //
 // It is the fact that makes `off` incomplete for a pair rather than merely
 // slower: there is nothing to fall back to. Three consumers read it and none
@@ -362,21 +357,21 @@ bool ggml_rir_op_native_retired(const char * ggml_op_spelling, rir_backend backe
 
 // The answer a backend's `supports_op` owes for a node RIR may serve: the pair
 // is promoted, the mode allows encoding, and the **portable** contract matches
-// this node (docs/INT_RIR_V4.md §P6).
+// this node.
 //
 // The device half is deliberately *not* evaluated here. `supports_op` is asked
 // on a device, before any context, queue or pipeline exists, so a check needing
 // one would either lie or force a context into existence at graph-split time.
 // What that leaves is exactly the half the registry publishes and every backend
 // evaluates identically — which is also the half that decides a *domain*. A
-// device rejection is never a domain (§P4), so a pair that reaches its dispatch
+// device rejection is never a domain, so a pair that reaches its dispatch
 // site and fails the device half is a build that cannot run here, and the site
 // says so rather than quietly answering elsewhere.
 //
 // A backend whose native kernel is still there ORs this with its own condition:
 // the union is the domain the op announces, and it is wider than either side —
 // the RIR contract accepts the packed-QKV view the native Vulkan `l2_norm_back`
-// failed on (docs/INT_RIR.md §11 phase F). A backend whose native is retired
+// failed on. A backend whose native is retired
 // returns this and nothing else.
 bool ggml_rir_supports_op(uint8_t backend, const struct ggml_tensor * node);
 
@@ -400,8 +395,7 @@ const rir_variant_desc * ggml_rir_select_variant(
 // Runs the selection rule on synthetic tables built for the purpose. Returns 0
 // when every case held, otherwise a bitmask of the cases that failed — see
 // ggml-rir.cpp for what each bit means. Exposed so a lane with no GPU can still
-// assert that the registry's `priority` and `rir_op_policies` are load-bearing
-// (docs/INT_RIR_V2.md §P1).
+// assert that the registry's `priority` and `rir_op_policies` are load-bearing.
 uint32_t ggml_rir_selftest_selection(void);
 
 // The tensor a binding of `v` reads or writes on `node`: `src[source]`, or
@@ -416,7 +410,7 @@ const struct ggml_tensor * ggml_rir_binding_tensor(const rir_variant_desc * v, u
 //
 // No backend restates any of this. A constraint that needs a pipeline, a device
 // limit or a descriptor offset to answer is the device half, and only that half
-// belongs in `ggml_rir_device_check_fn` (docs/INT_RIR_V2.md §P1).
+// belongs in `ggml_rir_device_check_fn`.
 int32_t ggml_rir_evaluate_portable(const rir_variant_desc * v, const struct ggml_tensor * node);
 
 // The device half of the contract, supplied by the backend: everything that
@@ -426,7 +420,7 @@ int32_t ggml_rir_evaluate_portable(const rir_variant_desc * v, const struct ggml
 typedef int32_t (*ggml_rir_device_check_fn)(void * device_ctx, const struct ggml_tensor * node);
 
 // The single entry both the preflight and the dispatch site go through, so no
-// contract can be visible to one and not the other (docs/INT_RIR_V2.md §P1).
+// contract can be visible to one and not the other.
 // Evaluates the portable part first, then delegates to `device_check`.
 // Counts nothing: the caller decides whether this evaluation is a dispatch
 // decision or a preflight probe.
@@ -443,7 +437,7 @@ int32_t ggml_rir_evaluate(uint8_t backend, const struct ggml_tensor * node,
 // dispatch. Fixed here rather than read from the generated
 // `RIR_MAX_PUSH_CONSTANT_BYTES`, so that adding a kernel — which may raise that
 // maximum — does not recompile the backend translation units for a number they
-// only use as a bound (docs/INT_RIR_V3.md §R0). `ggml-rir.cpp` includes the
+// only use as a bound. `ggml-rir.cpp` includes the
 // generated header and static_asserts that the real maximum still fits, so the
 // two cannot drift apart silently.
 #define RIR_PUSH_CONSTANT_CAPACITY 256
@@ -473,7 +467,7 @@ void ggml_rir_grid(const rir_variant_desc * v, const struct ggml_tensor * node, 
 //
 // Everything a dispatch site used to spell out — the mode test, the site name,
 // the counters, the require abort — lives here, so integrating a second op is a
-// call and not a copy of forty lines (docs/INT_RIR_V2.md §P2).
+// call and not a copy of forty lines.
 const rir_variant_desc * ggml_rir_dispatch_begin(uint8_t backend, const struct ggml_tensor * node,
                                                  ggml_rir_device_check_fn device_check,
                                                  void * device_ctx);
@@ -493,8 +487,8 @@ bool ggml_rir_preflight_graph(uint8_t backend, struct ggml_cgraph * cgraph,
 // --- graph census -----------------------------------------------------------
 //
 // The site counters answer "how did the ops RIR already covers behave". They
-// cannot answer the question R2 opens (docs/INT_RIR_V3.md §5): *which op should
-// be written next*. That one is about the ops RIR does **not** cover, so it
+// cannot answer the next question: *which op should be written next*. That one
+// is about the ops RIR does **not** cover, so it
 // needs a hook that sees every node of the graph, not only the registered ones.
 //
 // The census is that hook. It is called from the same place as the preflight —
@@ -504,7 +498,7 @@ bool ggml_rir_preflight_graph(uint8_t backend, struct ggml_cgraph * cgraph,
 //
 // It measures **work**, not time. A per-node timing would need a
 // synchronization per node, whose fixed submission cost on macOS is larger than
-// most nodes (docs/INT_RIR_V3.md §10, R0 niveau 1) and would flatten exactly
+// most nodes, and would flatten exactly
 // the ranking it is meant to produce. So the census publishes the shapes, and
 // the time of a shape is what `scripts/test-rir.sh` already measures in
 // isolation. Two measurements, each honest about what it observed.
@@ -548,8 +542,8 @@ ggml_rir_census_row ggml_rir_census_snapshot(uint32_t index);
 
 // --- subgraph patterns ------------------------------------------------------
 //
-// The rows above rank *ops*. They cannot rank what O6 asks about
-// (docs/OPTIM_V3.md §6): a fusion does not remove an op, it removes the
+// The rows above rank *ops*. They cannot rank a fusion: it does not remove an
+// op, it removes the
 // boundary between two of them — a dispatch, and the round trip through memory
 // of the tensor that only existed to cross it. An op row has no column for
 // that, because the cost belongs to the edge and not to either endpoint.
@@ -559,13 +553,13 @@ ggml_rir_census_row ggml_rir_census_snapshot(uint32_t index);
 // output, and is not a view. Under those conditions, and only under them,
 // fusing the pair is a local rewrite — nobody else can observe the tensor that
 // disappears. Every contiguous window of length 2..GGML_RIR_MAX_PATTERN_LEN of
-// a chain is counted, not only the maximal chain, because the pilot O6 §6.2
+// a chain is counted, not only the maximal chain, because the fusion pilot
 // has to pick between `RMS_NORM→MUL` and `RMS_NORM→MUL→ADD` and a census that
 // published only the longest would hide the shorter one's own traffic.
 //
 // What is deliberately *not* counted: a node with two computed sources that are
 // both fusable — `ADD(f(x), g(x))` is a DAG motif, not a chain, and collapsing
-// it needs a fusion vocabulary the IntegrationSpec of §6.3 does not have. The
+// it needs a fusion vocabulary the IntegrationSpec does not have. The
 // walk follows one spine, the first fusable source in `src` order, so the
 // relation is a function and the chains are disjoint.
 //
@@ -574,7 +568,7 @@ ggml_rir_census_row ggml_rir_census_snapshot(uint32_t index);
 // figure read *and* written, i.e. twice it. Nothing here executed anything.
 
 #define GGML_RIR_MAX_PATTERN_ROWS 128
-// Four is the length of the pilot named in §6.2 plus one. Longer chains are not
+// Four is the length of the fusion pilot plus one. Longer chains are not
 // dropped: their length-4 windows are counted, which is what a fusion of that
 // vocabulary could actually emit.
 #define GGML_RIR_MAX_PATTERN_LEN  4
@@ -621,7 +615,7 @@ void               ggml_rir_violation_format(char * buf, size_t n_buf);
 //
 // Every dimension counts because the variants now carry one `nb[d]` per
 // argument per dimension: a view whose planes sit further apart than the rows
-// they contain (Qwen3.5's packed QKV, docs/INT_RIR.md §11 phase D) addresses
+// they contain (Qwen3.5's packed QKV) addresses
 // well past what a row-folded bound would predict.
 uint64_t ggml_rir_max_byte_offset(const struct ggml_tensor * t);
 

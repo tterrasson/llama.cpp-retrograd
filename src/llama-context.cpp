@@ -3650,7 +3650,7 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
 //
 
 // retro delta: unpack the output-head tensor the fused CE optimizer path
-// needs (see docs/memory/03-vocab-logits-chunked-ce.md). Historically this was
+// needs. Historically this was
 // always a bare MUL_MAT(w, h). Some models (e.g. gemma4 with suppressed
 // tokens, src/models/gemma4.cpp) instead build ADD(MUL_MAT(w, h), bias) with a
 // fixed [n_vocab] F32 bias graph input; recognize that pattern too (either ADD
@@ -3758,7 +3758,7 @@ static bool llama_fused_ce_unpack_head(
     return false;
 }
 
-// retro delta (plan rl/OPTIMIZE feature 3): the hidden states the fused CE reads
+// retro delta: the hidden states the fused CE reads
 // are the model's embeddings output (`result_norm`), which llm_graph_result marks
 // GGML_TENSOR_FLAG_OUTPUT. ggml-alloc never frees an output and never lets another
 // node reuse its buffer, so the flag pins the full [n_embd, n_tokens] activations
@@ -3967,7 +3967,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     }
     opt_ce_tiles = lopt_params.n_ce_tiles > 0 ? lopt_params.n_ce_tiles : 1;
     opt_ce_seq_chunk = lopt_params.n_ce_seq_chunk > 0 ? lopt_params.n_ce_seq_chunk : 0;
-    // retro delta (plan rl/OPTIMIZE feature 3): offloading the log-softmax
+    // retro delta: offloading the log-softmax
     // activations means letting grad_h reuse the buffer of `h`, one evicted token
     // chunk at a time. Without token chunking the "chunk" is the whole tensor and
     // the staging buffer costs exactly what the aliasing saves, so the flag buys

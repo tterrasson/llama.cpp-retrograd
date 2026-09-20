@@ -152,11 +152,10 @@ struct vk_op_push_constants {
 // one struct per production kernel, each with its own static_assert — and
 // `ggml_rir_fill_params` places the fields, so nothing here restates it. What
 // is left is a buffer whose used length is only known from the registry row,
-// hence the explicit size (docs/INT_RIR_V2.md §P1).
+// hence the explicit size.
 //
 // The capacity is the stable one published by ggml-rir.h, not the generated
-// maximum: this unit must not depend on a header that a new kernel edits
-// (docs/INT_RIR_V3.md §R0).
+// maximum: this unit must not depend on a header that a new kernel edits.
 struct vk_rir_push_constants {
     uint32_t data[RIR_PUSH_CONSTANT_CAPACITY / 4];
     size_t   n_bytes;
@@ -759,7 +758,7 @@ struct vk_op_conv_rs_gather_push_constants {
     uint32_t total;
 };
 
-// retro delta: fused sparse cross-entropy (docs/memory/GPUVOCAB.md).
+// retro delta: fused sparse cross-entropy.
 struct vk_op_fused_sparse_ce_push_constants {
     uint32_t n_embd;
     uint32_t n_tokens;

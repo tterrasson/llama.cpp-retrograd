@@ -1,5 +1,4 @@
-// retro delta: the one translation unit that sees the RIR launch stubs
-// (docs/CUDA_v1.md §C2).
+// retro delta: the one translation unit that sees the RIR launch stubs.
 //
 // It exists so that nothing else does, which is the same reason
 // `ggml-vulkan-rir.cpp` exists — and one CUDA adds: a generated `.cu` includes

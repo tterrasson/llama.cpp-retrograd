@@ -54,7 +54,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/vec.cpp
         ggml-cpu/ops.h
         ggml-cpu/ops.cpp
-        # retro delta: the fork's own CPU kernels (docs/RETRO_FORK.md)
+        # retro delta: the fork's own CPU kernels
         ggml-cpu/retro-ops.cpp
         )
 

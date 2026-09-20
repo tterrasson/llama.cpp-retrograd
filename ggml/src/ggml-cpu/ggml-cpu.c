@@ -2964,8 +2964,8 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_OUT_PROD:
                     {
-                        // OPTIMS_V4 Q2: quantized/F16 OUT_PROD now decodes a
-                        // fixed 256-value tile on each worker's stack.
+                        // Quantized/F16 OUT_PROD decodes a fixed 256-value
+                        // tile on each worker's stack.
                         cur = 0;
                     } break;
                 case GGML_OP_SET_ROWS:

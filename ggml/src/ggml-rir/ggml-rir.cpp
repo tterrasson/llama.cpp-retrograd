@@ -3,7 +3,7 @@
 
 // The generated constant-buffer layouts, included *here* and nowhere in a
 // backend: this is the unit that owns the check that the capacity the
-// backends stage into still holds every kernel (docs/INT_RIR_V3.md §R0).
+// backends stage into still holds every kernel.
 #include "rir_kernel_params.h"
 
 #include "ggml-impl.h"
@@ -50,7 +50,7 @@ std::atomic<bool> g_mode_latched{false};
 
 ggml_rir_mode mode_from_env() {
     const char * v = std::getenv("RETRO_RIR_MODE");
-    // Absent is `prefer` since docs/INT_RIR_V4.md §P6: the promoted pairs are
+    // Absent is `prefer`: the promoted pairs are
     // the build's own dispatch path, not an opt-in experiment. `off` stays a
     // spelling, so the bench and the diagnostic keep their native run — for the
     // pairs that still have a native kernel to run.
@@ -234,7 +234,7 @@ struct stats_printer {
         // because this is the one path a lane reliably reaches: the rule is
         // pure, the shipped registry cannot exhibit a tie, a policy veto and a
         // shape miss in one run, and a variant table nothing checks is a table
-        // that silently stops arbitrating (docs/INT_RIR_V3.md §R1).
+        // that silently stops arbitrating.
         std::fprintf(stderr, "ggml-rir: selftest selection=0x%x\n",
             ggml_rir_selftest_selection());
         const ggml_rir_counters c = ggml_rir_counters_snapshot();
@@ -259,7 +259,7 @@ struct stats_printer {
         std::fprintf(stderr, "\n");
         // The same numbers split by (op, backend, variant). With one op these
         // lines restate the aggregate; with two they are the only way to tell
-        // which op is not being covered (docs/INT_RIR.md §9.2).
+        // which op is not being covered.
         const uint32_t n_sites = ggml_rir_site_count();
         for (uint32_t s = 0; s < n_sites; ++s) {
             const ggml_rir_site_counters row = ggml_rir_site_snapshot(s);
@@ -287,7 +287,7 @@ struct stats_printer {
                 }
             }
             // The coverage rate and the domain that explains it, on the same
-            // line as the counters that produced them (docs/INT_RIR_V4.md §P4).
+            // line as the counters that produced them.
             //
             // Printed per site and never derived from the aggregate, which
             // cannot answer this question: a shared encoder — Metal's
@@ -496,7 +496,7 @@ uint64_t ggml_rir_max_byte_offset(const struct ggml_tensor * t) {
     // largest index that multiplies `nb[0]` is therefore `ne[0]/blck - 1`, and
     // using `ne[0] - 1` overstated the span by a factor of `block_elements` —
     // enough to refuse a perfectly addressable q4_K row with `integer_range`.
-    // Unreachable until §P5 gave a quantized binding to the portable contract,
+    // Unreachable before the portable contract gained a quantized binding,
     // which is why it stood.
     const int64_t blck = ggml_blck_size(t->type);
     uint64_t last = 0;
@@ -557,15 +557,15 @@ constexpr int RIR_N_BACKENDS = 4;  // rir_backend is dense: cuda/vulkan/metal/cp
 // `candidates` is what a *node* is resolved against, in descending priority so
 // the per-node choice is a scan that stops at the first fit. It is bounded by
 // construction: a pair publishes one lowering per shape regime and one per
-// `src0` dtype it can read (docs/INT_RIR_V4.md §P5), not one per shape.
+// `src0` dtype it can read, not one per shape.
 //
-// Sixteen and not eight since FUTURE V1 §5: `OUT_PROD` reads the ten standard
+// Sixteen and not eight because `OUT_PROD` reads the ten standard
 // quantized formats plus two, and its F32 fallback, which is thirteen rows for
 // one pair. The bound is still a bound and still aborts rather than dropping a
 // row — a variant the table cannot hold is one that would never be selected,
 // which is worse than a loud failure at startup.
 //
-// Forty-eight since docs/CUDA_v1.md §C6, for the same pair that raised it to
+// Forty-eight for the same pair that raised it to
 // thirty-two: `GGML_OP_UNARY` on CUDA carries a third lowering — the flattened
 // dispatch — over fourteen members, so forty-two rows resolve one node.
 constexpr uint32_t RIR_MAX_PAIR_VARIANTS = 48;
@@ -659,7 +659,7 @@ void build_selection() {
             // the native kernel *before* the registry promotes the pair — the
             // measurement the promotion decision depends on. It can only raise
             // observe to prefer: a NATIVE_ONLY pair has no pipeline built and
-            // must stay unreachable (docs/INT_RIR_V2.md §P2).
+            // must stay unreachable.
             if (policy == RIR_POLICY_OBSERVE_GENERATED &&
                     op_listed_in_env("RETRO_RIR_TEST_PREFER", op)) {
                 policy = RIR_POLICY_PREFER_GENERATED;
@@ -754,7 +754,7 @@ const rir_variant_desc * ggml_rir_select_variant(
         // The claim filters, when a node is in hand. A specialization that does
         // not fit this node is not a worse candidate, it is not a candidate:
         // its schedule was measured on the shapes it claims and loses — often
-        // by a factor of several — everywhere else (docs/INT_RIR_V3.md §R1),
+        // by a factor of several — everywhere else,
         // and a row whose dtype does not match would reinterpret the bytes.
         if (node != nullptr
                 && (!ggml_rir_variant_fits_shape(&v, node) || !ggml_rir_variant_fits_layout(&v, node)
@@ -833,7 +833,7 @@ uint32_t ggml_rir_selftest_selection(void) {
     // The rule the second cumsum variant needs, exercised on synthetic rows:
     // the shipped registry has exactly one specialization, so nothing in it
     // could tell "the rule was evaluated" apart from "the rule happened to
-    // hold" (docs/INT_RIR_V3.md §R1).
+    // hold".
     //
     // One axis, `row`, read from dimension 1 of the dst binding. The
     // specialization claims rows ≤ 4 and outranks the fallback.
@@ -879,7 +879,7 @@ uint32_t ggml_rir_selftest_selection(void) {
     // answer is the highest priority — the question pipeline creation asks.
     if (!is(picked(arbitrated, 2, prefer, 1), "special")) { failures |= 1u << 10; }
 
-    // --- per-dtype arbitration (docs/INT_RIR_V4.md §P5) ---------------------
+    // --- per-dtype arbitration ---------------------
     //
     // The same mechanism, on the third claim: `OUT_PROD` publishes one row per
     // `src0` dtype it can read, and what picks between them is the node's own
@@ -914,7 +914,7 @@ uint32_t ggml_rir_selftest_selection(void) {
     if (picked_type(GGML_TYPE_Q6_K) != nullptr) { failures |= 1u << 13; }
     probe.type = GGML_TYPE_F32;
 
-    // --- the vectorized fold claim (docs/FUTURE_V1.md §6) -------------------
+    // --- the vectorized fold claim -------------------
     //
     // The fourth claim, and the only one that is a *relation* between two axes:
     // a vec4 variant reading an operand through a fold needs that fold to be
@@ -1015,10 +1015,9 @@ const rir_variant_desc * ggml_rir_find_variant_for_node(int32_t ggml_op, rir_bac
     // answers "a variant". That property is checked at generation
     // (`check_schedule_table`), not hoped for here.
     for (uint32_t i = 0; i < sel.n_candidates; ++i) {
-        // `fits_axes` is here since FUTURE V1 §6, and it is what makes two
-        // kernels of one op selectable by *shape*. Until then no two variants
-        // of a pair disagreed about which extents must match, so the shape half
-        // of the contract could wait for `evaluate_portable`. Now `mul` claims
+        // `fits_axes` is what makes two kernels of one op selectable by
+        // *shape*, when the variants of a pair disagree about which extents
+        // must match. `mul` claims
         // three equal shapes and `mul_repeat` claims a divisor: a repeated node
         // that reached `mul` would be refused with `shape` and leave for the
         // native kernel, never trying the variant written for it.
@@ -1124,7 +1123,7 @@ ggml_type ggml_type_of_dtype(const char * dtype) {
     if (std::strcmp(dtype, "i32")  == 0)     { return GGML_TYPE_I32;  }
     // The quantized spellings are **expanded from the canonical table**, not
     // restated: `ggml_type_name(q4_K)` is what the registry prints, and the
-    // same header generates both sides (docs/INT_RIR.md §7.2). Writing the
+    // same header generates both sides. Writing the
     // list here is how a format ends up known to one side and not the other.
     // F16 is a row of that table, so it needs no line of its own.
 #define RIR_DTYPE_ROW(TYPE, BLK, NL, NAME, VKNAME) \
@@ -1152,8 +1151,8 @@ int64_t axis_extent(const rir_variant_desc * v, uint32_t a, const struct ggml_te
 }
 
 // The number of points a flattened dispatch covers: the product of
-// `ceil(extent / per_index)` over the axes the variant decomposes
-// (docs/CUDA_v1.md §C6). Zero when the variant is not flattened, and
+// `ceil(extent / per_index)` over the axes the variant decomposes.
+// Zero when the variant is not flattened, and
 // **saturating** rather than wrapping: the caller compares it against a bound,
 // and a wrapped product would compare small.
 uint64_t flat_total(const rir_variant_desc * v, const struct ggml_tensor * node) {
@@ -1180,8 +1179,8 @@ uint64_t flat_total(const rir_variant_desc * v, const struct ggml_tensor * node)
 
 // The multiplier and the shift of an unsigned division by `d`, as
 // `init_fastdiv_values` computes them in ggml-cuda/common.cuh and as
-// `rir_lower::fastdiv_magic` computes them for the oracle
-// (docs/CUDA_v1.md §C1.5). One formula, three implementations, and the parity
+// `rir_lower::fastdiv_magic` computes them for the oracle.
+// One formula, three implementations, and the parity
 // harness is what keeps them equal.
 void fastdiv_magic(uint32_t d, uint32_t * mp, uint32_t * sh) {
     uint32_t l = 0;
@@ -1233,7 +1232,7 @@ bool ggml_rir_variant_fits_layout(const rir_variant_desc * v, const struct ggml_
     if (v == nullptr || node == nullptr) {
         return false;
     }
-    // Linear addressing (docs/OPTIM_V3.md §3), first because it is the strictest
+    // Linear addressing, first because it is the strictest
     // claim of the two and subsumes what the width claims below it: the shader
     // computes `linear * vector_width * elem_bytes` and reads no stride at all,
     // which is the byte offset of that point exactly when **every** binding is
@@ -1269,7 +1268,7 @@ bool ggml_rir_variant_fits_layout(const rir_variant_desc * v, const struct ggml_
     // not at all) is read scalar and broadcast, and its stride is free.
     //
     // A flattened variant has no grid axis, and the contiguous one is the first
-    // it decomposes into — `flat[0]`, fastest first (docs/CUDA_v1.md §C6). The
+    // it decomposes into — `flat[0]`, fastest first. The
     // width means the same thing there and claims the same stride; what changes
     // is only where the axis is published.
     const int8_t a = v->n_flat > 0 ? v->flat[0].axis : v->dispatch[0].axis;
@@ -1296,8 +1295,8 @@ bool ggml_rir_variant_fits_layout(const rir_variant_desc * v, const struct ggml_
     if (!unit_stride_at_dim0(a)) {
         return false;
     }
-    // The operand read through a **fold** owes both halves of that sentence
-    // (docs/FUTURE_V1.md §6). An axis folded into the vectorized one replays
+    // The operand read through a **fold** owes both halves of that sentence.
+    // An axis folded into the vectorized one replays
     // index `i` as `i % extent`, so it is read in vectors too — which needs the
     // fold to be the identity *and* its own binding to have a unit contiguous
     // stride. The first alone is not enough: a `src1` with the same `ne0` but a
@@ -1323,7 +1322,7 @@ bool ggml_rir_variant_fits_axes(const rir_variant_desc * v, const struct ggml_te
         return false;
     }
     for (uint32_t a = 0; a < v->n_axes; ++a) {
-        // A **folded** axis is the divisor of a repeat (docs/FUTURE_V1.md §6),
+        // A **folded** axis is the divisor of a repeat,
         // not a shared extent: what it owes is divisibility, which is
         // `ggml_can_repeat` and is checked just below. Requiring agreement here
         // would refuse the very shapes the repeating kernel exists to serve.
@@ -1421,8 +1420,7 @@ int32_t ggml_rir_evaluate_portable(const rir_variant_desc * v, const struct ggml
         // `i / block_elements` and `i % block_elements`, so a row that is not a
         // whole number of blocks would send its tail into the next block. The
         // portable oracle already refuses this (`RejectReason::QuantBlock`);
-        // saying it here is what makes the two sides agree on the same node
-        // (docs/INT_RIR_V4.md §P5).
+        // saying it here is what makes the two sides agree on the same node.
         if (v->bindings[b].block_elements > 1
                 && t->ne[0] % (int64_t) v->bindings[b].block_elements != 0) {
             return GGML_RIR_REJECT_QUANT_BLOCK;
@@ -1454,7 +1452,7 @@ int32_t ggml_rir_evaluate_portable(const rir_variant_desc * v, const struct ggml
     // this row a node it does not fit — a shape-blind lookup, or a caller
     // naming the variant — and it must say `stride` rather than run.
     // **After** the bindings, and the order is the reason attributed to a node
-    // rather than an accident (docs/FUTURE_V1.md §7). When no variant of the
+    // rather than an accident. When no variant of the
     // family fits, selection hands back the pair's fallback — some *other*
     // member — so an F16 node would be refused as "wrong member" when what is
     // actually out of scope is its dtype. Checking the bindings first makes each
@@ -1475,7 +1473,7 @@ int32_t ggml_rir_evaluate_portable(const rir_variant_desc * v, const struct ggml
     }
 
     // The flattened index has to be representable, and the bound is tighter
-    // than `index_bits` says (docs/CUDA_v1.md §C6). The decomposition adds
+    // than `index_bits` says. The decomposition adds
     // `umulhi(n, mp)` to `n` in 32 bits, which is exact while `n < 2^31` and
     // wraps above it — so the claim this variant makes is not "the index fits
     // in 32 bits" but "it fits in 31". It is checked here, with the other
@@ -1578,14 +1576,14 @@ bool ggml_rir_fill_params(const rir_variant_desc * v, const struct ggml_tensor *
         }
     }
     // The flattened dispatch's own block, last, exactly as the generated shader
-    // declares it (docs/CUDA_v1.md §C6): the total, then one (divisor, magic
+    // declares it: the total, then one (divisor, magic
     // multiplier, shift) triple per divisor — one fewer than there are axes,
     // the last index being the quotient itself.
     //
     // This is the only place a push constant is *computed* rather than copied,
     // and it is why the flattening is not free of the host: the reciprocal of a
     // runtime divisor cannot be a compile-time constant, and dividing on the
-    // device is exactly the cost §C1.5 says the native does not pay.
+    // device is exactly the cost the native does not pay.
     if (v->n_flat > 0) {
         const uint64_t total = flat_total(v, node);
         if (total == 0 || total > 0x7fffffffull) {
@@ -1594,8 +1592,8 @@ bool ggml_rir_fill_params(const rir_variant_desc * v, const struct ggml_tensor *
         if (i < n_slots) {
             slot[i++] = (uint32_t) total;
         }
-        // A linear variant decomposes nothing, so it declares no reciprocal
-        // (docs/OPTIM_V3.md §3). Writing them anyway would overrun the layout the
+        // A linear variant decomposes nothing, so it declares no reciprocal.
+        // Writing them anyway would overrun the layout the
         // shader published, which the exact-fill check below reports.
         for (uint32_t f = 0; !v->linear_addr && f + 1 < v->n_flat && i + 2 < n_slots; ++f) {
             const uint32_t per = v->flat[f].per_workgroup ? v->flat[f].per_workgroup : 1;
@@ -1618,7 +1616,7 @@ bool ggml_rir_fill_params(const rir_variant_desc * v, const struct ggml_tensor *
 }
 
 void ggml_rir_grid(const rir_variant_desc * v, const struct ggml_tensor * node, uint32_t grid[3]) {
-    // The flattened dispatch first (docs/CUDA_v1.md §C6): one dimension over
+    // The flattened dispatch first: one dimension over
     // the whole parallel space. It is read before `dispatch[]` and not beside
     // it because such a variant has **no** grid axis — `dispatch[0].axis` is -1
     // — and the loop below would answer a single workgroup for the whole
@@ -1665,7 +1663,7 @@ const rir_variant_desc * ggml_rir_dispatch_begin(uint8_t backend, const struct g
         // and let the caller invoke a kernel that no longer exists.
         if (node != nullptr && ggml_rir_op_native_retired(ggml_op_name(node->op), (rir_backend) backend)) {
             GGML_ABORT("ggml-rir: %s/%s a été dispatché sous mode=off alors que son natif "
-                       "est retiré (docs/INT_RIR_V4.md §P6)",
+                       "est retiré",
                     ggml_op_name(node->op), ggml_rir_backend_name(backend));
         }
         return nullptr;
@@ -1676,7 +1674,7 @@ const rir_variant_desc * ggml_rir_dispatch_begin(uint8_t backend, const struct g
 
     // Attribute every count below — including the rejects the evaluator records
     // — to (this op, this backend), so the report can name what is not covered
-    // instead of one process-wide total (docs/INT_RIR.md §9.2). The name is the
+    // instead of one process-wide total. The name is the
     // registry's own spelling; a node with no variant has no site, and only
     // feeds the aggregate.
     ggml_rir_site_begin(variant ? variant->ggml_op : nullptr, backend);
@@ -1707,12 +1705,11 @@ const rir_variant_desc * ggml_rir_dispatch_begin(uint8_t backend, const struct g
     // Same reasoning as the `off` branch above, on the other exit. There is no
     // native kernel to count here, so counting one would be a lie the coverage
     // report would then publish. What produced this is either a device-half
-    // rejection — a build that cannot run on this machine, never a domain (§P4)
+    // rejection — a build that cannot run on this machine, never a domain
     // — or a portable rejection on a pair that declared no restriction at all,
     // which is the defect `assumed_domain` exists to make visible.
     if (ggml_rir_op_native_retired(ggml_op_name(node->op), (rir_backend) backend)) {
-        GGML_ABORT("ggml-rir: %s/%s reject=%s et le natif est retiré : aucun repli "
-                   "(docs/INT_RIR_V4.md §P6)",
+        GGML_ABORT("ggml-rir: %s/%s reject=%s et le natif est retiré : aucun repli",
                 ggml_op_name(node->op), ggml_rir_backend_name(backend),
                 ggml_rir_reject_name(why));
     }
@@ -1991,7 +1988,7 @@ void census_note_chain(uint8_t backend, const std::vector<const ggml_tensor *> &
             row->n_bytes_intermediate += intermediate;
             // A property of the (ops, backend) key alone, so it is the same on
             // every occurrence: whether RIR has a kernel for each link, which
-            // is what removes a row from the candidate list of §6.2.
+            // is what removes a row from the fusion candidate list.
             row->registered = registered;
         }
     }
@@ -2077,7 +2074,7 @@ void census_note_patterns(uint8_t backend, ggml_cgraph * g, int n_nodes) {
 // The pattern ranking, printed with the op ranking. Sorted by the traffic a
 // fusion would remove — twice the intermediate bytes, since the tensor is
 // written and read back — and then by the dispatches it would remove. Those two
-// columns are exactly what O6 §6.2 picks its pilot with.
+// columns are exactly what the fusion pilot is picked with.
 void pattern_print(std::FILE * out) {
     const uint32_t n = g_n_patterns.load(std::memory_order_acquire);
     if (n == 0) {

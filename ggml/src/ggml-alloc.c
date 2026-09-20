@@ -50,7 +50,7 @@ bool ggml_op_can_inplace(enum ggml_op op) {
     }
 }
 
-// retro delta (plan rl/OPTIMIZE feature 3): FUSED_SPARSE_CE_BACK can write grad_h
+// retro delta: FUSED_SPARSE_CE_BACK can write grad_h
 // straight over the hidden states it reads, but only when the node was built with
 // offload_h set (op_params[2]) — the backends then stage each token chunk out of
 // `h` before overwriting it. Without the flag the kernels read `h` while writing

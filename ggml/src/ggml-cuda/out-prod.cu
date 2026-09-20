@@ -6,7 +6,7 @@
 #include <cstdlib>
 #include <limits>
 
-// Native quantized OUT_PROD (OPTIMS_V4 Q2).
+// Native quantized OUT_PROD.
 //
 // Keep the reduction in F32 and in increasing-k order, but decode src0 directly
 // into a small shared-memory tile instead of materializing an F32 copy in the
@@ -25,8 +25,8 @@ static constexpr int OUT_PROD_Q_THREADS = RETRO_QUANT_THREADS;
 
 // The per-type loaders and their traits table live in retro-quant-loader.cuh:
 // fused sparse CE decodes the same frozen weights with the same contract, and
-// two copies of a quantization formula is the drift this repo keeps closing
-// (OPTIM_V3 O5 point 1). The 256-value tile of that contract *is* OUT_PROD_Q_BM.
+// two copies of a quantization formula is the drift this repo keeps closing.
+// The 256-value tile of that contract *is* OUT_PROD_Q_BM.
 template<typename loader>
 static __global__ void k_out_prod_quant(
         const void * __restrict__ src0, const float * __restrict__ src1, float * __restrict__ dst,

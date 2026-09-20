@@ -1,5 +1,4 @@
-// retro delta: SPIR-V of the RIR-generated shaders, addressed by artifact name
-// (docs/INT_RIR_V3.md §R0).
+// retro delta: SPIR-V of the RIR-generated shaders, addressed by artifact name.
 //
 // This header is hand-written and stable: it names no kernel. Adding a
 // generated kernel changes only `ggml-vulkan-rir-shaders.hpp` — which the

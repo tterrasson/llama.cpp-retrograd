@@ -111,12 +111,11 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 
 #include "ggml-backend-impl.h"
 #include "ggml-retro-quant.h"
-#include "ggml-rir/ggml-rir.h"  // retro delta: RIR AOT variants (docs/INT_RIR.md)
+#include "ggml-rir/ggml-rir.h"  // retro delta: RIR AOT variants
 // retro delta: the RIR shader blobs are resolved by name in their own unit, and
 // the constant-buffer capacity is a stable number in ggml-rir.h. Neither the
 // generated shader header nor the generated params header is included here, so
-// adding a RIR kernel does not recompile this 20 000-line unit
-// (docs/INT_RIR_V3.md §R0).
+// adding a RIR kernel does not recompile this 20 000-line unit.
 #include "ggml-vulkan-rir.h"
 
 #include "ggml-vulkan-shaders.hpp"
@@ -916,7 +915,7 @@ struct vk_device_struct {
     // — they are distinct SPIR-V modules — keyed by the name the registry
     // publishes. A map rather than a member per kernel: nothing in this unit
     // names a generated kernel any more, so adding one is a registry row and a
-    // shader file, nothing here (docs/INT_RIR_V3.md §R0).
+    // shader file, nothing here.
     std::map<std::string, vk_pipeline> pipeline_rir;
 
     // [src/dst 0=fp32,1=fp16]
@@ -1036,7 +1035,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_scan_back_grad_f32;
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
-    // retro delta: fused sparse cross-entropy (docs/memory/GPUVOCAB.md).
+    // retro delta: fused sparse cross-entropy.
     vk_pipeline pipeline_fused_sparse_ce_count;
     // Indexed by the head's ggml_type; null for types without a compiled variant
     // (or when the device lacks the needed features). supports_op gates on null.

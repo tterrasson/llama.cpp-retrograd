@@ -6,7 +6,7 @@
 // reached through ops.h like any other compute function. This header exists
 // only for the cases where an *upstream* dispatcher in ops.cpp has to call a
 // kernel the fork added — one `#include` in ops.cpp instead of a declaration
-// wedged into upstream's ops.h (docs/RETRO_FORK.md).
+// wedged into upstream's ops.h.
 
 #include "ggml.h"
 #include "ggml-impl.h"

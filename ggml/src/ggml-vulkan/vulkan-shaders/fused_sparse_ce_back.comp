@@ -30,7 +30,7 @@
 // The head is dequantized through the backend's generic per-type helpers
 // (dequant_funcs.glsl), so a single shader source covers every quant type; the
 // generator compiles one variant per DATA_A_* type. Matches
-// ggml_compute_forward_fused_sparse_ce_back_f32. See docs/memory/GPUVOCAB.md.
+// ggml_compute_forward_fused_sparse_ce_back_f32.
 
 // See fused_sparse_ce.comp for the include ordering rationale.
 #define FLOAT_TYPE float

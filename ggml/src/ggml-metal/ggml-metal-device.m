@@ -7,8 +7,7 @@
 #import "ggml-metal-common.h"
 #import "ggml-retro-quant.h"
 // retro delta: the portable half of the RIR contract, which is the whole answer
-// this device gives for a pair whose native kernel is retired
-// (docs/INT_RIR_V4.md §P6).
+// this device gives for a pair whose native kernel is retired.
 #import "ggml-rir/ggml-rir.h"
 
 #include <Foundation/Foundation.h>
@@ -2094,7 +2093,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_OPT_STEP_SGD:
             return has_simdgroup_reduction;
         // retro delta: the two backward reductions whose native Metal kernel is
-        // retired (docs/INT_RIR_V4.md §P6). What used to stand here was a
+        // retired. What used to stand here was a
         // hand-written restatement of the same conditions the registry
         // publishes — F32 throughout, `nb[0] == type_size`, three identical
         // shapes — kept in step with a kernel by hand. The generated variant is
@@ -2104,10 +2103,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         //
         // It is not the same set as before, and that is the point of asking the
         // contract rather than a copy of it: the RIR contract accepts the packed
-        // QKV view that the equivalent native Vulkan kernel failed on
-        // (docs/INT_RIR.md §11 phase F), and it refuses nothing the matrix or a
+        // QKV view that the equivalent native Vulkan kernel failed on,
+        // and it refuses nothing the matrix or a
         // real backward graph produces — 60/60 and 30/30 nodes claimed, 100 %
-        // on the graph (§7.2), which is the condition §11 puts on a removal.
+        // on the graph, which is the condition for removing a native kernel.
         case GGML_OP_RMS_NORM_BACK:
         case GGML_OP_L2_NORM_BACK:
             return has_simdgroup_reduction && ggml_rir_supports_op(RIR_BACKEND_METAL, op);
