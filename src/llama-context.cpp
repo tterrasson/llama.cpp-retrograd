@@ -3775,7 +3775,17 @@ static void llama_fused_ce_release_hidden_output(struct ggml_tensor * h) {
 }
 
 static void llama_set_param(struct ggml_tensor * tensor, llama_opt_param_filter param_filter, void * userdata) {
-    if (!tensor || tensor->type != GGML_TYPE_F32) {
+    // retro delta: the float types an update kernel can write, not F32 alone.
+    // ggml_opt_step_adamw accepts an F16 parameter (it rounds the update
+    // stochastically rather than keeping an F32 master copy), and
+    // ggml_build_backward_expand allocates every gradient accumulator in F32
+    // whatever the parameter's own storage, so the rest of the graph is
+    // unchanged. Which of the admitted types a given run may actually mark is
+    // the caller's question - it depends on the optimizer that owns the
+    // parameter and on the device the step lands on - and `param_filter` is
+    // where that policy belongs; widening here without it would silently mark
+    // a tensor whose step aborts on the first update.
+    if (!tensor || (tensor->type != GGML_TYPE_F32 && tensor->type != GGML_TYPE_F16)) {
         return;
     }
     if (!param_filter(tensor, userdata)) {
