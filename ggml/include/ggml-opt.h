@@ -112,6 +112,70 @@ extern "C" {
         GGML_OPT_OPTIMIZER_TYPE_COUNT
     };
 
+    // retro delta: the executable half of an optimizer's descriptor.
+    //
+    // An optimizer declares what persistent state it keeps; the allocator, the
+    // initializer and the update graph all read that declaration instead of
+    // spelling one optimizer's layout out in three places. AdamW's pair is one
+    // table among others, and an optimizer keeping three slots of two shapes
+    // needs no new branch in the allocator.
+
+    // How large one slot is, relative to the parameter it belongs to.
+    enum ggml_opt_slot_shape {
+        GGML_OPT_SLOT_SHAPE_PARAMETER = 0, // the parameter's own shape
+        GGML_OPT_SLOT_SHAPE_BLOCKS    = 1, // ceil(nelements / n_block) elements
+        GGML_OPT_SLOT_SHAPE_FIXED     = 2, // n_block elements, parameter-independent
+    };
+
+    // What a slot holds before the first update. An enumeration rather than a
+    // scalar fill because a codebook is generated, not filled.
+    enum ggml_opt_slot_init {
+        GGML_OPT_SLOT_INIT_ZERO             = 0, // every element zero
+        GGML_OPT_SLOT_INIT_CODE             = 1, // every byte the same code
+        GGML_OPT_SLOT_INIT_UNIFORM_CODEBOOK = 2, // c[k] = -1 + 2k/(n-1), F32
+    };
+
+    struct ggml_opt_slot_def {
+        const char *             name;
+        enum ggml_type           type;
+        enum ggml_opt_slot_shape shape;
+        // Block size for BLOCKS, element count for FIXED, ignored otherwise.
+        int64_t                  n_block;
+        enum ggml_opt_slot_init  init;
+        uint8_t                  code; // GGML_OPT_SLOT_INIT_CODE only
+    };
+
+    // The per-parameter and per-owner slot tables of one optimizer. An empty
+    // table is a valid answer and is not "no optimizer": SGD keeps no
+    // per-parameter state and still has an iteration counter and an RNG.
+    GGML_API const struct ggml_opt_slot_def * ggml_opt_optimizer_slots(
+            enum ggml_opt_optimizer_type optimizer, int64_t * n_slots);
+    GGML_API const struct ggml_opt_slot_def * ggml_opt_optimizer_shared_slots(
+            enum ggml_opt_optimizer_type optimizer, int64_t * n_slots);
+
+    // How many hyperparameters one optimizer's update step reads, excluding
+    // the shared gradient-clipping scale appended to them.
+    GGML_API int64_t ggml_opt_optimizer_n_params(enum ggml_opt_optimizer_type optimizer);
+
+    // How many elements one slot of this definition holds for a parameter of
+    // n_param_elements. A partial trailing block still costs an element, and a
+    // FIXED slot ignores the parameter entirely.
+    GGML_API int64_t ggml_opt_slot_n_elements(
+            const struct ggml_opt_slot_def * def, int64_t n_param_elements);
+
+    // The bytes a slot holds before the first update, from its definition
+    // alone. This is what the allocator writes into a live slot, exposed so the
+    // initializer can be checked without allocating a graph: one definition,
+    // one reader. Returns false for a buffer that is not exactly the slot's
+    // size, which is the only way a caller can get a partial answer.
+    GGML_API bool ggml_opt_slot_initial_bytes(
+            const struct ggml_opt_slot_def * def, int64_t n_elements, void * out, size_t n_bytes);
+
+    // Which optimizer owns one parameter. A null callback puts every parameter
+    // on the context's own optimizer, which is the single-optimizer run.
+    typedef enum ggml_opt_optimizer_type (*ggml_opt_get_param_optimizer)(
+            const struct ggml_tensor * param, void * userdata);
+
     // parameters that control which optimizer is used and how said optimizer tries to find the minimal loss
     struct ggml_opt_optimizer_params {
         // Maximum global L2 norm across all parameter gradients. Gradients are
@@ -159,8 +223,16 @@ extern "C" {
         ggml_opt_get_optimizer_params get_opt_pars;    // callback for calculating optimizer parameters
         void *                        get_opt_pars_ud; // userdata for calculating optimizer parameters
 
-        // only GGML_OPT_OPTIMIZER_TYPE_ADAMW needs m, v momenta per parameter tensor
+        // the optimizer every parameter uses, unless get_param_optimizer answers
+        // otherwise; its slot table is what the state allocator reads
         enum ggml_opt_optimizer_type optimizer;
+
+        // retro delta: per-parameter optimizer assignment. NULL keeps the whole
+        // run on `optimizer` above. A mixed run allocates each parameter's
+        // slots from the table of the optimizer that owns it, and builds each
+        // update step from that optimizer's own graph.
+        ggml_opt_get_param_optimizer get_param_optimizer;
+        void *                       get_param_optimizer_ud;
     };
 
     // get parameters for an optimization context with defaults set where possible
@@ -218,19 +290,34 @@ extern "C" {
 
     // retro delta: optimizer-state access for training checkpoints.
     //
-    // The AdamW momenta are allocated lazily, by the first ggml_opt_alloc that
-    // builds the optimizer graph; before that ggml_opt_momenta_count() is 0 and
-    // a checkpoint must record that it carries no momenta. Once allocated the
+    // The persistent slots are allocated lazily, by the first ggml_opt_alloc
+    // that builds the optimizer graph; before that ggml_opt_slot_count() is 0
+    // and a checkpoint must record that it carries no state. Once allocated the
     // tensors outlive individual graph allocations (they live in ctx_static),
     // so they stay readable and writable between epochs, and they are indexed
-    // by a stable parameter name rather than by graph node order.
+    // by a stable (owner, slot) pair rather than by graph node order.
+    //
+    // Two scopes: per-parameter slots, whose owner is the parameter's name, and
+    // shared slots, allocated once per owning optimizer and named by it. The
+    // shared table is empty for an optimizer that keeps nothing once.
     GGML_API int64_t ggml_opt_iter(    ggml_opt_context_t opt_ctx);
     GGML_API void    ggml_opt_set_iter(ggml_opt_context_t opt_ctx, int64_t iter);
 
-    GGML_API int64_t               ggml_opt_momenta_count(ggml_opt_context_t opt_ctx);
-    GGML_API const char *          ggml_opt_momenta_name( ggml_opt_context_t opt_ctx, int64_t index);
-    GGML_API struct ggml_tensor  * ggml_opt_momenta_m(    ggml_opt_context_t opt_ctx, int64_t index);
-    GGML_API struct ggml_tensor  * ggml_opt_momenta_v(    ggml_opt_context_t opt_ctx, int64_t index);
+    GGML_API int64_t               ggml_opt_slot_count( ggml_opt_context_t opt_ctx);
+    GGML_API const char *          ggml_opt_slot_owner( ggml_opt_context_t opt_ctx, int64_t index);
+    GGML_API const char *          ggml_opt_slot_name(  ggml_opt_context_t opt_ctx, int64_t index);
+    GGML_API struct ggml_tensor  * ggml_opt_slot_tensor(ggml_opt_context_t opt_ctx, int64_t index);
+
+    GGML_API int64_t               ggml_opt_shared_slot_count( ggml_opt_context_t opt_ctx);
+    GGML_API const char *          ggml_opt_shared_slot_owner( ggml_opt_context_t opt_ctx, int64_t index);
+    GGML_API const char *          ggml_opt_shared_slot_name(  ggml_opt_context_t opt_ctx, int64_t index);
+    GGML_API struct ggml_tensor  * ggml_opt_shared_slot_tensor(ggml_opt_context_t opt_ctx, int64_t index);
+
+    // The optimizer that owns one marked parameter. `found` distinguishes "no
+    // such parameter" from the first optimizer of the enumeration, and may be
+    // NULL when the caller already knows the name is marked.
+    GGML_API enum ggml_opt_optimizer_type ggml_opt_param_optimizer(
+            ggml_opt_context_t opt_ctx, const char * name, bool * found);
 
     // mt19937 state, serialized as the whitespace-separated decimal word list
     // produced by operator<<. Returns the number of bytes required excluding

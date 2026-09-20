@@ -39,6 +39,74 @@ struct ggml_opt_dataset {
     std::vector<int64_t> permutation;
 };
 
+// retro delta: one live persistent slot. The owner is a parameter's name in
+// the per-parameter scope and an optimizer's name in the shared one, so both
+// tables are read through one shape and a checkpoint that round-trips one
+// round-trips the other.
+struct ggml_opt_slot {
+    std::string             owner;
+    std::string             name;
+    struct ggml_tensor    * tensor = nullptr;
+    enum ggml_opt_slot_init init   = GGML_OPT_SLOT_INIT_ZERO;
+    uint8_t                 code   = 0;
+};
+
+// AdamW's two F32 moments, zero-initialized. Written as a table rather than
+// as two fields so that the allocator, the initializer and the update graph
+// read one declaration; nothing below knows the number two.
+static const struct ggml_opt_slot_def ggml_opt_slots_adamw[] = {
+    { "m", GGML_TYPE_F32, GGML_OPT_SLOT_SHAPE_PARAMETER, 0, GGML_OPT_SLOT_INIT_ZERO, 0 },
+    { "v", GGML_TYPE_F32, GGML_OPT_SLOT_SHAPE_PARAMETER, 0, GGML_OPT_SLOT_INIT_ZERO, 0 },
+};
+
+const struct ggml_opt_slot_def * ggml_opt_optimizer_slots(
+        enum ggml_opt_optimizer_type optimizer, int64_t * n_slots) {
+    switch (optimizer) {
+        case GGML_OPT_OPTIMIZER_TYPE_ADAMW:
+            if (n_slots) {
+                *n_slots = (int64_t) (sizeof(ggml_opt_slots_adamw)/sizeof(ggml_opt_slots_adamw[0]));
+            }
+            return ggml_opt_slots_adamw;
+        case GGML_OPT_OPTIMIZER_TYPE_SGD:
+            // Not "not initialized": SGD keeps no per-parameter state and still
+            // has an iteration counter and a schedule.
+            if (n_slots) {
+                *n_slots = 0;
+            }
+            return nullptr;
+        default:
+            GGML_ABORT("unknown optimizer");
+    }
+}
+
+const struct ggml_opt_slot_def * ggml_opt_optimizer_shared_slots(
+        enum ggml_opt_optimizer_type optimizer, int64_t * n_slots) {
+    switch (optimizer) {
+        case GGML_OPT_OPTIMIZER_TYPE_ADAMW:
+        case GGML_OPT_OPTIMIZER_TYPE_SGD:
+            if (n_slots) {
+                *n_slots = 0;
+            }
+            return nullptr;
+        default:
+            GGML_ABORT("unknown optimizer");
+    }
+}
+
+int64_t ggml_opt_optimizer_n_params(enum ggml_opt_optimizer_type optimizer) {
+    switch (optimizer) {
+        // alpha, beta1, beta2, eps, wd, beta1h, beta2h, and the per-step seed
+        // the stochastic rounding of an F16 parameter needs.
+        case GGML_OPT_OPTIMIZER_TYPE_ADAMW: return 8;
+        case GGML_OPT_OPTIMIZER_TYPE_SGD:   return 2;
+        default: GGML_ABORT("unknown optimizer");
+    }
+}
+
+// The widest shared table any optimizer declares, so the static context can be
+// sized before the run's owners are known.
+#define GGML_OPT_MAX_SHARED_SLOTS 4
+
 struct ggml_opt_context {
     ggml_backend_sched_t       backend_sched        = nullptr;
     ggml_cgraph              * allocated_graph      = nullptr;
@@ -73,8 +141,6 @@ struct ggml_opt_context {
     // graphs can assign different node indices to the same parameter.
     std::map<std::string, struct ggml_tensor *> grad_acc_by_name;
     struct ggml_tensor * loss_acc = nullptr;
-    std::vector<struct ggml_tensor *> grad_m;
-    std::vector<struct ggml_tensor *> grad_v;
     // Forward tensors retained across the backward pass. Empty preserves the
     // ordinary graph exactly; dynamic callers refresh this list per build.
     std::vector<struct ggml_tensor *> gradient_checkpoints;
@@ -87,14 +153,25 @@ struct ggml_opt_context {
     // build between a training step and the read would otherwise erase the
     // measurement rather than report the last one.
     struct ggml_opt_checkpoint_profile checkpoint_profile = {};
-    // retro delta: compacted, name-keyed view of the momenta above. This is
-    // the pairing both the optimizer step and checkpointing use; grad_m/grad_v
-    // stay as the allocation-time storage, indexed by forward-graph node
-    // position, which is not a stable identity across graph builds.
-    std::vector<std::string>          momenta_names;
-    std::vector<struct ggml_tensor *> momenta_m;
-    std::vector<struct ggml_tensor *> momenta_v;
-    std::map<std::string, size_t>     momenta_index;
+    // retro delta: the live persistent-state table, allocated from the
+    // optimizer descriptor. Keyed by parameter name, because a dynamic graph
+    // is rebuilt on every ggml_opt_alloc and a node position is only
+    // incidentally stable across builds. Checkpointing hands these same
+    // tensors to the caller under the same key, so the update step and the
+    // restore agree by construction rather than by coincidence.
+    std::vector<ggml_opt_slot>                          slots;
+    // parameter name -> [begin, end) into `slots`, its owner's whole table.
+    std::map<std::string, std::pair<size_t, size_t>>    slots_by_param;
+    // parameter name -> the optimizer that owns it. A run with one optimizer
+    // records the same value for every parameter; a mixed run is what makes
+    // this a table rather than a field.
+    std::map<std::string, enum ggml_opt_optimizer_type> param_optimizer;
+    // State one optimizer keeps once rather than once per parameter.
+    std::vector<ggml_opt_slot>                          shared_slots;
+    // Which optimizers this run actually builds a step for, in enumeration
+    // order. Filling the hyperparameters of an optimizer nothing uses would
+    // validate values no update ever reads.
+    bool optimizer_used[GGML_OPT_OPTIMIZER_TYPE_COUNT] = {};
     // CE nodes are stamped once per ubatch. Cache their addresses across
     // repeated calls and rebuild the cache only when ggml_opt_build replaces
     // a dynamic graph.
@@ -109,10 +186,199 @@ struct ggml_opt_context {
 
     ggml_opt_get_optimizer_params get_opt_pars    = nullptr;
     void *                        get_opt_pars_ud = nullptr;
-    struct ggml_tensor *          opt_step_params = nullptr; // Stores output of get_opt_pars.
+    // retro delta: one hyperparameter tensor per optimizer, because a mixed
+    // run reads two update kernels' worth of coefficients in one step, and
+    // the shared gradient-clipping scale beside them: the norm is one norm
+    // over every trainable gradient whatever owns each parameter.
+    struct ggml_tensor * opt_step_params[GGML_OPT_OPTIMIZER_TYPE_COUNT] = {};
+    struct ggml_tensor * opt_max_grad_norm = nullptr;
 
     enum ggml_opt_optimizer_type optimizer = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
+    ggml_opt_get_param_optimizer get_param_optimizer    = nullptr;
+    void *                       get_param_optimizer_ud = nullptr;
 };
+
+// The optimizer that owns one parameter: the run's, unless the caller answers
+// otherwise. Asked before anything is allocated, because a parameter's slot
+// table is its owner's and not the run's.
+static enum ggml_opt_optimizer_type ggml_opt_owner_of(
+        ggml_opt_context_t opt_ctx, const struct ggml_tensor * param) {
+    if (!opt_ctx->get_param_optimizer) {
+        return opt_ctx->optimizer;
+    }
+    const enum ggml_opt_optimizer_type owner =
+            opt_ctx->get_param_optimizer(param, opt_ctx->get_param_optimizer_ud);
+    GGML_ASSERT(owner >= 0 && owner < GGML_OPT_OPTIMIZER_TYPE_COUNT &&
+            "parameter assignment named an optimizer this build does not have");
+    return owner;
+}
+
+// One slot of one owner, allocated in the static context from its definition.
+static ggml_opt_slot ggml_opt_slot_alloc(
+        struct ggml_context            * ctx,
+        const struct ggml_opt_slot_def & def,
+        const struct ggml_tensor       * param,
+        const char                     * owner,
+        const char                     * optimizer_name) {
+    struct ggml_tensor * tensor = nullptr;
+    switch (def.shape) {
+        case GGML_OPT_SLOT_SHAPE_PARAMETER:
+            GGML_ASSERT(param);
+            tensor = ggml_new_tensor(ctx, def.type, GGML_MAX_DIMS, param->ne);
+            break;
+        case GGML_OPT_SLOT_SHAPE_BLOCKS:
+            GGML_ASSERT(param);
+            tensor = ggml_new_tensor_1d(
+                    ctx, def.type, ggml_opt_slot_n_elements(&def, ggml_nelements(param)));
+            break;
+        case GGML_OPT_SLOT_SHAPE_FIXED:
+            GGML_ASSERT(def.n_block > 0);
+            tensor = ggml_new_tensor_1d(ctx, def.type, ggml_opt_slot_n_elements(&def, 0));
+            break;
+        default:
+            GGML_ABORT("unknown optimizer slot shape");
+    }
+    ggml_format_name(tensor, "%s %s for %s", optimizer_name, def.name, owner);
+
+    ggml_opt_slot slot;
+    slot.owner  = owner;
+    slot.name   = def.name;
+    slot.tensor = tensor;
+    slot.init   = def.init;
+    slot.code   = def.code;
+    return slot;
+}
+
+int64_t ggml_opt_slot_n_elements(const struct ggml_opt_slot_def * def, int64_t n_param_elements) {
+    if (!def) {
+        return 0;
+    }
+    switch (def->shape) {
+        case GGML_OPT_SLOT_SHAPE_PARAMETER:
+            return n_param_elements;
+        case GGML_OPT_SLOT_SHAPE_BLOCKS: {
+            const int64_t block = def->n_block > 0 ? def->n_block : 1;
+            // A partial trailing block still costs an element.
+            // retro delta: avoid overflowing the rounded-up numerator.
+            return n_param_elements / block + (n_param_elements % block != 0);
+        }
+        case GGML_OPT_SLOT_SHAPE_FIXED:
+            return def->n_block;
+        default:
+            GGML_ABORT("unknown optimizer slot shape");
+    }
+}
+
+bool ggml_opt_slot_initial_bytes(
+        const struct ggml_opt_slot_def * def, int64_t n_elements, void * out, size_t n_bytes) {
+    if (!def || !out || n_elements < 0) {
+        return false;
+    }
+    const size_t element = ggml_type_size(def->type);
+    // retro delta: validate before multiplying; wrapped sizes must not admit
+    // a small buffer for a large codebook.
+    if ((uint64_t) n_elements > SIZE_MAX / element ||
+            n_bytes != element * (size_t) n_elements) {
+        return false;
+    }
+    switch (def->init) {
+        case GGML_OPT_SLOT_INIT_ZERO:
+            std::memset(out, 0, n_bytes);
+            return true;
+        case GGML_OPT_SLOT_INIT_CODE:
+            // A byte pattern, not a value: the slot's dtype decides what the
+            // code means and the initializer only has to be canonical.
+            std::memset(out, def->code, n_bytes);
+            return true;
+        case GGML_OPT_SLOT_INIT_UNIFORM_CODEBOOK: {
+            if (def->type != GGML_TYPE_F32) {
+                return false;
+            }
+            // retro delta: callers provide bytes, with no float alignment guarantee.
+            uint8_t * values = (uint8_t *) out;
+            const float denominator = n_elements > 1 ? (float) (n_elements - 1) : 1.0f;
+            for (int64_t k = 0; k < n_elements; ++k) {
+                const float value = -1.0f + 2.0f*((float) k)/denominator;
+                std::memcpy(values + (size_t) k * sizeof(float), &value, sizeof(value));
+            }
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+// retro delta: the initializer. A slot allocated from a definition is filled
+// according to that definition before the first update, whatever its shape and
+// whatever its dtype -- zeroing a byte-index slot would be a code the codebook
+// does not reserve, and a codebook is generated rather than filled.
+//
+// The bytes come from ggml_opt_slot_initial_bytes so that what a live slot
+// holds and what the declaration says it holds cannot drift apart: there is one
+// function and this is its only other caller.
+static void ggml_opt_fill_slot(const ggml_opt_slot & slot) {
+    struct ggml_tensor * tensor = slot.tensor;
+    if (!tensor) {
+        return;
+    }
+    const size_t nbytes = ggml_nbytes(tensor);
+    if (slot.init == GGML_OPT_SLOT_INIT_ZERO) {
+        // The common case, and the one a backend can do without a host buffer.
+        ggml_set_zero(tensor);
+        return;
+    }
+    const struct ggml_opt_slot_def def = {
+        slot.name.c_str(), tensor->type, GGML_OPT_SLOT_SHAPE_PARAMETER, 0, slot.init, slot.code,
+    };
+    std::vector<uint8_t> bytes(nbytes);
+    GGML_ASSERT(ggml_opt_slot_initial_bytes(&def, ggml_nelements(tensor), bytes.data(), nbytes) &&
+            "a slot declares an initializer its dtype cannot hold");
+    ggml_backend_tensor_set(tensor, bytes.data(), 0, nbytes);
+}
+
+static void ggml_opt_fill_slots(ggml_opt_context_t opt_ctx) {
+    for (const ggml_opt_slot & slot : opt_ctx->slots) {
+        ggml_opt_fill_slot(slot);
+    }
+    for (const ggml_opt_slot & slot : opt_ctx->shared_slots) {
+        ggml_opt_fill_slot(slot);
+    }
+}
+
+// retro delta: one optimizer's update, as a graph.
+//
+// The one place an optimizer's arithmetic is written. Its inputs are the
+// parameter, its gradient, the slots its own table declared for it and the
+// arguments its own kernel reads; the caller roots the result in the
+// executable graph, so a state update this function builds but does not return
+// would be constructed and never run.
+static struct ggml_tensor * ggml_opt_build_step(
+        ggml_opt_context_t             opt_ctx,
+        enum ggml_opt_optimizer_type   optimizer,
+        struct ggml_tensor           * param,
+        struct ggml_tensor           * grad,
+        const ggml_opt_slot          * slots,
+        size_t                         n_slots,
+        struct ggml_tensor           * step_args,
+        struct ggml_tensor           * grad_scale) {
+    struct ggml_context * ctx = opt_ctx->ctx_compute;
+    switch (optimizer) {
+        case GGML_OPT_OPTIMIZER_TYPE_ADAMW: {
+            GGML_ASSERT(n_slots == 2 && "adamw declares two slots per parameter");
+            struct ggml_tensor * m = slots[0].tensor;
+            struct ggml_tensor * v = slots[1].tensor;
+            GGML_ASSERT(ggml_are_same_shape(m, param) && ggml_are_same_shape(v, param) &&
+                    "optimizer parameter changed shape between graph builds");
+            return ggml_opt_step_adamw(ctx, param, grad, m, v, step_args);
+        }
+        case GGML_OPT_OPTIMIZER_TYPE_SGD:
+            GGML_ASSERT(n_slots == 0 && "sgd keeps no per-parameter state");
+            GGML_UNUSED(slots);
+            return ggml_opt_step_sgd(ctx, param, ggml_mul(ctx, grad, grad_scale), step_args);
+        default:
+            GGML_ABORT("unknown optimizer");
+    }
+}
 
 // retro delta: defined below, next to the rest of the checkpoint accounting;
 // declared here because ggml_opt_build (above it) stamps the profile.
@@ -391,6 +657,8 @@ struct ggml_opt_params ggml_opt_default_params(
         /*get_opt_pars    =*/ ggml_opt_get_default_optimizer_params,
         /*get_opt_pars_ud =*/ nullptr,
         /*optimizer       =*/ GGML_OPT_OPTIMIZER_TYPE_ADAMW,
+        /*get_param_optimizer    =*/ nullptr,
+        /*get_param_optimizer_ud =*/ nullptr,
     };
 }
 
@@ -470,22 +738,30 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     GGML_ASSERT((!opt_ctx->static_graphs || opt_ctx->inputs->data) && "when using static graphs the inputs must be allocated statically");
     ++opt_ctx->graph_generation;
 
-    const enum ggml_opt_optimizer_type optimizer = opt_ctx->optimizer;
-
     const bool accumulate = opt_ctx->build_type_alloc >= GGML_OPT_BUILD_TYPE_GRAD &&
         !(opt_ctx->static_graphs && opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT && opt_ctx->opt_period == 1);
 
-    const bool need_momenta = opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT &&
-        opt_ctx->optimizer == GGML_OPT_OPTIMIZER_TYPE_ADAMW;
+    // retro delta: persistent state is allocated from the descriptor, so the
+    // question is no longer "is this AdamW" but "is this the optimizer build".
+    const bool need_slots = opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT;
 
     ggml_set_input(opt_ctx->inputs);
     ggml_set_output(opt_ctx->outputs);
 
     int n_param = 0;
+    // Counted from the tables of the optimizers that actually own parameters,
+    // not from one optimizer's shape: a mixed run allocates a different number
+    // of slots per parameter.
+    int n_slot_tensors = 0;
     for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
         const struct ggml_tensor * node = opt_ctx->gf->nodes[i];
         if (node->flags & GGML_TENSOR_FLAG_PARAM) {
             n_param++;
+            if (need_slots) {
+                int64_t n_defs = 0;
+                ggml_opt_optimizer_slots(ggml_opt_owner_of(opt_ctx, node), &n_defs);
+                n_slot_tensors += (int) n_defs;
+            }
         }
         GGML_ASSERT(!(node->flags & GGML_TENSOR_FLAG_LOSS) && "support for extra loss terms not implemented");
     }
@@ -493,15 +769,19 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     if (!opt_ctx->ctx_static) {
         // The static context is used for:
         //   - gradients (1 per loss, 1 tensor per param if using gradient accumulation)
-        //   - optimizer momenta (2 tensors per param)
+        //   - the persistent slots every owning optimizer declares
+        //   - the shared slots every owning optimizer declares
         //   - labels (if using static graphs)
         //   - loss (if using static graphs, up to 5 tensors)
         //   - pred (if using static graphs)
         //   - ncorrect (if using static graphs, 2 tensors).
         constexpr size_t n_loss = 1;
-        const size_t tensors_per_param = (accumulate ? 1 : 0) + (need_momenta ? 2 : 0);
+        const size_t tensors_per_param = accumulate ? 1 : 0;
+        const size_t tensors_shared = need_slots
+                ? GGML_OPT_OPTIMIZER_TYPE_COUNT*GGML_OPT_MAX_SHARED_SLOTS : 0;
         const size_t tensors_const = opt_ctx->static_graphs ? 9 : 0;
-        const size_t size_meta = (n_loss + tensors_per_param*n_param + tensors_const) * ggml_tensor_overhead();
+        const size_t size_meta = (n_loss + tensors_per_param*n_param + (size_t) n_slot_tensors
+                + tensors_shared + tensors_const) * ggml_tensor_overhead();
         struct ggml_init_params params = {
             /*.mem_size   =*/ size_meta,
             /*.mem_buffer =*/ nullptr,
@@ -621,21 +901,43 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             }
         }
 
-        if (need_momenta && opt_ctx->build_type_alloc >= GGML_OPT_BUILD_TYPE_OPT) {
-            opt_ctx->grad_m.resize(n_nodes);
-            opt_ctx->grad_v.resize(n_nodes);
+        // retro delta: allocate every owner's declared slots, in parameter
+        // order and within a parameter in declaration order. Nothing here
+        // knows what AdamW keeps: the tables do.
+        if (need_slots) {
+            std::vector<enum ggml_opt_optimizer_type> owners;
             for (int i = 0; i < n_nodes; ++i) {
                 ggml_tensor * node = opt_ctx->gf->nodes[i];
-                if (node->flags & GGML_TENSOR_FLAG_PARAM) {
-                    opt_ctx->grad_m[i] = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
-                    opt_ctx->grad_v[i] = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
-                    opt_ctx->momenta_index[node->name] = opt_ctx->momenta_m.size();
-                    opt_ctx->momenta_names.push_back(node->name);
-                    opt_ctx->momenta_m.push_back(opt_ctx->grad_m[i]);
-                    opt_ctx->momenta_v.push_back(opt_ctx->grad_v[i]);
-                } else {
-                    opt_ctx->grad_m[i] = nullptr;
-                    opt_ctx->grad_v[i] = nullptr;
+                if (!(node->flags & GGML_TENSOR_FLAG_PARAM)) {
+                    continue;
+                }
+                const enum ggml_opt_optimizer_type owner = ggml_opt_owner_of(opt_ctx, node);
+                opt_ctx->param_optimizer[node->name] = owner;
+                if (std::find(owners.begin(), owners.end(), owner) == owners.end()) {
+                    owners.push_back(owner);
+                }
+                int64_t n_defs = 0;
+                const struct ggml_opt_slot_def * defs = ggml_opt_optimizer_slots(owner, &n_defs);
+                const size_t begin = opt_ctx->slots.size();
+                for (int64_t slot = 0; slot < n_defs; ++slot) {
+                    opt_ctx->slots.push_back(ggml_opt_slot_alloc(
+                            opt_ctx->ctx_static, defs[slot], node, node->name,
+                            ggml_opt_optimizer_name(owner)));
+                }
+                opt_ctx->slots_by_param[node->name] = { begin, opt_ctx->slots.size() };
+            }
+            // One shared row per owner that owns something, in first-seen
+            // order. An owner with an empty shared table contributes none,
+            // which is every optimizer this build can run.
+            for (const enum ggml_opt_optimizer_type owner : owners) {
+                int64_t n_defs = 0;
+                const struct ggml_opt_slot_def * defs = ggml_opt_optimizer_shared_slots(owner, &n_defs);
+                GGML_ASSERT(n_defs <= GGML_OPT_MAX_SHARED_SLOTS &&
+                        "an optimizer declares more shared slots than the static context was sized for");
+                for (int64_t slot = 0; slot < n_defs; ++slot) {
+                    opt_ctx->shared_slots.push_back(ggml_opt_slot_alloc(
+                            opt_ctx->ctx_static, defs[slot], nullptr,
+                            ggml_opt_optimizer_name(owner), ggml_opt_optimizer_name(owner)));
                 }
             }
         }
@@ -702,30 +1004,34 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     opt_ctx->gb_opt = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gb_grad, /*force_grads =*/ true);
 
     if (!opt_ctx->ctx_cpu) {
-        const size_t size_meta = ggml_tensor_overhead();
+        // retro delta: one hyperparameter tensor per optimizer, plus the
+        // clipping ceiling they share. Every optimizer gets one whether or not
+        // this run uses it: the tensors are a handful of floats, and a run that
+        // allocated only the optimizers of its first build could not be
+        // rebuilt with another one without reallocating the CPU context.
+        const size_t size_meta = (GGML_OPT_OPTIMIZER_TYPE_COUNT + 1) * ggml_tensor_overhead();
         struct ggml_init_params params = {
             /*.mem_size   =*/ size_meta,
             /*.mem_buffer =*/ nullptr,
             /*.no_alloc   =*/ true,
         };
         opt_ctx->ctx_cpu = ggml_init(params);
-        // AdamW carries seven hyperparameters plus the stochastic-rounding seed.
-        const int64_t optimizer_param_count = need_momenta ? 8 : 2;
-        opt_ctx->opt_step_params = ggml_new_tensor_1d(
-                opt_ctx->ctx_cpu, GGML_TYPE_F32, optimizer_param_count + 1);
-        ggml_set_input(opt_ctx->opt_step_params);
-        const char * optimizer_name = ggml_opt_optimizer_name(opt_ctx->optimizer);
-        ggml_format_name(opt_ctx->opt_step_params, "%s_params", optimizer_name);
+        for (int type = 0; type < GGML_OPT_OPTIMIZER_TYPE_COUNT; ++type) {
+            const enum ggml_opt_optimizer_type optimizer_type = (enum ggml_opt_optimizer_type) type;
+            struct ggml_tensor * step_params = ggml_new_tensor_1d(
+                    opt_ctx->ctx_cpu, GGML_TYPE_F32, ggml_opt_optimizer_n_params(optimizer_type));
+            ggml_set_input(step_params);
+            ggml_format_name(step_params, "%s_params", ggml_opt_optimizer_name(optimizer_type));
+            opt_ctx->opt_step_params[type] = step_params;
+        }
+        // The gradient norm is one norm over every trainable gradient, so the
+        // ceiling it is compared against is one value whatever owns what.
+        opt_ctx->opt_max_grad_norm = ggml_new_tensor_1d(opt_ctx->ctx_cpu, GGML_TYPE_F32, 1);
+        ggml_set_input(opt_ctx->opt_max_grad_norm);
+        ggml_set_name(opt_ctx->opt_max_grad_norm, "max_grad_norm");
         opt_ctx->buf_cpu = ggml_backend_alloc_ctx_tensors_from_buft(opt_ctx->ctx_cpu, ggml_backend_cpu_buffer_type());
     }
-    const int64_t optimizer_param_count = need_momenta ? 8 : 2;
-    ggml_tensor * optimizer_params = ggml_view_1d(
-            opt_ctx->ctx_compute, opt_ctx->opt_step_params, optimizer_param_count, 0);
-    ggml_tensor * max_grad_norm = ggml_view_1d(
-            opt_ctx->ctx_compute,
-            opt_ctx->opt_step_params,
-            1,
-            optimizer_param_count * sizeof(float));
+    ggml_tensor * max_grad_norm = opt_ctx->opt_max_grad_norm;
 
     // Compute one norm over every trainable parameter gradient, then use the
     // same scale for all tensors so clipping preserves the gradient direction.
@@ -752,66 +1058,53 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             ggml_div(opt_ctx->ctx_compute, max_grad_norm, global_grad_norm),
             0.0f,
             1.0f);
-    // retro delta: AdamW folds the clipping scale into its own kernel, so the
-    // scale travels with the hyperparameters instead of being multiplied into a
-    // full-size copy of every gradient. The concat runs once per graph; the
-    // nine-element result -- seven hyperparameters, the rounding seed, then the
-    // clipping scale -- is shared by every parameter.
-    ggml_tensor * adamw_params = optimizer == GGML_OPT_OPTIMIZER_TYPE_ADAMW
-        ? ggml_concat(opt_ctx->ctx_compute, optimizer_params, grad_scale, 0)
-        : nullptr;
+    // retro delta: the per-optimizer argument each update step reads. AdamW
+    // folds the clipping scale into its own kernel, so the scale travels with
+    // the hyperparameters instead of being multiplied into a full-size copy of
+    // every gradient; the concat runs once per optimizer per graph and its
+    // result is shared by every parameter that optimizer owns.
+    struct ggml_tensor * step_args[GGML_OPT_OPTIMIZER_TYPE_COUNT] = {};
+    for (int type = 0; type < GGML_OPT_OPTIMIZER_TYPE_COUNT; ++type) {
+        struct ggml_tensor * declared = opt_ctx->opt_step_params[type];
+        switch ((enum ggml_opt_optimizer_type) type) {
+            case GGML_OPT_OPTIMIZER_TYPE_ADAMW:
+                step_args[type] = ggml_concat(opt_ctx->ctx_compute, declared, grad_scale, 0);
+                break;
+            case GGML_OPT_OPTIMIZER_TYPE_SGD:
+                // SGD keeps the explicit multiply: its kernel is untouched by
+                // the F16 work and takes a scaled gradient instead.
+                step_args[type] = declared;
+                break;
+            default:
+                GGML_ABORT("unknown optimizer");
+        }
+    }
 
-    const char * optimizer_name = ggml_opt_optimizer_name(opt_ctx->optimizer);
     for (int i = opt_ctx->gf->n_nodes-1; i >= 0; --i) {
         struct ggml_tensor * node = opt_ctx->gb_opt->nodes[i];
         struct ggml_tensor * grad = ggml_graph_get_grad(opt_ctx->gb_opt, node);
 
         if (grad && (node->flags & GGML_TENSOR_FLAG_PARAM)) {
-            struct ggml_tensor * m = nullptr;
-            struct ggml_tensor * v = nullptr;
-            if (need_momenta) {
-                // retro delta: pair a parameter with its momenta by name.
-                //
-                // The momenta are allocated once, on the first build, and
-                // indexed there by forward-graph node position; a dynamic graph
-                // is rebuilt on every ggml_opt_alloc, so that position is only
-                // incidentally stable. Checkpointing hands these same tensors
-                // to the caller keyed by parameter name
-                // (ggml_opt_momenta_name), and a restore writes them back by
-                // name, so the two lookups must agree by construction rather
-                // than by coincidence: a disagreement would silently train with
-                // another parameter's momenta.
-                //
-                // The pairing has not been observed to diverge in practice; the
-                // point is that nothing enforced it. The assert below also
-                // turns "a parameter appeared after the momenta were allocated"
-                // — previously a null or mismatched grad_m[i] — into a failure.
-                const auto slot = opt_ctx->momenta_index.find(node->name);
-                GGML_ASSERT(slot != opt_ctx->momenta_index.end() &&
-                        "optimizer parameter has no momenta; it appeared after they were allocated");
-                m = opt_ctx->momenta_m[slot->second];
-                v = opt_ctx->momenta_v[slot->second];
-                GGML_ASSERT(ggml_are_same_shape(m, node) &&
-                        "optimizer parameter changed shape between graph builds");
-                ggml_format_name(m, "AdamW m for %s", node->name);
-                ggml_format_name(v, "AdamW v for %s", node->name);
-            }
-            struct ggml_tensor * opt_step;
-            switch (optimizer) {
-                case GGML_OPT_OPTIMIZER_TYPE_ADAMW:
-                    opt_step = ggml_opt_step_adamw(
-                            opt_ctx->ctx_compute, node, grad, m, v, adamw_params);
-                    break;
-                case GGML_OPT_OPTIMIZER_TYPE_SGD:
-                    // SGD keeps the explicit multiply: its kernel is untouched
-                    // by the F16 work and retrograd only trains with AdamW.
-                    opt_step = ggml_opt_step_sgd(opt_ctx->ctx_compute, node,
-                            ggml_mul(opt_ctx->ctx_compute, grad, grad_scale), optimizer_params);
-                    break;
-                default:
-                    GGML_ABORT("fatal error");
-            }
-            ggml_format_name(opt_step, "%s step for %s", optimizer_name, node->name);
+            // The owner and its slots, both keyed by the parameter's name. The
+            // assert turns "a parameter appeared after the state was
+            // allocated" into a failure rather than a step against another
+            // parameter's slots.
+            const auto owner_row = opt_ctx->param_optimizer.find(node->name);
+            GGML_ASSERT(owner_row != opt_ctx->param_optimizer.end() &&
+                    "optimizer parameter has no slot table; it appeared after the state was allocated");
+            const enum ggml_opt_optimizer_type owner = owner_row->second;
+            const auto range = opt_ctx->slots_by_param.at(node->name);
+            const size_t n_slots = range.second - range.first;
+            // retro delta: an all-SGD run has no backing slot array.
+            const ggml_opt_slot * slots = n_slots ? opt_ctx->slots.data() + range.first : nullptr;
+            opt_ctx->optimizer_used[owner] = true;
+
+            struct ggml_tensor * opt_step = ggml_opt_build_step(
+                    opt_ctx, owner, node, grad, slots, n_slots, step_args[owner], grad_scale);
+            ggml_format_name(opt_step, "%s step for %s", ggml_opt_optimizer_name(owner), node->name);
+            // Every write the step performs is rooted here: a state update that
+            // is constructed but not reachable from the graph's outputs is
+            // constructed, not executed.
             ggml_build_forward_expand(opt_ctx->gb_opt, opt_step);
         }
     }
@@ -820,6 +1113,11 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         opt_ctx->buf_static = ggml_backend_alloc_ctx_tensors(
             opt_ctx->ctx_static, ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0));
         ggml_graph_reset(opt_ctx->gb_opt);
+        // The declared initializer, after the buffers exist and before the
+        // first step. Separate from ggml_graph_reset, which knows one
+        // optimizer's node shape and cannot reach a slot that is neither of
+        // AdamW's two.
+        ggml_opt_fill_slots(opt_ctx);
     }
 }
 
@@ -836,6 +1134,8 @@ ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
     result->get_opt_pars     = params.get_opt_pars;
     result->get_opt_pars_ud  = params.get_opt_pars_ud;
     result->optimizer        = params.optimizer;
+    result->get_param_optimizer    = params.get_param_optimizer;
+    result->get_param_optimizer_ud = params.get_param_optimizer_ud;
 
     GGML_ASSERT(result->opt_period >= 1);
 
@@ -883,6 +1183,11 @@ void ggml_opt_free(ggml_opt_context_t opt_ctx) {
 void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer) {
     if (optimizer) {
         ggml_graph_reset(opt_ctx->gb_opt);
+        // retro delta: back to what the declaration says an empty slot holds.
+        // ggml_graph_reset zeroes the two operands of an AdamW step node and
+        // reaches no other slot, so the initializer is what makes "reset" mean
+        // the same thing for every optimizer.
+        ggml_opt_fill_slots(opt_ctx);
         opt_ctx->iter = 1;
     } else {
         ggml_graph_reset(opt_ctx->gb_grad);
@@ -993,29 +1298,69 @@ void ggml_opt_set_iter(ggml_opt_context_t opt_ctx, int64_t iter) {
     opt_ctx->iter = iter;
 }
 
-int64_t ggml_opt_momenta_count(ggml_opt_context_t opt_ctx) {
-    return (int64_t) opt_ctx->momenta_names.size();
+int64_t ggml_opt_slot_count(ggml_opt_context_t opt_ctx) {
+    return (int64_t) opt_ctx->slots.size();
 }
 
-const char * ggml_opt_momenta_name(ggml_opt_context_t opt_ctx, int64_t index) {
-    if (index < 0 || index >= (int64_t) opt_ctx->momenta_names.size()) {
+const char * ggml_opt_slot_owner(ggml_opt_context_t opt_ctx, int64_t index) {
+    if (index < 0 || index >= (int64_t) opt_ctx->slots.size()) {
         return nullptr;
     }
-    return opt_ctx->momenta_names[index].c_str();
+    return opt_ctx->slots[(size_t) index].owner.c_str();
 }
 
-struct ggml_tensor * ggml_opt_momenta_m(ggml_opt_context_t opt_ctx, int64_t index) {
-    if (index < 0 || index >= (int64_t) opt_ctx->momenta_m.size()) {
+const char * ggml_opt_slot_name(ggml_opt_context_t opt_ctx, int64_t index) {
+    if (index < 0 || index >= (int64_t) opt_ctx->slots.size()) {
         return nullptr;
     }
-    return opt_ctx->momenta_m[index];
+    return opt_ctx->slots[(size_t) index].name.c_str();
 }
 
-struct ggml_tensor * ggml_opt_momenta_v(ggml_opt_context_t opt_ctx, int64_t index) {
-    if (index < 0 || index >= (int64_t) opt_ctx->momenta_v.size()) {
+struct ggml_tensor * ggml_opt_slot_tensor(ggml_opt_context_t opt_ctx, int64_t index) {
+    if (index < 0 || index >= (int64_t) opt_ctx->slots.size()) {
         return nullptr;
     }
-    return opt_ctx->momenta_v[index];
+    return opt_ctx->slots[(size_t) index].tensor;
+}
+
+int64_t ggml_opt_shared_slot_count(ggml_opt_context_t opt_ctx) {
+    return (int64_t) opt_ctx->shared_slots.size();
+}
+
+const char * ggml_opt_shared_slot_owner(ggml_opt_context_t opt_ctx, int64_t index) {
+    if (index < 0 || index >= (int64_t) opt_ctx->shared_slots.size()) {
+        return nullptr;
+    }
+    return opt_ctx->shared_slots[(size_t) index].owner.c_str();
+}
+
+const char * ggml_opt_shared_slot_name(ggml_opt_context_t opt_ctx, int64_t index) {
+    if (index < 0 || index >= (int64_t) opt_ctx->shared_slots.size()) {
+        return nullptr;
+    }
+    return opt_ctx->shared_slots[(size_t) index].name.c_str();
+}
+
+struct ggml_tensor * ggml_opt_shared_slot_tensor(ggml_opt_context_t opt_ctx, int64_t index) {
+    if (index < 0 || index >= (int64_t) opt_ctx->shared_slots.size()) {
+        return nullptr;
+    }
+    return opt_ctx->shared_slots[(size_t) index].tensor;
+}
+
+enum ggml_opt_optimizer_type ggml_opt_param_optimizer(
+        ggml_opt_context_t opt_ctx, const char * name, bool * found) {
+    const auto row = name ? opt_ctx->param_optimizer.find(name) : opt_ctx->param_optimizer.end();
+    if (row == opt_ctx->param_optimizer.end()) {
+        if (found) {
+            *found = false;
+        }
+        return opt_ctx->optimizer;
+    }
+    if (found) {
+        *found = true;
+    }
+    return row->second;
 }
 
 size_t ggml_opt_rng_state(ggml_opt_context_t opt_ctx, char * buffer, size_t n_buffer) {
@@ -1413,48 +1758,56 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     if (opt_ctx->allocated_graph == opt_ctx->gb_opt) {
         const ggml_opt_optimizer_params & opt_pars = opt_ctx->get_opt_pars(opt_ctx->get_opt_pars_ud);
         GGML_ASSERT(opt_pars.max_grad_norm > 0.0f);
+        // One ceiling for one norm, whatever owns each parameter.
+        GGML_ASSERT(opt_ctx->opt_max_grad_norm);
+        ggml_get_data_f32(opt_ctx->opt_max_grad_norm)[0] = opt_pars.max_grad_norm;
 
-        switch (opt_ctx->optimizer) {
-            case GGML_OPT_OPTIMIZER_TYPE_ADAMW: {
-                GGML_ASSERT(opt_pars.adamw.alpha > 0.0f);
-                GGML_ASSERT(opt_pars.adamw.beta1 >= 0.0f);
-                GGML_ASSERT(opt_pars.adamw.beta1 <= 1.0f);
-                GGML_ASSERT(opt_pars.adamw.beta2 >= 0.0f);
-                GGML_ASSERT(opt_pars.adamw.beta2 <= 1.0f);
-                GGML_ASSERT(opt_pars.adamw.eps >= 0.0f);
-                GGML_ASSERT(opt_pars.adamw.wd >= 0.0f);
-                GGML_ASSERT(opt_pars.adamw.wd <= 1.0f);
+        // retro delta: one fill per optimizer this run actually builds a step
+        // for. Validating the coefficients of an optimizer nothing uses would
+        // refuse a value no update ever reads.
+        for (int type = 0; type < GGML_OPT_OPTIMIZER_TYPE_COUNT; ++type) {
+            if (!opt_ctx->optimizer_used[type]) {
+                continue;
+            }
+            float * values = ggml_get_data_f32(opt_ctx->opt_step_params[type]);
+            switch ((enum ggml_opt_optimizer_type) type) {
+                case GGML_OPT_OPTIMIZER_TYPE_ADAMW: {
+                    GGML_ASSERT(opt_pars.adamw.alpha > 0.0f);
+                    GGML_ASSERT(opt_pars.adamw.beta1 >= 0.0f);
+                    GGML_ASSERT(opt_pars.adamw.beta1 <= 1.0f);
+                    GGML_ASSERT(opt_pars.adamw.beta2 >= 0.0f);
+                    GGML_ASSERT(opt_pars.adamw.beta2 <= 1.0f);
+                    GGML_ASSERT(opt_pars.adamw.eps >= 0.0f);
+                    GGML_ASSERT(opt_pars.adamw.wd >= 0.0f);
+                    GGML_ASSERT(opt_pars.adamw.wd <= 1.0f);
 
-                // beta1, beta2 after applying warmup
-                const float beta1h = 1.0f / (1.0f - powf(opt_pars.adamw.beta1, opt_ctx->iter));
-                const float beta2h = 1.0f / (1.0f - powf(opt_pars.adamw.beta2, opt_ctx->iter));
+                    // beta1, beta2 after applying warmup
+                    const float beta1h = 1.0f / (1.0f - powf(opt_pars.adamw.beta1, opt_ctx->iter));
+                    const float beta2h = 1.0f / (1.0f - powf(opt_pars.adamw.beta2, opt_ctx->iter));
 
-                float * adamw_par_data = ggml_get_data_f32(opt_ctx->opt_step_params);
-                adamw_par_data[0] = opt_pars.adamw.alpha;
-                adamw_par_data[1] = opt_pars.adamw.beta1;
-                adamw_par_data[2] = opt_pars.adamw.beta2;
-                adamw_par_data[3] = opt_pars.adamw.eps;
-                adamw_par_data[4] = opt_pars.adamw.wd;
-                adamw_par_data[5] = beta1h;
-                adamw_par_data[6] = beta2h;
-                // retro delta: per-step seed for the stochastic rounding an F16
-                // parameter needs. Exact as a float below 2^24 iterations; past
-                // that the stream repeats a step, which costs nothing but
-                // decorrelation.
-                adamw_par_data[7] = (float) opt_ctx->iter;
-                adamw_par_data[8] = opt_pars.max_grad_norm;
-            } break;
-            case GGML_OPT_OPTIMIZER_TYPE_SGD: {
-                GGML_ASSERT(opt_pars.sgd.alpha > 0.0f);
-                GGML_ASSERT(opt_pars.sgd.wd >= 0.0f);
-                GGML_ASSERT(opt_pars.sgd.wd <= 1.0f);
-                float * sgd = ggml_get_data_f32(opt_ctx->opt_step_params);
-                sgd[0] = opt_pars.sgd.alpha;
-                sgd[1] = opt_pars.sgd.wd;
-                sgd[2] = opt_pars.max_grad_norm;
-            } break;
-            default:
-                GGML_ABORT("fatal error");
+                    values[0] = opt_pars.adamw.alpha;
+                    values[1] = opt_pars.adamw.beta1;
+                    values[2] = opt_pars.adamw.beta2;
+                    values[3] = opt_pars.adamw.eps;
+                    values[4] = opt_pars.adamw.wd;
+                    values[5] = beta1h;
+                    values[6] = beta2h;
+                    // retro delta: per-step seed for the stochastic rounding an
+                    // F16 parameter needs. Exact as a float below 2^24
+                    // iterations; past that the stream repeats a step, which
+                    // costs nothing but decorrelation.
+                    values[7] = (float) opt_ctx->iter;
+                } break;
+                case GGML_OPT_OPTIMIZER_TYPE_SGD: {
+                    GGML_ASSERT(opt_pars.sgd.alpha > 0.0f);
+                    GGML_ASSERT(opt_pars.sgd.wd >= 0.0f);
+                    GGML_ASSERT(opt_pars.sgd.wd <= 1.0f);
+                    values[0] = opt_pars.sgd.alpha;
+                    values[1] = opt_pars.sgd.wd;
+                } break;
+                default:
+                    GGML_ABORT("unknown optimizer");
+            }
         }
     }
 
