@@ -733,13 +733,26 @@ static void ggml_opt_copy_recompute_backend(
     }
 }
 
+// Whether the backward pass sums into persistent accumulators rather than
+// writing the gradients of a single evaluation. True whenever more than one
+// evaluation contributes to a step, and true for every dynamic graph: the
+// gradient tensors of a graph that is rebuilt per evaluation do not survive it,
+// so the sum has to live in ctx_static either way.
+//
+// Read by ggml_opt_alloc as well as by the build, because "these accumulators
+// hold a partial sum" is exactly the condition under which a new accumulation
+// window has to start by clearing them.
+static bool ggml_opt_grads_accumulate(const struct ggml_opt_context * opt_ctx) {
+    return opt_ctx->build_type_alloc >= GGML_OPT_BUILD_TYPE_GRAD &&
+        !(opt_ctx->static_graphs && opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT && opt_ctx->opt_period == 1);
+}
+
 static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     GGML_ASSERT(opt_ctx->ctx_compute && "no compute context set, either use static graphs or set one with ggml_opt_prepare_alloc");
     GGML_ASSERT((!opt_ctx->static_graphs || opt_ctx->inputs->data) && "when using static graphs the inputs must be allocated statically");
     ++opt_ctx->graph_generation;
 
-    const bool accumulate = opt_ctx->build_type_alloc >= GGML_OPT_BUILD_TYPE_GRAD &&
-        !(opt_ctx->static_graphs && opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT && opt_ctx->opt_period == 1);
+    const bool accumulate = ggml_opt_grads_accumulate(opt_ctx);
 
     // retro delta: persistent state is allocated from the descriptor, so the
     // question is no longer "is this AdamW" but "is this the optimizer build".
@@ -1660,7 +1673,24 @@ bool ggml_opt_get_checkpoint_profile(
 
 void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     GGML_ASSERT(!opt_ctx->eval_ready);
-    if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT && opt_ctx->opt_period > 1 && opt_ctx->opt_i == 0) {
+
+    // retro delta: a backward pass at opt_i == 0 opens an accumulation window,
+    // and a window starts empty. Upstream clears the accumulators here through
+    // opt_ctx->gb_grad, which is the graph of the *previous* evaluation - with
+    // dynamic graphs ggml_opt_eval has already dropped it, so the clear ran on
+    // a null graph and every window after the first carried the gradients of
+    // all the windows before it. That is invisible inside one uninterrupted
+    // run (the sum is deterministic) and shows up the moment a run is resumed
+    // from a checkpoint: the accumulators are live state no checkpoint holds,
+    // so a restored trainer starts its next window from zero while the
+    // uninterrupted one starts from the carried sum.
+    //
+    // The window is identified from opt_i alone rather than from the previous
+    // build type, which an intervening evaluation-only pass would have changed
+    // to FORWARD.
+    const bool window_start =
+        backward && opt_ctx->opt_i == 0 && ggml_opt_grads_accumulate(opt_ctx);
+    if (window_start && opt_ctx->gb_grad) {
         ggml_graph_reset(opt_ctx->gb_grad);
     }
     if (backward) {
@@ -1672,6 +1702,13 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
 
     if (!opt_ctx->static_graphs && !opt_ctx->cache_dynamic_graph) {
         ggml_opt_build(opt_ctx);
+        // The graph this window accumulates into only exists now. The
+        // accumulators it names are the persistent ones of ctx_static, so
+        // clearing them through a freshly built gb_grad clears the same
+        // tensors the cleared-above branch would have.
+        if (window_start) {
+            ggml_graph_reset(opt_ctx->gb_grad);
+        }
     }
 
     struct ggml_cgraph * graph = nullptr;
