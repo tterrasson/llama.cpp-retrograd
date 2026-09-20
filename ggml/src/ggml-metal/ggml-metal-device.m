@@ -1756,6 +1756,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 op->src[0]->ne[0] != 576) {
                 return false;
             }
+            if (op->src[1]->ne[0] == 72 && op->src[1]->ne[0] != op->src[2]->ne[0]) {
+                return false;
+            }
+            if (op->src[1]->ne[0] < op->src[2]->ne[0]) {
+                return false;
+            }
             if (op->src[1]->type != op->src[2]->type) {
                 return false;
             }
@@ -1825,8 +1831,6 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 op->src[1]->type == GGML_TYPE_F32 &&
                 op->type         == GGML_TYPE_F32 &&
                 op->src[0]->ne[1] == 4 &&
-                op->src[1]->ne[0] == 4 &&
-                op->src[1]->ne[2] == 1 &&
                 ggml_is_contiguous_rows(op->src[0]) &&
                 ggml_is_contiguous_rows(op->src[1]);
         case GGML_OP_DSV4_HC_POST:
@@ -1834,17 +1838,15 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 op->src[0]->type == GGML_TYPE_F32 &&
                 op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 &&
-                op->src[3] != NULL &&
-                op->src[3]->type == GGML_TYPE_F32 &&
+                (op->src[3] == NULL || op->src[3]->type == GGML_TYPE_F32) &&
                 op->type         == GGML_TYPE_F32 &&
                 op->src[1]->ne[1] == 4 &&
                 op->src[2]->ne[0] == 4 &&
-                op->src[3]->ne[0] == 4 &&
-                op->src[3]->ne[1] == 4 &&
+                (op->src[3] == NULL || (op->src[3]->ne[0] == 4 && op->src[3]->ne[1] == 4)) &&
                 ggml_is_contiguous_rows(op->src[0]) &&
                 ggml_is_contiguous_rows(op->src[1]) &&
                 ggml_is_contiguous_rows(op->src[2]) &&
-                ggml_is_contiguous_rows(op->src[3]);
+                (op->src[3] == NULL || ggml_is_contiguous_rows(op->src[3]));
         case GGML_OP_FLASH_ATTN_BACK:
             // retro delta: kernel_flash_attn_back_{q,kv}_f32_{f16,f32}_d{128,256}.
             // This is what makes the KV cache differentiable (and `kv_dtype =
@@ -1909,8 +1911,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 }
                 return true;
             }
-        case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
+            return has_simdgroup_reduction;
+        case GGML_OP_SSM_CONV:
             return has_simdgroup_reduction;
         // retro delta: dedicated F32 backward kernels. SSM_CONV_BACK writes
         // disjoint packed-output elements; SSM_SCAN_BACK zero-fills its packed
