@@ -148,6 +148,15 @@ struct vk_op_push_constants {
     float param4;
 };
 
+// retro delta: Gefen, shared by both phases. `zero_code` comes from the host so
+// the canonical index has one definition (ggml.h) for every backend.
+struct vk_op_gefen_push_constants {
+    uint32_t np;
+    uint32_t bs;
+    uint32_t levels;
+    uint32_t zero_code;
+};
+
 // retro delta: constant buffer of a RIR variant. The *layout* is generated —
 // one struct per production kernel, each with its own static_assert — and
 // `ggml_rir_fill_params` places the fields, so nothing here restates it. What

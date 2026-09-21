@@ -390,6 +390,14 @@ extern "C" {
 
     GGML_API const char * ggml_opt_optimizer_name(enum ggml_opt_optimizer_type);
 
+    // retro delta: upper bound on the graph nodes one parameter's update
+    // appends, including its share of the clipping norm. Muon's update is
+    // tens of nodes per matrix, not one, so callers must size graphs with
+    // this number rather than assuming one node per parameter.
+    GGML_API int64_t ggml_opt_step_graph_nodes(
+            enum ggml_opt_optimizer_type             optimizer,
+            const struct ggml_opt_optimizer_layout * layout);
+
     // ====== Optimization Result ======
 
     GGML_API ggml_opt_result_t ggml_opt_result_init(void);

@@ -2585,6 +2585,11 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     // activation buffers are still sized from the nodes actually used, so inference cost is
     // unchanged.
     res *= 4u;
+    // retro delta: room for the update the optimizer appends. The factor above
+    // covers the backward only. Zero until llama_opt_init has marked a
+    // parameter, which is also when the reserve is asked for again.
+    res += (uint32_t) (opt_n_params
+            * (size_t) ggml_opt_step_graph_nodes(opt_optimizer_type, &opt_optimizer_layout));
     return res;
 }
 
@@ -3853,22 +3858,46 @@ static ggml_cgraph * llama_opt_build_forward_graph(
     return gf;
 }
 
+// retro delta: graph nodes this run's update appends, summed over the
+// parameters of `gf`. The per-parameter figure comes from ggml-opt.
+static size_t llama_opt_update_size(
+        ggml_cgraph                            * gf,
+        enum ggml_opt_optimizer_type             optimizer,
+        const struct ggml_opt_optimizer_layout * layout) {
+    const int64_t per_param = ggml_opt_step_graph_nodes(optimizer, layout);
+    size_t n_params = 0;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        if (ggml_graph_node(gf, i)->flags & GGML_TENSOR_FLAG_PARAM) {
+            ++n_params;
+        }
+    }
+    // One shared tail for the global clipping norm and the coefficient concats.
+    return n_params*(size_t) per_param + 16;
+}
+
 static size_t llama_opt_metadata_size(
         size_t size_gf,
         bool   fused_sparse_ce,
-        bool   gradient_checkpointing) {
+        bool   gradient_checkpointing,
+        size_t size_update) {
+    // retro delta: the optimizer graph is the backward graph plus the update,
+    // and `size_update` says how many nodes this run's optimizer appends (Muon
+    // appends tens of nodes per matrix, not one).
+    const size_t size_opt = size_gf + size_update;
     if (!gradient_checkpointing) {
-        const size_t n_graphs = fused_sparse_ce ? 3 : 2;
-        return 4*size_gf*ggml_tensor_overhead()
-                + n_graphs*ggml_graph_overhead_custom(size_gf, /*grads =*/ true);
+        const size_t n_graphs = fused_sparse_ce ? 2 : 1;
+        return 4*size_opt*ggml_tensor_overhead()
+                + n_graphs*ggml_graph_overhead_custom(size_gf, /*grads =*/ true)
+                + ggml_graph_overhead_custom(size_gf, /*grads =*/ true)
+                + ggml_graph_overhead_custom(size_opt, /*grads =*/ true);
     }
 
     // In addition to the ordinary backward tensors, checkpointing owns one
     // temporary backward graph and at most one recompute tensor per forward
     // node. The rewritten backward and optimizer graphs need room for both the
     // ordinary nodes and those clones.
-    const size_t rewritten_size = 2*size_gf;
-    size_t result = 6*size_gf*ggml_tensor_overhead();
+    const size_t rewritten_size = 2*size_gf + size_update;
+    size_t result = 6*(size_gf + size_update)*ggml_tensor_overhead();
     if (fused_sparse_ce) {
         result += ggml_graph_overhead_custom(size_gf, /*grads =*/ true);
     }
@@ -3991,6 +4020,8 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     opt_params.get_opt_pars_ud = lopt_params.get_opt_pars_ud;
     opt_params.optimizer       = lopt_params.optimizer_type;
     opt_params.layout          = lopt_params.optimizer_layout;
+    opt_optimizer_type         = lopt_params.optimizer_type;
+    opt_optimizer_layout       = lopt_params.optimizer_layout;
     opt_params.get_param_optimizer    = lopt_params.param_optimizer;
     opt_params.get_param_optimizer_ud = lopt_params.param_optimizer_ud;
     opt_ctx = ggml_opt_init(opt_params);
@@ -4019,6 +4050,20 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
             llama_set_param(reinterpret_cast<struct ggml_tensor **>(&layer)[i], param_filter, param_filter_ud);
         }
     }
+
+    // retro delta: the marked set is known only now, so the scheduler can be
+    // reserved for the largest graph a step builds (forward, backward and the
+    // update; Muon's update is tens of nodes per matrix, not one).
+    opt_n_params = 0;
+    for (const auto & [name, tensor] : model->tensors_by_name) {
+        if (tensor && (tensor->flags & GGML_TENSOR_FLAG_PARAM)) {
+            ++opt_n_params;
+        }
+    }
+    sched_need_reserve = true;
+    // Taken now: the optimizer context captured the scheduler above, and
+    // sched_reserve() rebinds it to the replacement.
+    sched_reserve();
 }
 
 int32_t llama_context::opt_preflight(llama_opt_preflight_cb callback, void * userdata) {
@@ -4127,7 +4172,8 @@ int32_t llama_context::opt_preflight(llama_opt_preflight_cb callback, void * use
         const size_t size_gf = ggml_graph_size(gf);
         {
             const size_t size_meta = llama_opt_metadata_size(
-                    size_gf, opt_fused_ce, opt_gradient_checkpointing);
+                    size_gf, opt_fused_ce, opt_gradient_checkpointing,
+                    llama_opt_update_size(gf, opt_optimizer_type, &opt_optimizer_layout));
             struct ggml_init_params params = {
                 /*.mem_size   =*/ size_meta,
                 /*.mem_buffer =*/ nullptr,
@@ -4182,6 +4228,22 @@ int32_t llama_context::opt_preflight(llama_opt_preflight_cb callback, void * use
             forward_nodes.insert(ggml_graph_node(gf, i));
         }
         ggml_cgraph * gb = ggml_opt_graph(opt_ctx);
+
+        // retro delta: a marked parameter the backward never reaches. The op
+        // scan above asks whether every op has a rule; this asks whether a
+        // gradient actually reaches every marked parameter, and catches a rule
+        // that is implemented but declines its operand.
+        for (int i = 0; i < ggml_graph_n_nodes(gb); ++i) {
+            ggml_tensor * node = ggml_graph_node(gb, i);
+            if (!(node->flags & GGML_TENSOR_FLAG_PARAM)) {
+                continue;
+            }
+            if (ggml_graph_get_grad(gb, node)) {
+                continue;
+            }
+            callback(LLAMA_OPT_PREFLIGHT_UNREACHED_PARAM, nullptr, node, userdata);
+        }
+
         for (ggml_backend_dev_t dev : devs) {
             for (int i = 0; i < ggml_graph_n_nodes(gb); ++i) {
                 const ggml_tensor * node = ggml_graph_node(gb, i);
@@ -4326,7 +4388,8 @@ void llama_context::opt_epoch_iter(
                 const size_t size_gf = ggml_graph_size(gf);
                 const size_t size_meta = llama_opt_metadata_size(
                         size_gf, opt_fused_ce,
-                        /*gradient_checkpointing =*/ false);
+                        /*gradient_checkpointing =*/ false,
+                        llama_opt_update_size(gf, opt_optimizer_type, &opt_optimizer_layout));
                 if (opt_compute_meta.size() < size_meta) {
                     opt_compute_meta.resize(size_meta);
                 }
@@ -4635,7 +4698,8 @@ bool llama_context::opt_step_packed_sequences(
             const auto allocation_started = std::chrono::steady_clock::now();
             const size_t size_gf = ggml_graph_size(gf);
             const size_t size_meta = llama_opt_metadata_size(
-                    size_gf, opt_fused_ce, opt_gradient_checkpointing);
+                    size_gf, opt_fused_ce, opt_gradient_checkpointing,
+                    llama_opt_update_size(gf, opt_optimizer_type, &opt_optimizer_layout));
             struct ggml_init_params params = {
                 /*.mem_size   =*/ size_meta,
                 /*.mem_buffer =*/ nullptr,

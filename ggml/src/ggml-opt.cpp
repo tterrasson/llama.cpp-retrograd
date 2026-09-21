@@ -109,6 +109,30 @@ static int32_t ggml_opt_muon_ns_steps(const struct ggml_opt_optimizer_layout * l
     return declared > 0 ? declared : GGML_OPT_MUON_NS_STEPS;
 }
 
+int64_t ggml_opt_step_graph_nodes(
+        enum ggml_opt_optimizer_type             optimizer,
+        const struct ggml_opt_optimizer_layout * layout) {
+    // Per-parameter clipping norm, built for every trainable parameter.
+    const int64_t clip = 4;
+    switch (optimizer) {
+        case GGML_OPT_OPTIMIZER_TYPE_ADAMW:
+            // One kernel, plus the concat carrying the clipping scale.
+            return clip + 4;
+        case GGML_OPT_OPTIMIZER_TYPE_SGD:
+            // One kernel and the multiply by the clipping scale.
+            return clip + 4;
+        case GGML_OPT_OPTIMIZER_TYPE_GEFEN:
+            // Two phases, plus their views of the coefficient vector.
+            return clip + 8;
+        case GGML_OPT_OPTIMIZER_TYPE_MUON:
+            // Rounded up rather than counted exactly per branch: an undercount
+            // aborts the graph build.
+            return clip + 48 + 12*(int64_t) ggml_opt_muon_ns_steps(layout);
+        default:
+            return clip + 8;
+    }
+}
+
 const struct ggml_opt_slot_def * ggml_opt_optimizer_slots(
         enum ggml_opt_optimizer_type             optimizer,
         const struct ggml_opt_optimizer_layout * layout,
@@ -1265,7 +1289,26 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     GGML_ASSERT(opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT);
 
     // gb_opt == graph backward optimize, forward pass, then backward pass to calculate gradients, then optimizer step.
-    opt_ctx->gb_opt = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gb_grad, /*force_grads =*/ true);
+    // retro delta: sized for the update: budget is summed per parameter owner,
+    // not copied from the backward graph's size.
+    {
+        int64_t update_nodes = 0;
+        for (int i = opt_ctx->gf->n_nodes - 1; i >= 0; --i) {
+            struct ggml_tensor * node = opt_ctx->gb_grad->nodes[i];
+            if (!(node->flags & GGML_TENSOR_FLAG_PARAM)) {
+                continue;
+            }
+            const auto owner = opt_ctx->param_optimizer.find(node->name);
+            update_nodes += ggml_opt_step_graph_nodes(
+                    owner != opt_ctx->param_optimizer.end() ? owner->second : opt_ctx->optimizer,
+                    &opt_ctx->layout);
+        }
+        // Shared tail: global norm reduction plus one coefficient concat per optimizer type.
+        update_nodes += 8 + 2*GGML_OPT_OPTIMIZER_TYPE_COUNT;
+        opt_ctx->gb_opt = ggml_new_graph_custom(opt_ctx->ctx_compute,
+                opt_ctx->gb_grad->size + (size_t) update_nodes, /*grads =*/ true);
+        ggml_graph_cpy(opt_ctx->gb_grad, opt_ctx->gb_opt);
+    }
 
     if (!opt_ctx->ctx_cpu) {
         // retro delta: one hyperparameter tensor per optimizer, plus the

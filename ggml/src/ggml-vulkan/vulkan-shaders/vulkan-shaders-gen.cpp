@@ -1226,6 +1226,12 @@ void process_shaders() {
     string_to_spv("opt_step_adamw_f16", "opt_step_adamw.comp", merge_maps(base_dict, {{"X_TYPE", "float16_t"}, {"STOCHASTIC_ROUNDING", "1"}}));
     string_to_spv("opt_step_sgd_f32", "opt_step_sgd.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
 
+    // retro delta: Gefen, one variant per stored layout.
+    string_to_spv("opt_step_gefen_stats_shared_v",    "opt_step_gefen_stats.comp", base_dict);
+    string_to_spv("opt_step_gefen_stats_quantized_m", "opt_step_gefen_stats.comp", merge_maps(base_dict, {{"QUANTIZED", "1"}}));
+    string_to_spv("opt_step_gefen_shared_v",          "opt_step_gefen.comp",       base_dict);
+    string_to_spv("opt_step_gefen_quantized_m",       "opt_step_gefen.comp",       merge_maps(base_dict, {{"QUANTIZED", "1"}}));
+
     string_to_spv("solve_tri_f32", "solve_tri.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
 
     for (auto transpose : {false, true}) {

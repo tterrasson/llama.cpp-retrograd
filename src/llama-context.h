@@ -459,6 +459,13 @@ private:
     uint32_t opt_checkpoint_every_n_layers = 1;
     // retro delta: GGML_TYPE_COUNT keeps checkpoints as built (bit-exact default).
     enum ggml_type opt_checkpoint_type = GGML_TYPE_COUNT;
+    // retro delta: the structural half of the optimizer descriptor, kept
+    // because sizing the metadata context depends on it (Muon's iteration
+    // count in particular).
+    struct ggml_opt_optimizer_layout opt_optimizer_layout = ggml_opt_default_optimizer_layout();
+    enum ggml_opt_optimizer_type opt_optimizer_type = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
+    // Parameters marked by llama_opt_init; zero before it runs.
+    size_t opt_n_params = 0;
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;

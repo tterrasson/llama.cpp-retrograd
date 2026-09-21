@@ -1860,6 +1860,11 @@ extern "C" {
         LLAMA_OPT_PREFLIGHT_MISSING_GRAD    = 0, // op has no gradient rule in ggml (dev is NULL)
         LLAMA_OPT_PREFLIGHT_DEVICE_FORWARD  = 1, // device cannot run this forward op
         LLAMA_OPT_PREFLIGHT_DEVICE_BACKWARD = 2, // device cannot run this backward/optimizer op
+        // retro delta: the parameter is marked and the built backward graph
+        // carries no gradient for it (dev is NULL). Unlike MISSING_GRAD, which
+        // is an op with no rule at all, this asks about the result: a rule can
+        // exist but decline one operand, and only this reason catches that.
+        LLAMA_OPT_PREFLIGHT_UNREACHED_PARAM = 3
     };
 
     typedef void (*llama_opt_preflight_cb)(
