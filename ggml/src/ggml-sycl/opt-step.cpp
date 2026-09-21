@@ -111,7 +111,9 @@ void ggml_sycl_opt_step_sgd(ggml_backend_sycl_context & ctx, ggml_tensor * dst) 
     GGML_ASSERT(ggml_is_contiguous(src0_grad));
     GGML_ASSERT(ggml_is_contiguous(sgd_params));
     GGML_ASSERT(ggml_are_same_shape(src0, src0_grad));
-    GGML_ASSERT(ggml_nelements(sgd_params) == 2);
+    // retro delta: alpha, wd and the rounding seed; this backend writes F32
+    // only, so the seed is unused here.
+    GGML_ASSERT(ggml_nelements(sgd_params) == 3);
 
     dpct::queue_ptr stream = ctx.stream();
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));

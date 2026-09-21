@@ -2079,9 +2079,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_DIAG:
             return true;
         case GGML_OP_OPT_STEP_ADAMW:
+            // retro delta: F16 and BF16 parameters join F32; moments stay F32.
             return has_simdgroup_reduction
                     && (op->src[0]->type == GGML_TYPE_F32
-                            || op->src[0]->type == GGML_TYPE_F16)
+                            || op->src[0]->type == GGML_TYPE_F16
+                            || op->src[0]->type == GGML_TYPE_BF16)
                     && op->src[1]->type == GGML_TYPE_F32
                     && op->src[2]->type == GGML_TYPE_F32
                     && op->src[3]->type == GGML_TYPE_F32
@@ -2091,7 +2093,16 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     && ggml_is_contiguous(op->src[2])
                     && ggml_is_contiguous(op->src[3]);
         case GGML_OP_OPT_STEP_SGD:
-            return has_simdgroup_reduction;
+            // retro delta: the same three parameter precisions AdamW takes,
+            // over a step with no moments (kernels/retro.metal).
+            return has_simdgroup_reduction
+                    && (op->src[0]->type == GGML_TYPE_F32
+                            || op->src[0]->type == GGML_TYPE_F16
+                            || op->src[0]->type == GGML_TYPE_BF16)
+                    && op->src[1]->type == GGML_TYPE_F32
+                    && op->src[2]->type == GGML_TYPE_F32
+                    && ggml_is_contiguous(op->src[0])
+                    && ggml_is_contiguous(op->src[1]);
         // retro delta: fixed-block Gefen. The two phases are admitted together
         // on purpose: a device that ran the pure one and not the mutating one
         // would be scheduled as a split, and the update would land on a copy of

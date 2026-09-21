@@ -5197,14 +5197,13 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
 // This is deliberately a superset of GGML_RETRO_DEQUANT_TYPES (the set every backend
 // decodes and the parity tests sweep): the extra types cost nothing on CUDA because
 // the path is type-generic, whereas Metal and Vulkan need one kernel variant each.
-// BF16 stays out even though ggml_get_to_fp32_cuda covers it:
-// ggml_compute_forward_out_prod GGML_ABORTs on BF16, so accepting it here would turn
-// any split back to the CPU into a crash rather than a fallback.
+// BF16 is decodable on the CPU side too (out_prod), so a split back to the
+// CPU is a fallback rather than a crash.
 static bool ggml_cuda_can_decode_frozen(const ggml_tensor * t) {
     if (t->type == GGML_TYPE_F32) {
         return true;
     }
-    if (t->type != GGML_TYPE_F16 && !ggml_is_quantized(t->type)) {
+    if (t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16 && !ggml_is_quantized(t->type)) {
         return false;
     }
     return ggml_get_to_fp32_cuda(t->type) != nullptr &&
@@ -5753,7 +5752,6 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         }
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
-        case GGML_OP_OPT_STEP_SGD:
         case GGML_OP_FILL:
         case GGML_OP_CUMSUM:
         case GGML_OP_TRI:
@@ -5793,11 +5791,17 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             }
             return ggml_cuda_can_decode_frozen(w);
         }
+        case GGML_OP_OPT_STEP_SGD:
+            // retro delta: F32, F16 or BF16 parameter, F32 gradient (opt-step-sgd.cu).
+            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16 ||
+                    op->src[0]->type == GGML_TYPE_BF16) &&
+                   op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_OPT_STEP_ADAMW:
-            // retro delta: F32 parameters, or F16 parameters with F32 moments and
-            // the fork's stochastic-rounding store (opt-step-adamw.cu). Gradient
-            // and moments remain F32 in both cases.
-            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+            // retro delta: F32 parameters, or F16/BF16 parameters with F32 moments
+            // and the fork's stochastic-rounding store (opt-step-adamw.cu).
+            // Gradient and moments remain F32 in every case.
+            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16 ||
+                    op->src[0]->type == GGML_TYPE_BF16) &&
                    op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_F32 &&
                    op->src[3]->type == GGML_TYPE_F32;
         // retro delta: Gefen. The two phases are admitted together so a device

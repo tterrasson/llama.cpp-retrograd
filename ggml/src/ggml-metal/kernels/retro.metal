@@ -778,9 +778,8 @@ kernel void kernel_conv_rs_gather_f32(
             (s_idx + (int64_t) k)*args.nb00 + (int64_t) c*args.nb01 + (int64_t) s*args.nb02);
 }
 
-// retro delta: stochastic rounding for F16 parameters. Mirrors
-// ggml_sr_uniform / ggml_stochastic_round_f16 in ggml-impl.h bit for bit -- an
-// exact CPU-vs-GPU equality test covers the three implementations.
+// retro delta: stochastic rounding for half-precision parameters. Mirrors the
+// ggml-impl.h helpers bit for bit; an exact CPU-vs-GPU equality test covers it.
 static inline float retro_sr_uniform(uint seed, uint index) {
     uint h = seed ^ (index * 0x9E3779B9u);
     h ^= h >> 16; h *= 0x7FEB352Du;
@@ -789,7 +788,9 @@ static inline float retro_sr_uniform(uint seed, uint index) {
     return float(h >> 8) * (1.0f / 16777216.0f);
 }
 
-static inline ushort retro_f16_neighbour(ushort bits, bool up) {
+// One function for both grids: F16 and BF16 are both sign-magnitude in 16
+// bits, so the neighbour is a magnitude increment either way.
+static inline ushort retro_half_neighbour(ushort bits, bool up) {
     const ushort sign = bits & 0x8000;
     const ushort mag  = bits & 0x7FFF;
     if (mag == 0) {
@@ -806,7 +807,7 @@ static inline float retro_stochastic_round_f16(float x, float u) {
     if (residual == 0.0f) {
         return nearest_f;
     }
-    const ushort other   = retro_f16_neighbour(as_type<ushort>(nearest), residual > 0.0f);
+    const ushort other   = retro_half_neighbour(as_type<ushort>(nearest), residual > 0.0f);
     const float  other_f = float(as_type<half>(other));
     const float  span    = other_f - nearest_f;
     const float  p = (span != 0.0f && isfinite(span)) ? residual / span : 0.0f;
@@ -841,6 +842,101 @@ kernel void kernel_opt_step_adamw_f16(
             - alpha * (gmi * beta1h) / (sqrt(gvi * beta2h) + eps);
     x[gid] = half(retro_stochastic_round_f16(
             updated, retro_sr_uniform(uint(pars[7]), gid)));
+}
+
+// BF16 is the top 16 bits of the F32 with the same value, round-half-to-even
+// on the way down (ggml_compute_fp32_to_bf16). The parameter is a raw 16-bit
+// word here and every arithmetic step is F32, so the kernel needs no `bfloat`.
+static inline ushort retro_f32_to_bf16(float x) {
+    const uint bits = as_type<uint>(x);
+    if ((bits & 0x7FFFFFFFu) > 0x7F800000u) {
+        return ushort((bits >> 16) | 64u);  // NaN, forced quiet
+    }
+    return ushort((bits + (0x7FFFu + ((bits >> 16) & 1u))) >> 16);
+}
+
+static inline float retro_bf16_to_f32(ushort bits) {
+    return as_type<float>(uint(bits) << 16);
+}
+
+// Returns the BF16 bits of `x` after stochastic rounding with uniform `u`.
+static inline ushort retro_stochastic_round_bf16(float x, float u) {
+    const ushort nearest   = retro_f32_to_bf16(x);
+    const float  nearest_f = retro_bf16_to_f32(nearest);
+    const float  residual  = x - nearest_f;
+    if (residual == 0.0f) {
+        return nearest;
+    }
+    const ushort other   = retro_half_neighbour(nearest, residual > 0.0f);
+    const float  other_f = retro_bf16_to_f32(other);
+    const float  span    = other_f - nearest_f;
+    const float  p = (span != 0.0f && isfinite(span)) ? residual / span : 0.0f;
+    return u < p ? other : nearest;
+}
+
+kernel void kernel_opt_step_adamw_bf16(
+        constant    ggml_metal_kargs_opt_step_adamw & args,
+        device       ushort * x,
+        device const float * g,
+        device       float * g_m,
+        device       float * g_v,
+        device const float * pars,
+        uint        gid[[thread_position_in_grid]]) {
+    if (gid >= args.np) {
+        return;
+    }
+
+    const float alpha  = pars[0];
+    const float beta1  = pars[1];
+    const float beta2  = pars[2];
+    const float eps    = pars[3];
+    const float wd     = pars[4];
+    const float beta1h = pars[5];
+    const float beta2h = pars[6];
+    const float gi = g[gid] * pars[8];
+    const float gmi = g_m[gid] * beta1 + gi * (1.0f - beta1);
+    const float gvi = g_v[gid] * beta2 + gi * gi * (1.0f - beta2);
+    g_m[gid] = gmi;
+    g_v[gid] = gvi;
+    const float updated = retro_bf16_to_f32(x[gid]) * (1.0f - alpha * wd)
+            - alpha * (gmi * beta1h) / (sqrt(gvi * beta2h) + eps);
+    x[gid] = retro_stochastic_round_bf16(
+            updated, retro_sr_uniform(uint(pars[7]), gid));
+}
+
+// The same stochastically rounded store as AdamW, over a step with no moments.
+kernel void kernel_opt_step_sgd_f16(
+        constant    ggml_metal_kargs_opt_step_sgd & args,
+        device       half * x,
+        device const float * g,
+        device const float * pars,
+        uint        gid[[thread_position_in_grid]]) {
+    if (gid >= args.np) {
+        return;
+    }
+
+    const float alpha = pars[0];
+    const float keep  = 1.0f - alpha * pars[1];
+    const float updated = float(x[gid]) * keep - alpha * g[gid];
+    x[gid] = half(retro_stochastic_round_f16(
+            updated, retro_sr_uniform(uint(pars[2]), gid)));
+}
+
+kernel void kernel_opt_step_sgd_bf16(
+        constant    ggml_metal_kargs_opt_step_sgd & args,
+        device       ushort * x,
+        device const float * g,
+        device const float * pars,
+        uint        gid[[thread_position_in_grid]]) {
+    if (gid >= args.np) {
+        return;
+    }
+
+    const float alpha = pars[0];
+    const float keep  = 1.0f - alpha * pars[1];
+    const float updated = retro_bf16_to_f32(x[gid]) * keep - alpha * g[gid];
+    x[gid] = retro_stochastic_round_bf16(
+            updated, retro_sr_uniform(uint(pars[2]), gid));
 }
 
 // retro delta: `kernel_rms_norm_back_f32` and `kernel_l2_norm_back_f32` stood

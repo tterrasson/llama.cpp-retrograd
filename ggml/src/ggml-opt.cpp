@@ -225,7 +225,9 @@ int64_t ggml_opt_optimizer_n_params(enum ggml_opt_optimizer_type optimizer) {
         // alpha, beta1, beta2, eps, wd, beta1h, beta2h, and the per-step seed
         // the stochastic rounding of an F16 parameter needs.
         case GGML_OPT_OPTIMIZER_TYPE_ADAMW: return 8;
-        case GGML_OPT_OPTIMIZER_TYPE_SGD:   return 2;
+        // alpha, wd, and the per-step seed for the stochastic rounding of
+        // half-precision parameters.
+        case GGML_OPT_OPTIMIZER_TYPE_SGD:   return 3;
         // alpha, momentum, wd, ns_epsilon. The iteration count and the Nesterov
         // choice are structural and belong to the layout, not here.
         case GGML_OPT_OPTIMIZER_TYPE_MUON:  return 4;
@@ -1379,9 +1381,9 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
                 break;
             case GGML_OPT_OPTIMIZER_TYPE_SGD:
             case GGML_OPT_OPTIMIZER_TYPE_MUON:
-                // Both keep the explicit multiply: SGD's kernel is untouched by
-                // the F16 work, and Muon's step is a graph whose first node can
-                // scale the gradient as cheaply as its kernel would.
+                // Both keep the explicit multiply: SGD's kernel reads an
+                // already-scaled gradient, and Muon's step scales it in its
+                // first node.
                 step_args[type] = declared;
                 break;
             case GGML_OPT_OPTIMIZER_TYPE_GEFEN:
@@ -2143,6 +2145,9 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
                     GGML_ASSERT(opt_pars.sgd.wd <= 1.0f);
                     values[0] = opt_pars.sgd.alpha;
                     values[1] = opt_pars.sgd.wd;
+                    // retro delta: the same per-step seed AdamW carries, read
+                    // only by the half-precision stores.
+                    values[2] = (float) opt_ctx->iter;
                 } break;
                 case GGML_OPT_OPTIMIZER_TYPE_MUON: {
                     GGML_ASSERT(opt_pars.muon.alpha > 0.0f);

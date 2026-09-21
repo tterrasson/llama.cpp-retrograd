@@ -3649,14 +3649,22 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #undef CREATE_FUSED_SPARSE_CE
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
-    // The F16 variant declares a float16_t storage buffer, so it needs
-    // VK_KHR_16bit_storage. Creating it unconditionally would fail here on a
+    // The half-precision variants declare a 16-bit storage buffer, so they need
+    // VK_KHR_16bit_storage. Creating them unconditionally would fail here on a
     // device without it and take the whole (F32) Vulkan backend down with it.
+    // The BF16 one stores raw 16-bit words and computes in F32, so it needs
+    // only the storage class that `device->fp16` guards.
     if (device->fp16) {
         ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f16, "opt_step_adamw_f16", opt_step_adamw_f16_len, opt_step_adamw_f16_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_bf16, "opt_step_adamw_bf16", opt_step_adamw_bf16_len, opt_step_adamw_bf16_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
     }
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_sgd_f32, "opt_step_sgd_f32", opt_step_sgd_f32_len, opt_step_sgd_f32_data, "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+    // Same 16-bit storage guard as AdamW's half-precision pair.
+    if (device->fp16) {
+        ggml_vk_create_pipeline(device, device->pipeline_opt_step_sgd_f16, "opt_step_sgd_f16", opt_step_sgd_f16_len, opt_step_sgd_f16_data, "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_opt_step_sgd_bf16, "opt_step_sgd_bf16", opt_step_sgd_bf16_len, opt_step_sgd_bf16_data, "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+    }
 
     // retro delta: Gefen. One workgroup per quantization block, so the
     // dispatch counts blocks, not elements.
@@ -9134,10 +9142,19 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
             return ctx->device->pipeline_opt_step_adamw_f16;
         }
+        if (src0->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_BF16) {
+            return ctx->device->pipeline_opt_step_adamw_bf16;
+        }
         return nullptr;
     case GGML_OP_OPT_STEP_SGD:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_opt_step_sgd_f32;
+        }
+        if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
+            return ctx->device->pipeline_opt_step_sgd_f16;
+        }
+        if (src0->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_BF16) {
+            return ctx->device->pipeline_opt_step_sgd_bf16;
         }
         return nullptr;
     // retro delta: Gefen. The variant selects the pipeline.
@@ -10775,7 +10792,7 @@ static void ggml_vk_opt_step_adamw_impl(ggml_backend_vk_context * ctx, vk_contex
     const ggml_tensor * gv = dst->src[3];
     const ggml_tensor * p = dst->src[4];
 
-    GGML_ASSERT(x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16);
+    GGML_ASSERT(x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16 || x->type == GGML_TYPE_BF16);
     GGML_ASSERT(g->type == GGML_TYPE_F32);
     GGML_ASSERT(gm->type == GGML_TYPE_F32);
     GGML_ASSERT(gv->type == GGML_TYPE_F32);
@@ -10897,9 +10914,32 @@ void ggml_vk_opt_step_gefen(ggml_backend_vk_context * ctx, vk_context& subctx, g
 }
 
 void ggml_vk_opt_step_sgd(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, ggml_tensor * dst) {
-    const size_t n = ggml_nelements(dst->src[0]);
+    // retro delta: dispatched directly rather than through ggml_vk_op_f32,
+    // because this parameter may be half-precision.
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(src2->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->buffer != nullptr);
+    GGML_ASSERT(ggml_is_contiguous(src0));
+    GGML_ASSERT(ggml_is_contiguous(src1));
+    GGML_ASSERT(ggml_is_contiguous(src2));
+    GGML_ASSERT(ggml_are_same_shape(src0, src1));
+    GGML_ASSERT(ggml_nelements(src2) == 3);
 
-    ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, src2, nullptr, dst, GGML_OP_OPT_STEP_SGD, { (uint32_t)n, 0, 0.0f, 0.0f, 0.0f, 0.0f });
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, src0, src1, src2, dst, GGML_OP_OPT_STEP_SGD);
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const uint32_t n = (uint32_t) ggml_nelements(src0);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {
+            ggml_vk_tensor_subbuffer(ctx, src0),
+            ggml_vk_tensor_subbuffer(ctx, src1),
+            ggml_vk_tensor_subbuffer(ctx, src2),
+        },
+        vk_op_push_constants { n, 0, 0.0f, 0.0f, 0.0f, 0.0f },
+        { n, 1, 1 });
 }
 
 void ggml_vk_concat(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -16559,7 +16599,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_OPT_STEP_ADAMW:
             return ggml_is_contiguous(op->src[0])
                     && (op->src[0]->type == GGML_TYPE_F32
-                            || (op->src[0]->type == GGML_TYPE_F16 && device->fp16))
+                            || ((op->src[0]->type == GGML_TYPE_F16
+                                    || op->src[0]->type == GGML_TYPE_BF16) && device->fp16))
                     && op->src[1]->type == GGML_TYPE_F32
                     && op->src[2]->type == GGML_TYPE_F32
                     && op->src[3]->type == GGML_TYPE_F32
@@ -16568,7 +16609,15 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     && ggml_is_contiguous(op->src[2])
                     && ggml_is_contiguous(op->src[3]);
         case GGML_OP_OPT_STEP_SGD:
-            return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
+            // retro delta: the same three parameter precisions AdamW takes,
+            // over a step with no moments.
+            return ggml_is_contiguous(op->src[0])
+                    && (op->src[0]->type == GGML_TYPE_F32
+                            || ((op->src[0]->type == GGML_TYPE_F16
+                                    || op->src[0]->type == GGML_TYPE_BF16) && device->fp16))
+                    && op->src[1]->type == GGML_TYPE_F32
+                    && op->src[2]->type == GGML_TYPE_F32
+                    && ggml_is_contiguous(op->src[1]);
         // retro delta: Gefen. The two phases are admitted together so a device
         // never runs one without the other, which would split the update onto
         // a copy of the state.
