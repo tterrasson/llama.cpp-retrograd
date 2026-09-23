@@ -184,6 +184,19 @@ public:
     const llama_rope_section_order rope_section_order = LLAMA_ROPE_SECTION_ORDER_TYXZ;
 };
 
+// Logical predecessor rows for recurrent convolutions in a packed batch.
+// Unlike attention, ShortConv cannot infer these edges from physical
+// adjacency, which is wrong once several branches share the same prompt.
+class llm_graph_input_conv_idx : public llm_graph_input_i {
+public:
+    explicit llm_graph_input_conv_idx(uint32_t l_cache) : l_cache(l_cache) {}
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * idx = nullptr; // I32 [l_cache * n_tokens]
+    const uint32_t l_cache;
+};
+
 // temperature tuning, used by llama4
 class llm_graph_input_attn_temp : public llm_graph_input_i {
 public:

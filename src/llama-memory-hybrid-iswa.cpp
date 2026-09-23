@@ -64,6 +64,15 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
     )) {}
 
 llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
+    return init_batch_impl(balloc, n_ubatch, embd_all, false);
+}
+
+llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch_packed(llama_batch_allocr & balloc, uint32_t n_ubatch) {
+    return init_batch_impl(balloc, n_ubatch, true, true);
+}
+
+llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch_impl(
+        llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all, bool packed) {
     do {
         balloc.split_reset();
 
@@ -73,7 +82,9 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
         while (true) {
             llama_ubatch ubatch;
 
-            if (embd_all) {
+            if (packed) {
+                ubatch = balloc.split_simple(n_ubatch);
+            } else if (embd_all) {
                 // if all tokens are output, split by sequence
                 ubatch = balloc.split_seq(n_ubatch);
             } else {
@@ -101,7 +112,7 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
         }
 
         // prepare the recurrent batches first
-        if (!mem_recr->prepare(ubatches)) {
+        if (!packed && !mem_recr->prepare(ubatches)) {
             // TODO: will the recurrent cache be in an undefined context at this point?
             LLAMA_LOG_ERROR("%s: failed to prepare recurrent ubatches\n", __func__);
             return std::make_unique<llama_memory_hybrid_iswa_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
@@ -121,7 +132,7 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
         }
 
         return std::make_unique<llama_memory_hybrid_iswa_context>(
-                this, std::move(sinfos_base), std::move(sinfos_swa), std::move(ubatches));
+                this, std::move(sinfos_base), std::move(sinfos_swa), std::move(ubatches), packed);
     } while(false);
 
     return std::make_unique<llama_memory_hybrid_iswa_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
@@ -235,11 +246,12 @@ llama_memory_hybrid_iswa_context::llama_memory_hybrid_iswa_context(
            llama_memory_hybrid_iswa * mem,
                     slot_info_vec_t   sinfos_base,
                     slot_info_vec_t   sinfos_swa,
-          std::vector<llama_ubatch>   ubatches) :
+          std::vector<llama_ubatch>   ubatches,
+                                bool indexed_recurrent) :
     ubatches(std::move(ubatches)),
     // note: here we copy the ubatches. not sure if this is ideal
     ctx_attn(new llama_kv_cache_iswa_context(mem->get_mem_attn(), std::move(sinfos_base), std::move(sinfos_swa), this->ubatches)),
-    ctx_recr(new llama_memory_recurrent_context(mem->get_mem_recr(), this->ubatches)),
+    ctx_recr(new llama_memory_recurrent_context(mem->get_mem_recr(), this->ubatches, indexed_recurrent)),
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
 }
 
