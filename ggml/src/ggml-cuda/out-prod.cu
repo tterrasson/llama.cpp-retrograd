@@ -299,10 +299,12 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     // in F32. Here src0 is dequantized with ggml-cuda's existing per-type kernels
     // (bit-identical to the CPU oracle's dequant) and the proven cuBLAS path is
     // reused, so every type with a to_fp32 kernel is covered with F32 accumulation
-    // (F16 included) -- but in slices along the reduction axis, so the F32 scratch
-    // never scales with the whole weight (see ggml_cuda_dequant_budget_bytes).
+    // (F16 and BF16 included) -- but in slices along the reduction axis, so the
+    // F32 scratch never scales with the whole weight (see
+    // ggml_cuda_dequant_budget_bytes). BF16 has no native tile loader, so it
+    // always takes that path.
     GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 ||
-                ggml_is_quantized(src0->type));
+                src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type));
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
