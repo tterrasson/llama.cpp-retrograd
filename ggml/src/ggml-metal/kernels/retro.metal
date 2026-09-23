@@ -1536,16 +1536,42 @@ kernel void kernel_retro_fill_f32(
     dst[gid] = args.val;
 }
 
+// retro delta: fixed-order sum of `n` partials into dst[0], one threadgroup.
+// A loss reduced by atomic adds lands in whatever order the threadgroups
+// finish, which is one F32 ulp of run-to-run noise; the scalar losses write
+// one partial per row instead and are summed here in an order that depends on
+// the shape alone.
+kernel void kernel_retro_sum_f32(
+        constant ggml_metal_kargs_retro_sum & args,
+        device const float * src,
+        device       float * dst,
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3 ntg[[threads_per_threadgroup]]) {
+    threadgroup float sh[32];
+
+    float partial = 0.0f;
+    for (int64_t i = tpitg.x; i < args.n; i += ntg.x) {
+        partial += src[i];
+    }
+    const float total = retro_tg_sum(partial, sh, sgitg, tiisg, ntg.x);
+
+    if (tpitg.x == 0) {
+        dst[0] = total;
+    }
+}
+
 // retro delta: cross-entropy loss forward for LoRA training.
-// src0 = logits, src1 = labels, both contiguous [ne00, nrows]; dst = scalar [1].
-// One threadgroup per row: log-sum-exp over the row, then the row's loss
-// contribution -Σ(label·log_softmax(logit))/nrows is atomically added to dst[0]
-// (dst is zero-filled by a preceding dispatch).
+// src0 = logits, src1 = labels, both contiguous [ne00, nrows]; dst = one
+// partial per row. One threadgroup per row: log-sum-exp over the row, then the
+// row's loss contribution -Σ(label·log_softmax(logit))/nactive, which
+// kernel_retro_sum_f32 then reduces into the scalar.
 kernel void kernel_cross_entropy_loss_f32(
         constant ggml_metal_kargs_cross_entropy_loss & args,
         device const float  * logits,
         device const float  * labels,
-        device atomic_float * dst,
+        device       float  * dst,
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort3 tpitg[[thread_position_in_threadgroup]],
         ushort  sgitg[[simdgroup_index_in_threadgroup]],
@@ -1556,8 +1582,11 @@ kernel void kernel_cross_entropy_loss_f32(
     const int64_t i1 = tgpig.x;
 
     // A batch containing only ignored labels has a zero loss.  Avoid dividing
-    // by zero while leaving the zero-filled destination unchanged.
+    // by zero; the row's partial is still written, since the sum reads it.
     if (args.nactive == 0) {
+        if (tpitg.x == 0) {
+            dst[i1] = 0.0f;
+        }
         return;
     }
 
@@ -1584,7 +1613,7 @@ kernel void kernel_cross_entropy_loss_f32(
     const float loss = retro_tg_sum(lloss, sh, sgitg, tiisg, ntg.x);
 
     if (tpitg.x == 0) {
-        atomic_fetch_add_explicit(dst, -loss / (float) args.nactive, memory_order_relaxed);
+        dst[i1] = -loss / (float) args.nactive;
     }
 }
 
@@ -1729,7 +1758,7 @@ kernel void kernel_fused_sparse_ce(
         device const int    * targets,
         device const float  * weights,
         device const float  * bias,
-        device atomic_float * dst,
+        device       float  * dst,
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort3 tpitg[[thread_position_in_threadgroup]],
         ushort  sgitg[[simdgroup_index_in_threadgroup]],
@@ -1745,7 +1774,12 @@ kernel void kernel_fused_sparse_ce(
     const int n_active = fsce_count_active(
             targets, weights, args.n_tokens, n_topk, args.n_vocab, sh, tpitg.x, sgitg, tiisg, ntg.x);
 
+    // dst holds one partial per token, which kernel_retro_sum_f32 reduces;
+    // an inactive token still writes its zero, since the sum reads it.
     if (!fsce_position_active(targets, weights, t, n_topk, args.n_vocab) || n_active == 0) {
+        if (tpitg.x == 0) {
+            dst[t] = 0.0f;
+        }
         return;
     }
 
@@ -1795,7 +1829,7 @@ kernel void kernel_fused_sparse_ce(
     const float contrib_all = retro_tg_sum(contrib, sh, sgitg, tiisg, ntg.x);
 
     if (tpitg.x == 0) {
-        atomic_fetch_add_explicit(dst, contrib_all/(float) n_active, memory_order_relaxed);
+        dst[t] = contrib_all/(float) n_active;
     }
 }
 
