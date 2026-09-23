@@ -797,3 +797,8 @@ bool llm_arch_is_hybrid         (const llm_arch & arch);
 bool llm_arch_is_diffusion      (const llm_arch & arch);
 bool llm_arch_supports_sm_tensor(const llm_arch & arch);
 bool llm_arch_supports_rs_rollback(const llm_arch & arch);
+// retro delta: whether this architecture's graph accepts an ubatch that mixes
+// several sequences (ubatch.equal_seqs() == false). See the definition in
+// llama-arch.cpp for what makes the answer true, and llama_context::
+// packed_seq_supported() for what keeps it honest.
+bool llm_arch_supports_unequal_seqs(const llm_arch & arch);

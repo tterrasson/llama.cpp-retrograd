@@ -152,6 +152,17 @@ struct llama_context {
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
 
+    // retro delta: one forward pass over a batch whose sequences stay in the
+    // physical order the caller gave them (llama_decode_packed in llama.h).
+    // Same path as decode(), only the memory split differs, so a caller can
+    // compare a packed forward against the isolated ones it must reproduce.
+    int decode_packed(const llama_batch & batch_inp);
+
+    // retro delta: whether this model's graph accepts a packed micro-batch,
+    // logged and refused under `func` when it does not. Guards every entry to
+    // the packed memory split; see the definition in llama-context.cpp.
+    bool packed_seq_supported(const char * func) const;
+
     //
     // state save/load
     //
@@ -480,6 +491,11 @@ private:
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
 
     bool has_evaluated_once = false;
+
+    // retro delta: set for the duration of one decode_packed() call, which is
+    // the only difference between it and decode() — the memory splits the batch
+    // with init_batch_packed() instead of init_batch().
+    bool decode_packed_active = false;
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;

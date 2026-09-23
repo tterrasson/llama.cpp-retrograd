@@ -1129,6 +1129,37 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
     }
 }
 
+// retro delta: whether a graph of this architecture can be built on an ubatch
+// that mixes several sequences, i.e. one produced by llama_batch_allocr::
+// split_simple rather than split_equal.
+//
+// An attention-only graph addresses its history by sequence id through the KV
+// mask, so a mixed ubatch is already its ordinary case. A recurrent or hybrid
+// graph carries a state per sequence, and can only accept a mixed ubatch if it
+// reads that state by index instead of relying on the physical adjacency
+// split_equal guarantees. Today one family does: LFM2/LFM2-MoE gather their
+// ShortConv window through GET_ROWS (src/models/lfm2.cpp).
+//
+// llama_context::packed_seq_supported() reads this table at the two entries to
+// the packed memory split, which are the only ways to build a graph on a mixed
+// ubatch — so the answer is never believed further than the caller that asked
+// for packing. A name added here without the indexed path in its graph is not
+// caught by that check, since it is this table the check trusts; it reaches the
+// GGML_ASSERT(ubatch.equal_seqs()) the graph already carries upstream.
+bool llm_arch_supports_unequal_seqs(const llm_arch & arch) {
+    if (!llm_arch_is_recurrent(arch) && !llm_arch_is_hybrid(arch)) {
+        return true;
+    }
+
+    switch (arch) {
+        case LLM_ARCH_LFM2:
+        case LLM_ARCH_LFM2MOE:
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
     switch (arch) {
         case LLM_ARCH_GROK:
