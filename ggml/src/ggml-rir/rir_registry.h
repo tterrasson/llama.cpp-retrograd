@@ -4,7 +4,7 @@
 #pragma once
 #include <stdint.h>
 
-#define RIR_REGISTRY_SCHEMA 15
+#define RIR_REGISTRY_SCHEMA 17
 #define RIR_MAX_BINDINGS 4
 #define RIR_MAX_PARAMS 2
 // Nine axes cover the four tensor dimensions plus four folded dimensions and
@@ -147,6 +147,21 @@ typedef struct rir_variant_desc {
     uint8_t          n_axes;
     rir_axis_desc    axes[RIR_MAX_AXES];
     rir_dispatch_desc dispatch[3];
+    // The **flattened** dispatch: the axes one linear
+    // grid dimension decomposes into, fastest first, with the number of indices
+    // one invocation covers on each. Zero for every other lowering, and the two
+    // are exclusive - a flattened variant has no grid axis at all.
+    //
+    // `per_workgroup` is read as "per invocation" here, which is why the type is
+    // shared rather than copied: the divisor of entry `i` is
+    // `ceil(extent(axis) / per)`, exactly the `ceil` a grid dimension applies,
+    // and the grid is `ceil(Π divisors / dispatch[0].per_workgroup)`.
+    //
+    // A consumer that ignores this field dispatches one block for the whole
+    // tensor, so `dispatch[0].axis` is **-1** on a flattened variant rather
+    // than a plausible axis: it cannot be read as a grid by accident.
+    uint8_t          n_flat;
+    rir_dispatch_desc flat[RIR_MAX_AXES];
     // Width of the integers the constant buffer carries. Every extent, every
     // stride and every addressed byte offset must be representable in it, or
     // the kernel would address the wrong bytes.
@@ -162,6 +177,15 @@ typedef struct rir_variant_desc {
     uint8_t      requires_subgroup; // 1 = needs the 32-lane collective below
     uint32_t     min_subgroup;
     uint32_t     workgroup[3];
+    // Bytes of workgroup-shared storage the generated kernel declares.
+    // Zero for a lowering that declares none.
+    //
+    // It is published for the same reason `workgroup` is: it is a *budget* the
+    // device half of the contract has to compare against a device limit, and a
+    // backend cannot derive it - the shared arrays are a lowering decision, and
+    // the only other place they exist is inside the compiled kernel. It is the
+    // `shared_bytes` field of `KernelNeeds`, rendered a fourth time.
+    uint32_t     shared_bytes;
     uint32_t     push_constant_bytes;
 } rir_variant_desc;
 
