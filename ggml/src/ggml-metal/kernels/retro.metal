@@ -98,3 +98,202 @@ kernel void kernel_out_prod_f32(
 
     dst[i0 + i1*args.s1 + i2*args.s2 + i3*args.s3] = acc;
 }
+
+// retro delta: threadgroup-wide sum/max over per-simdgroup partials. Safe for any
+// threadgroup size (including a partial trailing simdgroup): only simdgroup 0
+// combines the partials, then the total is re-broadcast through shared memory.
+// `sh` must hold 32 floats; all threads of the threadgroup must call this.
+static float retro_tg_sum(float partial, threadgroup float * sh,
+                          ushort sgitg, ushort tiisg, ushort ntg) {
+    const ushort nsg = (ntg + 31) / 32;
+    partial = simd_sum(partial);
+    if (tiisg == 0) {
+        sh[sgitg] = partial;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        float v = tiisg < nsg ? sh[tiisg] : 0.0f;
+        v = simd_sum(v);
+        if (tiisg == 0) {
+            sh[0] = v;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float total = sh[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return total;
+}
+
+static float retro_tg_max(float partial, threadgroup float * sh,
+                          ushort sgitg, ushort tiisg, ushort ntg) {
+    const ushort nsg = (ntg + 31) / 32;
+    partial = simd_max(partial);
+    if (tiisg == 0) {
+        sh[sgitg] = partial;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        float v = tiisg < nsg ? sh[tiisg] : -INFINITY;
+        v = simd_max(v);
+        if (tiisg == 0) {
+            sh[0] = v;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float total = sh[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return total;
+}
+
+// retro delta: soft-max backward for LoRA training.
+// src0 = dy (grad of softmax output), src1 = y (softmax output), same shape.
+// Per row: dx = (dy - dot(y, dy)) * y * scale. One threadgroup per row.
+kernel void kernel_soft_max_back_f32(
+        constant ggml_metal_kargs_soft_max_back & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3 ntg[[threads_per_threadgroup]]) {
+    threadgroup float sh[32];
+
+    const int i01 = tgpig.x;
+    const int i02 = tgpig.y;
+    const int i03 = tgpig.z;
+
+    device const float * dy = (device const float *) (src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01);
+    device const float * y  = (device const float *) (src1 + i03*args.nb13 + i02*args.nb12 + i01*args.nb11);
+    device       float * dx = (device       float *) (dst  + i03*args.nb3  + i02*args.nb2  + i01*args.nb1);
+
+    float dot_y_dy = 0.0f;
+    for (int i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) {
+        dot_y_dy += y[i00] * dy[i00];
+    }
+    dot_y_dy = retro_tg_sum(dot_y_dy, sh, sgitg, tiisg, ntg.x);
+
+    for (int i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) {
+        dx[i00] = (dy[i00] - dot_y_dy) * y[i00] * args.scale;
+    }
+}
+
+// retro delta: flat F32 fill; zero-initialises accumulator outputs before the
+// atomic-add stages of cross-entropy loss and get-rows backward.
+kernel void kernel_retro_fill_f32(
+        constant ggml_metal_kargs_retro_fill & args,
+        device float * dst,
+        uint gid[[thread_position_in_grid]]) {
+    if ((int64_t) gid >= args.np) {
+        return;
+    }
+    dst[gid] = args.val;
+}
+
+// retro delta: cross-entropy loss forward for LoRA training.
+// src0 = logits, src1 = labels, both contiguous [ne00, nrows]; dst = scalar [1].
+// One threadgroup per row: log-sum-exp over the row, then the row's loss
+// contribution is atomically added to dst[0] (dst is zero-filled first).
+kernel void kernel_cross_entropy_loss_f32(
+        constant ggml_metal_kargs_cross_entropy_loss & args,
+        device const float  * logits,
+        device const float  * labels,
+        device atomic_float * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3 ntg[[threads_per_threadgroup]]) {
+    threadgroup float sh[32];
+    const int64_t i1 = tgpig.x;
+    device const float * s0 = logits + i1*args.ne00;
+    device const float * s1 = labels + i1*args.ne00;
+
+    float lmax = -INFINITY;
+    for (int i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) {
+        lmax = MAX(lmax, s0[i00]);
+    }
+    const float max_val = retro_tg_max(lmax, sh, sgitg, tiisg, ntg.x);
+
+    float lsum = 0.0f;
+    for (int i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) {
+        lsum += exp(s0[i00] - max_val);
+    }
+    const float log_sum = log(retro_tg_sum(lsum, sh, sgitg, tiisg, ntg.x));
+
+    float lloss = 0.0f;
+    for (int i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) {
+        lloss += (s0[i00] - max_val - log_sum) * s1[i00];
+    }
+    const float loss = retro_tg_sum(lloss, sh, sgitg, tiisg, ntg.x);
+
+    if (tpitg.x == 0) {
+        atomic_fetch_add_explicit(dst, -loss / (float) args.nrows, memory_order_relaxed);
+    }
+}
+
+// retro delta: cross-entropy loss backward for LoRA training.
+// src0 = grad of the loss (scalar), src1 = logits, src2 = labels (contiguous
+// [ne00, nrows]); dst = (softmax(logits) - labels) * grad/nrows, same shape.
+kernel void kernel_cross_entropy_loss_back_f32(
+        constant ggml_metal_kargs_cross_entropy_loss_back & args,
+        device const float * grad,
+        device const float * logits,
+        device const float * labels,
+        device       float * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3 ntg[[threads_per_threadgroup]]) {
+    threadgroup float sh[32];
+    const int64_t i1 = tgpig.x;
+    device const float * s0 = logits + i1*args.ne00;
+    device const float * s1 = labels + i1*args.ne00;
+    device       float * d  = dst    + i1*args.ne00;
+
+    float lmax = -INFINITY;
+    for (int i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) {
+        lmax = MAX(lmax, s0[i00]);
+    }
+    const float max_val = retro_tg_max(lmax, sh, sgitg, tiisg, ntg.x);
+
+    float lsum = 0.0f;
+    for (int i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) {
+        lsum += exp(s0[i00] - max_val);
+    }
+    const float sum = retro_tg_sum(lsum, sh, sgitg, tiisg, ntg.x);
+    const float sm_scale = 1.0f / sum;
+    const float d_by_nr  = grad[0] / (float) args.nrows;
+
+    for (int i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) {
+        const float sm = exp(s0[i00] - max_val) * sm_scale;
+        d[i00] = (sm - s1[i00]) * d_by_nr;
+    }
+}
+
+// retro delta: get-rows backward for LoRA training.
+// src0 = grad rows [ne00, nr], src1 = I32 row indices [nr]; dst [ne00, n_vocab]
+// is zero-filled by a preceding dispatch, then each grad row is scatter-added
+// into dst row idx[i]. Duplicate indices accumulate, hence the atomic add.
+kernel void kernel_get_rows_back_f32(
+        constant ggml_metal_kargs_get_rows_back & args,
+        device const char    * src0,
+        device const int32_t * src1,
+        device       char    * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3 ntg[[threads_per_threadgroup]]) {
+    const int64_t i = tgpig.x;
+    if (i >= args.nr) {
+        return;
+    }
+    const int64_t r = src1[i];
+    device const float  * s = (device const float  *) (src0 + i*args.nb01);
+    device atomic_float * d = (device atomic_float *) (dst  + r*args.nb1);
+
+    for (int64_t i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) {
+        atomic_fetch_add_explicit(d + i00, s[i00], memory_order_relaxed);
+    }
+}
