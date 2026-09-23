@@ -962,7 +962,7 @@ int main(void) {
                         ggml_tensor * p = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2);
                         t = ggml_opt_step_sgd(ctx, a, b, p);
                     } break;
-                    case GGML_OPT_OPTIMIZER_TYPE_COUNT: {
+                    default: {
                         GGML_ABORT("fatal error");
                     }
                 }

@@ -1,0 +1,93 @@
+#version 450
+
+#include "gefen_head.glsl"
+
+layout(local_size_x = GEFEN_WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer G {float grad[];};
+#ifdef QUANTIZED
+layout (binding = 1) readonly buffer M {uint indices[];};
+#else
+layout (binding = 1) readonly buffer M {float moment[];};
+#endif
+layout (binding = 2) readonly buffer S {float scales[];};
+layout (binding = 3) readonly buffer V {float v[];};
+layout (binding = 4) readonly buffer C {float codebook[];};
+layout (binding = 5) readonly buffer P {float pars[];};
+layout (binding = 6) writeonly buffer D {float dst[];};
+
+shared float sh_sum[GEFEN_WORKGROUP_SIZE];
+#ifdef QUANTIZED
+shared float sh_max[GEFEN_WORKGROUP_SIZE];
+#endif
+
+// Phase A. Reads the clipped gradient and the old state, writes [scale, second
+// moment] per block. Under shared_v there is no scale; the first row stays zero.
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint b   = gl_WorkGroupID.x;
+
+    const float beta1  = pars[1];
+    const float beta2  = pars[2];
+    const float gscale = pars[7];
+
+    const uint i0 = b*p.bs;
+    const uint i1 = min(i0 + p.bs, p.np);
+
+    // Accumulate the mean term by term, clamping each square: one overflowing
+    // square would otherwise poison the whole reduction.
+    const float inv_n = 1.0f/float(i1 - i0);
+
+    float sum_sq  = 0.0f;
+    float max_abs = 0.0f;
+
+#ifdef QUANTIZED
+    const float scale_old = scales[b];
+#endif
+
+    for (uint i = i0 + tid; i < i1; i += GEFEN_WORKGROUP_SIZE) {
+        const float gi = grad[i]*gscale;
+        sum_sq += min(gi*gi, 3.4028235e38f)*inv_n;
+#ifdef QUANTIZED
+        // Recomputes the first moment the update will use, so the scale
+        // matches the values that are actually quantized.
+        const uint  code    = (indices[i >> 2] >> (8u*(i & 3u))) & 0xFFu;
+        const float decoded = scale_old*codebook[code < p.levels ? code : p.levels - 1u];
+        const float mi      = beta1*decoded + (1.0f - beta1)*gi;
+        max_abs = max(max_abs, abs(mi));
+#endif
+    }
+
+    sh_sum[tid] = sum_sq;
+#ifdef QUANTIZED
+    sh_max[tid] = max_abs;
+#endif
+    barrier();
+
+    [[unroll]] for (uint s = GEFEN_WORKGROUP_SIZE/2u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            sh_sum[tid] += sh_sum[tid + s];
+#ifdef QUANTIZED
+            sh_max[tid] = max(sh_max[tid], sh_max[tid + s]);
+#endif
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        // Already a mean over the block's actual elements, so a partial
+        // trailing block is not diluted by padding.
+        const float mean_sq = sh_sum[0];
+#ifdef QUANTIZED
+        dst[2*b + 0] = sh_max[0];
+#else
+        dst[2*b + 0] = 0.0f;
+#endif
+        // Restore the infinity the other backends produce: a clamped term
+        // contributes exactly FLT_MAX/n and no other term is negative, so the
+        // mean reaching that value is the overflow signal.
+        dst[2*b + 1] = mean_sq >= 3.4028235e38f*inv_n
+                ? uintBitsToFloat(0x7F800000u)
+                : beta2*v[b] + (1.0f - beta2)*mean_sq;
+    }
+}

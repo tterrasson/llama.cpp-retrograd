@@ -166,6 +166,15 @@ struct vk_op_push_constants {
     float param4;
 };
 
+// retro delta: Gefen, shared by both phases. `zero_code` comes from the host so
+// the canonical index has one definition (ggml.h) for every backend.
+struct vk_op_gefen_push_constants {
+    uint32_t np;
+    uint32_t bs;
+    uint32_t levels;
+    uint32_t zero_code;
+};
+
 struct vk_op_fwht_push_constants {
     uint32_t n_rows;
     uint32_t src_offset;
