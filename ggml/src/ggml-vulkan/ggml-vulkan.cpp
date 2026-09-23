@@ -3693,9 +3693,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_col2im_1d_f16,  "col2im_1d_f16",  col2im_1d_f16_len,  col2im_1d_f16_data,  "main", 2, sizeof(vk_op_col2im_1d_push_constants), {256, 1, 1}, {}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_col2im_1d_bf16, "col2im_1d_bf16", col2im_1d_bf16_len, col2im_1d_bf16_data, "main", 2, sizeof(vk_op_col2im_1d_push_constants), {256, 1, 1}, {}, 1, true);
 
-    ggml_vk_create_pipeline(device, device->pipeline_out_prod_f32, "out_prod_f32", out_prod_f32_len, out_prod_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {256, 1, 1}, {}, 1);
+    // retro delta: the out_prod shaders compute a BM=64 x BN=16 dst tile per
+    // workgroup (see out_prod.comp), so the workgroup denominators must match the
+    // tile, not the 256-thread local size.
+    ggml_vk_create_pipeline(device, device->pipeline_out_prod_f32, "out_prod_f32", out_prod_f32_len, out_prod_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {64, 16, 1}, {}, 1);
 #define CREATE_OUT_PROD_QUANT(TYPE, NAMELC) \
-    ggml_vk_create_pipeline(device, device->pipeline_out_prod_quant_f32[TYPE], "out_prod_" #NAMELC "_f32", out_prod_ ## NAMELC ## _f32_len, out_prod_ ## NAMELC ## _f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_out_prod_quant_f32[TYPE], "out_prod_" #NAMELC "_f32", out_prod_ ## NAMELC ## _f32_len, out_prod_ ## NAMELC ## _f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {64, 16, 1}, {}, 1);
     CREATE_OUT_PROD_QUANT(GGML_TYPE_Q4_0, q4_0)
     CREATE_OUT_PROD_QUANT(GGML_TYPE_Q4_1, q4_1)
     CREATE_OUT_PROD_QUANT(GGML_TYPE_Q5_0, q5_0)
@@ -3812,12 +3815,17 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_back_f32, "ssm_conv_back_f32", ssm_conv_back_f32_len, ssm_conv_back_f32_data, "main", 4, sizeof(vk_op_ssm_conv_back_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_conv_rs_gather_f32, "conv_rs_gather_f32", conv_rs_gather_f32_len, conv_rs_gather_f32_data, "main", 2, sizeof(vk_op_conv_rs_gather_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_back_ckpt_f32, "ssm_scan_back_ckpt_f32", ssm_scan_back_ckpt_f32_len, ssm_scan_back_ckpt_f32_data, "main", 9, sizeof(vk_op_ssm_scan_back_push_constants), {256, 1, 1}, {}, 1);
     if (device->buffer_float32_atomic_add) {
         ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_back_grad_f32, "ssm_scan_back_grad_f32", ssm_scan_back_grad_f32_len, ssm_scan_back_grad_f32_data, "main", 12, sizeof(vk_op_ssm_scan_back_push_constants), {256, 1, 1}, {}, 1);
         // retro delta: analytic backward for GATED_DELTA_NET; also needs buffer F32 atomic add (shared grad_q/grad_k scatter).
-        ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_back_f32, "gated_delta_net_back_f32", gated_delta_net_back_f32_len, gated_delta_net_back_f32_data, "main", 9, sizeof(vk_op_gated_delta_net_back_push_constants), {32, 1, 1}, {}, 1);
+        // One workgroup of 256 per (head, sequence); the in-workgroup reductions
+        // use subgroupAdd, so full subgroups are required.
+        if (device->subgroup_basic && device->subgroup_arithmetic && device->subgroup_require_full_support) {
+            ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_back_f32, "gated_delta_net_back_f32", gated_delta_net_back_f32_len, gated_delta_net_back_f32_data, "main", 9, sizeof(vk_op_gated_delta_net_back_push_constants), {256, 1, 1}, {}, 1, false, true);
             ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_back_chunked_f32, "gated_delta_net_back_chunked_f32", gated_delta_net_back_chunked_f32_len, gated_delta_net_back_chunked_f32_data, "main", 9, sizeof(vk_op_gated_delta_net_back_push_constants), {256, 1, 1}, {}, 1, false, true);
+        }
     }
 
     // retro delta: fused sparse cross-entropy. One
@@ -9434,6 +9442,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_ssm_conv_back_f32;
         }
         return nullptr;
+    case GGML_OP_CONV_RS_GATHER:
+        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_conv_rs_gather_f32;
+        }
+        return nullptr;
     case GGML_OP_SSM_SCAN_BACK:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_ssm_scan_back_grad_f32;
@@ -9710,6 +9723,16 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
                 elements = { nr, 1, 1 };
             }
         } break;
+    case GGML_OP_OUT_PROD:
+        // retro delta: one BM=64 x BN=16 output tile per workgroup; local_size_x
+        // remains 256 and each thread accumulates TM=4 dst rows. The tile is tall
+        // and thin because dst is ne00 x n_tokens and n_tokens is the ubatch.
+        elements = {
+            (uint32_t)dst->ne[0],
+            (uint32_t)dst->ne[1],
+            (uint32_t)(dst->ne[2] * dst->ne[3]),
+        };
+        break;
     case GGML_OP_SOLVE_TRI:
         {
             uint32_t nr = (uint32_t)(ne02 * ne03);
@@ -9876,7 +9899,6 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     case GGML_OP_DIV:
     case GGML_OP_MUL:
     case GGML_OP_ADD1:
-    case GGML_OP_OUT_PROD:
     case GGML_OP_ARANGE:
     case GGML_OP_FILL:
     case GGML_OP_SCALE:
@@ -9979,9 +10001,10 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             elements = { nr, n_t, n_s };
         }
         break;
+    case GGML_OP_CONV_RS_GATHER:
     case GGML_OP_SSM_CONV_BACK:
         {
-            // one thread per packed-output element ([grad_sx | grad_c])
+            // one thread per output element
             const uint32_t total = (uint32_t)ggml_nelements(dst);
             if (total > 262144) {
                 elements = { 512, 512, CEIL_DIV(total, 262144) };
@@ -10864,6 +10887,23 @@ static void ggml_vk_ssm_conv_back(ggml_backend_vk_context * ctx, vk_context& sub
         (uint32_t)(src1->nb[0] / sizeof(float)), (uint32_t)(src1->nb[1] / sizeof(float)),
         (uint32_t)(src2->nb[0] / sizeof(float)), (uint32_t)(src2->nb[1] / sizeof(float)), (uint32_t)(src2->nb[2] / sizeof(float)),
         n_sx,
+    });
+}
+
+// retro delta: recurrent-state rollback snapshot gather (conv_rs_gather.comp).
+// One thread per output element; see the shader header for the slot layout.
+static void ggml_vk_conv_rs_gather(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
+    const uint32_t kernel_m1  = (uint32_t)ggml_get_op_params_i32(dst, 0);
+    const uint32_t K          = (uint32_t)ggml_get_op_params_i32(dst, 1);
+    const uint32_t n_channels = (uint32_t)src0->ne[1];
+    const uint32_t n_seqs     = (uint32_t)src0->ne[2];
+    const uint32_t base       = (uint32_t)(src0->ne[0] - (int64_t)kernel_m1);
+
+    ggml_vk_op_f32<vk_op_conv_rs_gather_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_CONV_RS_GATHER, {
+        kernel_m1, n_channels, n_seqs, K,
+        base,
+        (uint32_t)(src0->nb[0] / sizeof(float)), (uint32_t)(src0->nb[1] / sizeof(float)), (uint32_t)(src0->nb[2] / sizeof(float)),
+        (uint32_t)ggml_nelements(dst),
     });
 }
 
@@ -13418,6 +13458,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
 
+    case GGML_OP_CONV_RS_GATHER:
+        ggml_vk_conv_rs_gather(ctx, compute_ctx, src0, node);
+
+        break;
+
     case GGML_OP_SSM_SCAN_BACK:
         ggml_vk_ssm_scan_back(ctx, compute_ctx, node);
 
@@ -15441,6 +15486,25 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     UNUSED(backend);
 }
+// retro delta: the prealloc_* buffers are the Vulkan equivalent of the CUDA pool —
+// per-context scratch for dequantization, split-k accumulation and the training
+// kernels' staging, owned by the backend and absent from every
+// ggml_backend_buffer. They are only ever reallocated larger (see
+// ggml_vk_preallocate_buffers), so the live sizes are already the high-water mark.
+// sync_staging is deliberately excluded: it is host-visible transfer memory, not
+// part of the device budget this reports on.
+static size_t ggml_backend_vk_get_scratch_bytes(ggml_backend_t backend) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    size_t total = 0;
+    for (const vk_buffer & buffer : { ctx->prealloc_x, ctx->prealloc_y,
+                                      ctx->prealloc_split_k, ctx->prealloc_add_rms_partials }) {
+        if (buffer != nullptr) {
+            total += buffer->size;
+        }
+    }
+    return total;
+}
+
 
 void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, struct ggml_backend_graph_optimize_params * params)
 {
@@ -15896,6 +15960,7 @@ static ggml_backend_i ggml_backend_vk_interface = {
     /* .event_record            = */ ggml_backend_vk_event_record,
     /* .event_wait              = */ ggml_backend_vk_event_wait,
     /* .graph_optimize          = */ ggml_vk_graph_optimize,
+    /* .get_scratch_bytes       = */ ggml_backend_vk_get_scratch_bytes, // retro delta
 };
 
 static ggml_guid_t ggml_backend_vk_guid() {
@@ -16732,9 +16797,17 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_GATED_DELTA_NET_BACK:
             {
-                // retro delta: reference kernel (gated_delta_net_back.comp).
-                // Needs buffer F32 atomic add for the shared grad_q/grad_k scatter.
-                if (!device->buffer_float32_atomic_add) {
+                // retro delta: gated_delta_net_back.comp. Needs buffer F32 atomic
+                // add for the shared grad_q/grad_k scatter, and full subgroups for
+                // the in-workgroup reductions.
+                if (!device->buffer_float32_atomic_add ||
+                    !device->subgroup_basic || !device->subgroup_arithmetic ||
+                    !device->subgroup_require_full_support) {
+                    return false;
+                }
+                // The shader's nine per-token vectors are shared memory, sized at
+                // compile time by GDN_S_V_MAX. Wider heads fall back to the CPU.
+                if (op->src[2] == nullptr || op->src[2]->ne[0] > 256) {
                     return false;
                 }
                 for (int i = 0; i < 7; i++) {
@@ -16793,6 +16866,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 && op->src[0]->type == GGML_TYPE_F32
                 && op->src[1]->type == GGML_TYPE_F32
                 && op->src[2]->type == GGML_TYPE_F32;
+        case GGML_OP_CONV_RS_GATHER:
+            // retro delta: recurrent-state rollback snapshot gather.
+            return op->type == GGML_TYPE_F32
+                && op->src[0]->type == GGML_TYPE_F32
+                && ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_SSM_SCAN_BACK:
             {
                 // needs buffer F32 atomic add for the gradient scatter

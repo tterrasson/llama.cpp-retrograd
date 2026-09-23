@@ -755,6 +755,14 @@ struct vk_op_ssm_conv_back_push_constants {
     uint32_t n_sx;
 };
 
+// retro delta: recurrent-state rollback snapshot gather (conv_rs_gather.comp).
+struct vk_op_conv_rs_gather_push_constants {
+    uint32_t kernel_m1, n_channels, n_seqs, K;
+    uint32_t base;
+    uint32_t nb00, nb01, nb02;
+    uint32_t total;
+};
+
 // retro delta: fused sparse cross-entropy.
 struct vk_op_fused_sparse_ce_push_constants {
     uint32_t n_embd;

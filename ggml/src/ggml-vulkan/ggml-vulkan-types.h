@@ -1021,6 +1021,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_ssm_conv_back_f32;
+    vk_pipeline pipeline_conv_rs_gather_f32;
     vk_pipeline pipeline_ssm_scan_back_ckpt_f32;
     vk_pipeline pipeline_ssm_scan_back_grad_f32;
     vk_pipeline pipeline_ssm_conv_silu_f32;

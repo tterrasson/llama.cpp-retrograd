@@ -1949,9 +1949,23 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return true;
         case GGML_OP_GATED_DELTA_NET:
             return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
+        case GGML_OP_CONV_RS_GATHER:
+            // retro delta: recurrent-state rollback snapshot gather.
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_GATED_DELTA_NET_BACK:
-            // retro delta: reference kernel (kernel_gated_delta_net_back_f32),
-            // contiguous F32 inputs (see ggml_gated_delta_net_back's asserts).
+            // retro delta: kernel_gated_delta_net_back_f32, contiguous F32
+            // inputs (see ggml_gated_delta_net_back's asserts). The in-threadgroup
+            // reductions use simd_sum.
+            if (!has_simdgroup_reduction) {
+                return false;
+            }
+            // Nine per-token vectors of S_v live in threadgroup memory. Cap S_v
+            // so the request stays well inside the 32 KiB a threadgroup gets.
+            if (op->src[2] == NULL || op->src[2]->ne[0] > 512) {
+                return false;
+            }
             for (int i = 0; i < 7; i++) {
                 if (op->src[i] == NULL || op->src[i]->type != GGML_TYPE_F32) {
                     return false;

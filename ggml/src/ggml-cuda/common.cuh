@@ -1200,6 +1200,13 @@ struct ggml_cuda_pool {
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
+
+    // retro delta: high-water mark, in device bytes, of what this pool has held at
+    // once — handed out plus cached for reuse. A high-water rather than the live
+    // value because the pool is the only home of scratch that no
+    // ggml_backend_buffer accounts for, and an OOM retry flushes the cache, which
+    // would otherwise erase the very peak the caller is looking for.
+    virtual size_t reserved_bytes() const { return 0; }
 };
 
 template<typename T>
@@ -1560,6 +1567,21 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_pool & pool() {
         return pool(device);
+    }
+
+    // retro delta: pool bytes across every device/stream this context has touched.
+    // Summed over all streams because a training step and a generation decode can
+    // sit on different ones, and the caller wants the context's total footprint.
+    size_t pool_reserved_bytes() const {
+        size_t total = 0;
+        for (const auto & per_device : pools) {
+            for (const auto & pool : per_device) {
+                if (pool) {
+                    total += pool->reserved_bytes();
+                }
+            }
+        }
+        return total;
     }
 };
 

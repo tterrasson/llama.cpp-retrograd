@@ -205,6 +205,12 @@ struct llama_context {
 
     llama_opt_timing opt_timing_get() const { return opt_timing; }
 
+    // retro delta: see llama_opt_memory. opt_memory_sample() reads the device
+    // budget and the backends' scratch and folds both into the high-water marks;
+    // it is called at the points inside a step where the peak actually occurs.
+    llama_opt_memory opt_memory_get() const { return opt_memory; }
+    void opt_memory_sample();
+
     // TODO: more flexible combinations of logical/physical batch size and context size
     // retro delta: label_weights optionally scales each label position's loss
     // contribution (dataset layout, nullable = all ones).
@@ -402,6 +408,7 @@ private:
     void * opt_label_storage = nullptr;
     std::vector<size_t> opt_active_label_offsets;
     llama_opt_timing opt_timing = {};
+    llama_opt_memory opt_memory = {}; // retro delta
 
     // retro delta: fused sparse cross-entropy for the packed step.
     bool    opt_fused_ce = false;
@@ -411,6 +418,8 @@ private:
     bool    opt_ce_offload_logsoftmax = false;
     bool    opt_gradient_checkpointing = false;
     uint32_t opt_checkpoint_every_n_layers = 1;
+    // retro delta: GGML_TYPE_COUNT keeps checkpoints as built (bit-exact default).
+    enum ggml_type opt_checkpoint_type = GGML_TYPE_COUNT;
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;
