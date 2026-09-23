@@ -765,6 +765,8 @@ struct vk_device_struct {
     bool subgroup_size_control;
     uint32_t subgroup_min_size;
     uint32_t subgroup_max_size;
+    // retro delta: a 32-wide subgroup is available to the Flash Attention backward
+    // shaders, natively or through VK_EXT_subgroup_size_control. See where it is set.
     bool fa_back_subgroup32;
     bool subgroup_require_full_support;
 
@@ -1019,6 +1021,12 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_scan_back_grad_f32;
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
+    // retro delta: fused sparse cross-entropy.
+    vk_pipeline pipeline_fused_sparse_ce_count;
+    // Indexed by the head's ggml_type; null for types without a compiled variant
+    // (or when the device lacks the needed features). supports_op gates on null.
+    vk_pipeline pipeline_fused_sparse_ce[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_fused_sparse_ce_back[GGML_TYPE_COUNT];
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_adamw_f16;
     vk_pipeline pipeline_opt_step_sgd_f32;

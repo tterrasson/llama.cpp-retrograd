@@ -27,6 +27,7 @@
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/flash-attn-back.cuh"
+#include "ggml-cuda/fused-sparse-ce.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -2405,6 +2406,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
             ggml_cuda_cross_entropy_loss_back(ctx, dst);
+            break;
+        case GGML_OP_FUSED_SPARSE_CE:
+            ggml_cuda_fused_sparse_ce(ctx, dst);
+            break;
+        case GGML_OP_FUSED_SPARSE_CE_BACK:
+            ggml_cuda_fused_sparse_ce_back(ctx, dst);
             break;
         case GGML_OP_OPT_STEP_ADAMW:
             ggml_cuda_opt_step_adamw(ctx, dst);
@@ -5680,6 +5687,54 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_DIAG:
         case GGML_OP_SOLVE_TRI:
             return true;
+        case GGML_OP_FUSED_SPARSE_CE:
+        case GGML_OP_FUSED_SPARSE_CE_BACK: {
+            // retro delta: correctness-first CUDA fused vocabulary CE.  Keep
+            // this contract narrower than the conversion layer: every accepted
+            // head type is covered by parity tests and has a to-F32 CUDA path.
+            const bool back = op->op == GGML_OP_FUSED_SPARSE_CE_BACK;
+            const ggml_tensor * grad    = back ? op->src[0] : nullptr;
+            const ggml_tensor * h       = back ? op->src[1] : op->src[0];
+            const ggml_tensor * w       = back ? op->src[2] : op->src[1];
+            const ggml_tensor * targets = back ? op->src[3] : op->src[2];
+            const ggml_tensor * weights = back ? op->src[4] : op->src[3];
+            const ggml_tensor * bias    = back ? op->src[5] : op->src[4]; // retro delta: optional [n_vocab] F32 bias
+            if (!h || !w || !targets || !weights ||
+                    (back && (!grad || grad->type != GGML_TYPE_F32)) ||
+                    h->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
+                    targets->type != GGML_TYPE_I32 || weights->type != GGML_TYPE_F32 ||
+                    w->ne[0] != h->ne[0] ||
+                    // retro delta: targets/weights are
+                    // [K, n_tokens], K in 1..GGML_FUSED_SPARSE_CE_K_MAX.
+                    targets->ne[1] != h->ne[1] || weights->ne[1] != h->ne[1] ||
+                    targets->ne[0] != weights->ne[0] || targets->ne[0] < 1 ||
+                    targets->ne[0] > GGML_FUSED_SPARSE_CE_K_MAX ||
+                    !ggml_is_contiguous(h) ||
+                    !ggml_is_contiguous(w) || !ggml_is_contiguous(targets) ||
+                    !ggml_is_contiguous(weights) || !ggml_is_contiguous(op) ||
+                    (bias && (bias->type != GGML_TYPE_F32 || bias->ne[0] != w->ne[1] ||
+                            !ggml_is_contiguous(bias))) ||
+                    (back && h->ne[0] > 8192)) {
+                return false;
+            }
+            switch (w->type) {
+                case GGML_TYPE_F32:
+                case GGML_TYPE_F16:
+                case GGML_TYPE_Q4_0:
+                case GGML_TYPE_Q4_1:
+                case GGML_TYPE_Q5_0:
+                case GGML_TYPE_Q5_1:
+                case GGML_TYPE_Q8_0:
+                case GGML_TYPE_Q2_K:
+                case GGML_TYPE_Q3_K:
+                case GGML_TYPE_Q4_K:
+                case GGML_TYPE_Q5_K:
+                case GGML_TYPE_Q6_K:
+                    return w->ne[0] % ggml_blck_size(w->type) == 0;
+                default:
+                    return false;
+            }
+        }
         case GGML_OP_OPT_STEP_ADAMW:
             // retro delta: F32 parameters, or F16 parameters with F32 moments and
             // the fork's stochastic-rounding store (opt-step-adamw.cu). Gradient

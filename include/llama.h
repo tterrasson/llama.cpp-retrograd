@@ -1723,6 +1723,22 @@ extern "C" {
         void * get_opt_pars_ud;                     // userdata for calculating optimizer parameters
 
         enum ggml_opt_optimizer_type optimizer_type;
+
+        // retro delta: fuse the output projection with the cross-entropy
+        // in the packed optimizer step so the full [n_vocab, n_tokens] logits are
+        // never materialized. n_ce_tiles is the vocabulary tile count C (>= 1).
+        bool    fused_sparse_ce;
+        int32_t n_ce_tiles;
+        // retro delta: flattened (batch x seq) token
+        // chunk size for the fused CE. 0 processes all tokens at once (unchanged);
+        // > 0 bounds the tiled logits intermediate to n_ce_seq_chunk tokens,
+        // capping peak footprint independently of the sequence length.
+        int32_t n_ce_seq_chunk;
+        // retro delta: let the fused CE backward write
+        // grad_h over the hidden states instead of into a second [n_embd, n_tokens]
+        // buffer, evicting one token chunk at a time. Numerically inert. Requires
+        // n_ce_seq_chunk > 0 to bound anything; ignored (with a warning) otherwise.
+        bool    ce_offload_logsoftmax;
     };
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
@@ -1731,6 +1747,24 @@ extern "C" {
     // Exposed so a training checkpoint can read and restore the optimizer
     // state (iteration counter, AdamW momenta, RNG) through the ggml-opt API.
     LLAMA_API ggml_opt_context_t llama_opt_context(struct llama_context * lctx);
+
+    // retro delta: a sparse target *distribution* per
+    // position, for offline top-k knowledge distillation. `ids` and `weights`
+    // are laid out [n_topk, n_positions]: entry j of position p is at
+    // p*n_topk + j. An entry with a negative id or a zero weight is skipped, and
+    // a position all of whose entries are skipped is masked exactly as a
+    // negative scalar label masks one. The weights are the teacher's
+    // renormalized probabilities, already scaled by whatever coefficient the
+    // position carries.
+    //
+    // Passing NULL (or ids/weights NULL) keeps the scalar labels of the call,
+    // and the run is then bit for bit the one that ran before this existed.
+    // n_topk must not exceed GGML_FUSED_SPARSE_CE_K_MAX.
+    typedef struct llama_opt_topk_labels {
+        const llama_token * ids;
+        const float       * weights;
+        uint32_t            n_topk;
+    } llama_opt_topk_labels;
 
     LLAMA_API void llama_opt_epoch(
             struct llama_context    * lctx,
@@ -1755,7 +1789,8 @@ extern "C" {
             int64_t                   idata_split,
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval,
-            const float             * label_weights);
+            const float             * label_weights,
+            const struct llama_opt_topk_labels * topk);
 
     // retro delta: one differentiable packed multi-sequence training graph.
     // Sequence membership is CSR, allowing several independent prompt groups
@@ -1767,6 +1802,7 @@ extern "C" {
             const llama_token       * tokens,
             const llama_token       * labels,
             const float             * label_weights,
+            const struct llama_opt_topk_labels * topk,
             const llama_pos         * positions,
             const size_t            * seq_offsets,
             const llama_seq_id      * seq_ids,

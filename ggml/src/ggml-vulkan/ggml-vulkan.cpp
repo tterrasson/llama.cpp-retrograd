@@ -241,6 +241,24 @@ uint64_t ggml_vk_get_node_flops(const ggml_tensor * node) {
         const ggml_tensor * v = node->src[2];
         return 2ull * q->ne[1] * q->ne[2] * (k->ne[0] + v->ne[0]) * k->ne[1] * q->ne[3];
     }
+    // retro delta: the fused sparse cross-entropy walks the whole projection
+    // head per token without ever materializing a logit, so its cost is a GEMM's
+    // and its node count is one. Reporting zero here (the default for an op this
+    // function does not know) keeps `batch_flops` flat, and the caller's
+    // flops-based submit heuristic then packs a graph's worth of them into a
+    // single submission -- seconds of GPU work, past what a driver watchdog
+    // allows. The backward makes three passes over the vocabulary where the
+    // forward makes one (logsumexp, softmax weights, weighted accumulation).
+    if (node->op == GGML_OP_FUSED_SPARSE_CE || node->op == GGML_OP_FUSED_SPARSE_CE_BACK) {
+        const bool back = node->op == GGML_OP_FUSED_SPARSE_CE_BACK;
+        const ggml_tensor * h = back ? node->src[1] : node->src[0];
+        const ggml_tensor * w = back ? node->src[2] : node->src[1];
+        if (!h || !w) {
+            return 0;
+        }
+        const uint64_t passes = back ? 3 : 1;
+        return passes * 2ull * (uint64_t) h->ne[0] * (uint64_t) w->ne[1] * (uint64_t) h->ne[1];
+    }
     return 0;
 }
 void ggml_vk_print_node_list(const ggml_cgraph * cgraph, int start, int end) {
@@ -3797,6 +3815,38 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_back_grad_f32, "ssm_scan_back_grad_f32", ssm_scan_back_grad_f32_len, ssm_scan_back_grad_f32_data, "main", 12, sizeof(vk_op_ssm_scan_back_push_constants), {256, 1, 1}, {}, 1);
     }
 
+    // retro delta: fused sparse cross-entropy. One
+    // workgroup per token; wg_denoms {1,1,1} so the dispatch element count is the
+    // token count itself. A single generic shader per direction is compiled once
+    // per head type (the head is dequantized via dequant_funcs.glsl), so adding a
+    // type is one CREATE line below plus one entry in vulkan-shaders-gen.cpp.
+    // The forward atomically sums into the scalar loss, so it needs buffer F32
+    // atomic add; the quantized/F16 heads declare a float16_t buffer, so they
+    // need fp16. Missing features simply leave those pipelines null and
+    // supports_op falls the op back to CPU.
+    ggml_vk_create_pipeline(device, device->pipeline_fused_sparse_ce_count, "fused_sparse_ce_count", fused_sparse_ce_count_len, fused_sparse_ce_count_data, "main", 3, sizeof(vk_op_fused_sparse_ce_push_constants), {256, 1, 1}, {}, 1);
+#define CREATE_FUSED_SPARSE_CE(ENUM, NAME) \
+    ggml_vk_create_pipeline(device, device->pipeline_fused_sparse_ce_back[ENUM], "fused_sparse_ce_back_" #NAME, fused_sparse_ce_back_##NAME##_len, fused_sparse_ce_back_##NAME##_data, "main", 8, sizeof(vk_op_fused_sparse_ce_push_constants), {1, 1, 1}, {}, 1); \
+    if (device->buffer_float32_atomic_add) { \
+        ggml_vk_create_pipeline(device, device->pipeline_fused_sparse_ce[ENUM], "fused_sparse_ce_" #NAME, fused_sparse_ce_##NAME##_len, fused_sparse_ce_##NAME##_data, "main", 7, sizeof(vk_op_fused_sparse_ce_push_constants), {1, 1, 1}, {}, 1); \
+    }
+    CREATE_FUSED_SPARSE_CE(GGML_TYPE_F32, f32);
+    if (device->fp16) {
+        // Quantized/F16 heads read float16_t scales, hence the fp16 guard.
+        CREATE_FUSED_SPARSE_CE(GGML_TYPE_F16,  f16);
+        CREATE_FUSED_SPARSE_CE(GGML_TYPE_Q4_0, q4_0);
+        CREATE_FUSED_SPARSE_CE(GGML_TYPE_Q4_1, q4_1);
+        CREATE_FUSED_SPARSE_CE(GGML_TYPE_Q5_0, q5_0);
+        CREATE_FUSED_SPARSE_CE(GGML_TYPE_Q5_1, q5_1);
+        CREATE_FUSED_SPARSE_CE(GGML_TYPE_Q8_0, q8_0);
+        CREATE_FUSED_SPARSE_CE(GGML_TYPE_Q2_K, q2_k);
+        CREATE_FUSED_SPARSE_CE(GGML_TYPE_Q3_K, q3_k);
+        CREATE_FUSED_SPARSE_CE(GGML_TYPE_Q4_K, q4_k);
+        CREATE_FUSED_SPARSE_CE(GGML_TYPE_Q5_K, q5_k);
+        CREATE_FUSED_SPARSE_CE(GGML_TYPE_Q6_K, q6_k);
+    }
+#undef CREATE_FUSED_SPARSE_CE
+
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
     // The F16 variant declares a float16_t storage buffer, so it needs
     // VK_KHR_16bit_storage. Creating it unconditionally would fail here on a
@@ -4610,9 +4660,20 @@ vk_device ggml_vk_get_device(size_t idx) {
 
         device->subgroup_require_full_support = subgroup_size_control_features.computeFullSubgroups;
 
+        // retro delta: the differentiable Flash Attention backward shaders assume a
+        // 32-wide subgroup (one subgroup per query row, `local_size_x = 32`). A
+        // device whose native subgroup is 32 satisfies that outright; otherwise the
+        // pipelines can *ask* for 32 through VK_EXT_subgroup_size_control, which is
+        // what unblocks AMD in wave64 — there the native subgroup is 64 but 32 is
+        // selectable, and without this the whole backward fell back to the CPU.
+        // A device that can neither report 32 nor
+        // select it keeps the fallback, and its FA-back pipelines are not created at
+        // all: requesting an unsupported size asserts inside ggml_vk_create_pipeline.
+        // Not qualifiable on this project's hardware — no wave64 GPU is accessible.
         device->fa_back_subgroup32 = device->subgroup_size == 32 ||
                 (device->subgroup_size_control &&
                  device->subgroup_min_size <= 32 && 32 <= device->subgroup_max_size);
+
 #if defined(VK_KHR_cooperative_matrix)
         device->coopmat_support = device->coopmat_support && coopmat_features.cooperativeMatrix;
         device->coopmat1_fa_support = device->coopmat_support && device->subgroup_require_full_support;
@@ -10659,6 +10720,133 @@ static void ggml_vk_ssm_conv_back(ggml_backend_vk_context * ctx, vk_context& sub
     });
 }
 
+// retro delta: fused sparse cross-entropy.
+// Both the forward loss and the backward gradient normalize by the number of
+// active tokens; a small count pre-pass computes it on device into a scratch
+// buffer so the semantics match the CPU oracle without any host readback.
+static vk_pipeline ggml_vk_fused_sparse_ce_pipeline(ggml_backend_vk_context * ctx, ggml_type w_type, bool back) {
+    if (w_type < 0 || w_type >= GGML_TYPE_COUNT) {
+        return nullptr;
+    }
+    return back ? ctx->device->pipeline_fused_sparse_ce_back[w_type]
+                : ctx->device->pipeline_fused_sparse_ce[w_type];
+}
+
+static vk_subbuffer ggml_vk_fused_sparse_ce_count(ggml_backend_vk_context * ctx, vk_context& subctx,
+        const ggml_tensor * targets, const ggml_tensor * weights,
+        const vk_op_fused_sparse_ce_push_constants & pc) {
+    // A single uint counter lives in the split_k scratch buffer.
+    const size_t count_bytes = 256; // rounded up for alignment
+    if (ctx->prealloc_size_split_k < count_bytes) {
+        ctx->prealloc_size_split_k = count_bytes;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    if (ctx->prealloc_split_k_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+    const vk_subbuffer count_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k);
+
+    vk_pipeline pipeline = ctx->device->pipeline_fused_sparse_ce_count;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    // Must be a command-buffer fill, not a deferred host memset: the forward and
+    // the backward each clear this counter, and on a UMA device a host memset would
+    // land before *both* count dispatches instead of between them -- the second
+    // consumer then divides by 2*n_active and its gradient comes out halved.
+    ggml_vk_buffer_fill_cmd(subctx, ctx->prealloc_split_k, 0, 0, count_bytes);
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, targets), ggml_vk_tensor_subbuffer(ctx, weights), count_buf },
+        pc, { pc.n_tokens, 1, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    ctx->prealloc_split_k_need_sync = true;
+    return count_buf;
+}
+
+static void ggml_vk_fused_sparse_ce(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * h       = dst->src[0]; // [n_embd, n_tokens] F32
+    const ggml_tensor * w       = dst->src[1]; // [n_embd, n_vocab]  F32/F16/Q8_0
+    const ggml_tensor * targets = dst->src[2]; // [K, n_tokens] I32
+    const ggml_tensor * weights = dst->src[3]; // [K, n_tokens] F32
+    const ggml_tensor * bias    = dst->src[4]; // [n_vocab] F32, may be null
+
+    GGML_ASSERT(dst->buffer != nullptr);
+    GGML_ASSERT(ggml_is_contiguous(w));
+
+    const vk_op_fused_sparse_ce_push_constants pc = {
+        (uint32_t) h->ne[0],
+        (uint32_t) h->ne[1],
+        (uint32_t) w->ne[1],
+        (uint32_t) (h->nb[1] / sizeof(float)),
+        0,
+        bias != nullptr ? 1u : 0u,
+        ggml_vk_fused_sparse_ce_tile((uint32_t) h->ne[0]),
+        (uint32_t) targets->ne[0], // retro delta
+    };
+
+    const vk_subbuffer count_buf = ggml_vk_fused_sparse_ce_count(ctx, subctx, targets, weights, pc);
+
+    vk_pipeline pipeline = ggml_vk_fused_sparse_ce_pipeline(ctx, w->type, false);
+    GGML_ASSERT(pipeline != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+    // The loss is accumulated with atomic adds, so start from zero. A
+    // command-buffer fill rather than a deferred host memset: gallocr may hand this
+    // scalar a buffer region an earlier node of the same graph still writes to, and
+    // on a UMA device a host memset would land before that write instead of after.
+    ggml_vk_buffer_fill_cmd(subctx, dst_buf.buffer, dst_buf.offset, 0, dst_buf.size);
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    // The bias binding must exist even when the head has none: bind the weights as
+    // a harmless stand-in and let has_bias keep the shader from reading it.
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, h), ggml_vk_tensor_subbuffer(ctx, w),
+          ggml_vk_tensor_subbuffer(ctx, targets), ggml_vk_tensor_subbuffer(ctx, weights),
+          count_buf, dst_buf, ggml_vk_tensor_subbuffer(ctx, bias ? bias : weights) },
+        pc, { (pc.n_tokens + pc.n_tok - 1) / pc.n_tok, 1, 1 });
+}
+
+static void ggml_vk_fused_sparse_ce_back(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * grad    = dst->src[0]; // scalar
+    const ggml_tensor * h       = dst->src[1]; // [n_embd, n_tokens] F32
+    const ggml_tensor * w       = dst->src[2]; // [n_embd, n_vocab]  F32/F16/Q8_0
+    const ggml_tensor * targets = dst->src[3]; // [K, n_tokens] I32
+    const ggml_tensor * weights = dst->src[4]; // [K, n_tokens] F32
+    const ggml_tensor * bias    = dst->src[5]; // [n_vocab] F32, may be null
+
+    GGML_ASSERT(dst->buffer != nullptr);
+    GGML_ASSERT(ggml_is_contiguous(w));
+
+    const vk_op_fused_sparse_ce_push_constants pc = {
+        (uint32_t) h->ne[0],
+        (uint32_t) h->ne[1],
+        (uint32_t) w->ne[1],
+        (uint32_t) (h->nb[1] / sizeof(float)),
+        (uint32_t) (dst->nb[1] / sizeof(float)),
+        bias != nullptr ? 1u : 0u,
+        ggml_vk_fused_sparse_ce_tile((uint32_t) h->ne[0]),
+        (uint32_t) targets->ne[0], // retro delta
+    };
+
+    const vk_subbuffer count_buf = ggml_vk_fused_sparse_ce_count(ctx, subctx, targets, weights, pc);
+
+    vk_pipeline pipeline = ggml_vk_fused_sparse_ce_pipeline(ctx, w->type, true);
+    GGML_ASSERT(pipeline != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    // See the forward for why a null bias still gets a binding.
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, grad), ggml_vk_tensor_subbuffer(ctx, h),
+          ggml_vk_tensor_subbuffer(ctx, w), ggml_vk_tensor_subbuffer(ctx, targets),
+          ggml_vk_tensor_subbuffer(ctx, weights), count_buf,
+          ggml_vk_tensor_subbuffer(ctx, dst),
+          ggml_vk_tensor_subbuffer(ctx, bias ? bias : weights) },
+        pc, { (pc.n_tokens + pc.n_tok - 1) / pc.n_tok, 1, 1 });
+}
+
 void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * conv = cgraph->nodes[node_idx];
     const ggml_tensor * src0 = conv->src[0];
@@ -11907,6 +12095,11 @@ void ggml_vk_cross_entropy_loss(ggml_backend_vk_context * ctx, vk_context& subct
     const uint32_t nclasses = (uint32_t)src0->ne[0];
     const uint32_t nrows    = (uint32_t)ggml_nrows(src0);
 
+    // retro delta: nactive follows the same host-side convention as the backward
+    // -- op_params[1] flags an explicit count in op_params[0], else every row
+    // counts, which is upstream's behaviour.
+    const uint32_t nactive = dst->op_params[1] ? (uint32_t) dst->op_params[0] : nrows;
+
     vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, src0, src1, nullptr, dst, GGML_OP_CROSS_ENTROPY_LOSS);
     GGML_ASSERT(pipeline != nullptr);
 
@@ -11917,7 +12110,7 @@ void ggml_vk_cross_entropy_loss(ggml_backend_vk_context * ctx, vk_context& subct
     vk_subbuffer src1_buf = ggml_vk_tensor_subbuffer(ctx, src1);
     vk_subbuffer dst_buf  = ggml_vk_tensor_subbuffer(ctx, dst, true);
 
-    const vk_op_push_constants pc = { nclasses, nrows, 0.0f, 0.0f, 0.0f, 0.0f };
+    const vk_op_push_constants pc = { nclasses, nrows, (float) nactive, 0.0f, 0.0f, 0.0f };
 
     const size_t tmp_size = (size_t)nrows * sizeof(float);
     if (ctx->prealloc_size_x < tmp_size) {
@@ -13065,6 +13258,16 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
     case GGML_OP_SSM_SCAN_BACK:
         ggml_vk_ssm_scan_back(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_FUSED_SPARSE_CE:
+        ggml_vk_fused_sparse_ce(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_FUSED_SPARSE_CE_BACK:
+        ggml_vk_fused_sparse_ce_back(ctx, compute_ctx, node);
 
         break;
 
@@ -14663,7 +14866,22 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             flops_cap = 2'000'000'000ULL * ctx->device->shader_core_count;
         }
     }
-    uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
+    // retro delta: Metal aborts a command buffer that runs too long, and a
+    // training graph reaches that on its own -- the fused cross-entropy alone is
+    // tens of GFLOP per node. Same shape as the AMD case above, with a cap
+    // measured on an M1: a submission of ~1.6 s of this work survived and ~3 s
+    // did not, and 50 GFLOP is comfortably inside that for the slowest kernel
+    // here (the dequantizing CE, ~85 GFLOP/s) without splitting a plain
+    // matmul-bound graph more than a handful of times.
+    if (ctx->device->driver_id == vk::DriverId::eMoltenvk) {
+        flops_cap = std::min(flops_cap, 50'000'000'000ULL);
+    }
+    // The scaled-down budget is only known once a graph has been costed. Until
+    // then, cap rather than disable the heuristic: the first graph of a run is
+    // also the one whose submissions nothing has bounded yet.
+    uint64_t flops_per_submit = ctx->last_total_flops != 0
+            ? std::min(flops_cap, ctx->last_total_flops / 40u)
+            : flops_cap;
 
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
@@ -15890,6 +16108,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_FLASH_ATTN_BACK:
             {
+                // retro delta: a 32-wide subgroup, native or requested through
+                // VK_EXT_subgroup_size_control. Gating on the native size alone used
+                // to send the entire backward to the CPU on AMD in wave64.
                 if (!device->fa_back_subgroup32) {
                     return false;
                 }
@@ -15917,7 +16138,12 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (mask && (mask->type != GGML_TYPE_F16 || !ggml_is_contiguous(mask))) {
                     return false;
                 }
-                if (sinks && sinks->type != GGML_TYPE_F32) {
+                // retro delta: attention sinks are accepted, and unlike CUDA and
+                // Metal that acceptance is now backed by a probe
+                // (flash_attn_back_vulkan_matches_cpu_with_attention_sinks) — the
+                // project rule is that a supports_op only advertises what a probe
+                // exercises.
+                if (sinks && (sinks->type != GGML_TYPE_F32 || !ggml_is_contiguous(sinks))) {
                     return false;
                 }
                 if (q->ne[0] > VK_FA_BACK_MAX_D || v->ne[0] > VK_FA_BACK_MAX_D ||
@@ -16410,6 +16636,82 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     }
                 }
                 return op->type == GGML_TYPE_F32;
+            }
+        case GGML_OP_FUSED_SPARSE_CE:
+        case GGML_OP_FUSED_SPARSE_CE_BACK:
+            {
+                // retro delta: fused sparse cross-entropy.
+                const bool back = op->op == GGML_OP_FUSED_SPARSE_CE_BACK;
+                // The forward atomically sums the scalar loss.
+                if (!back && !device->buffer_float32_atomic_add) {
+                    return false;
+                }
+                const ggml_tensor * h       = back ? op->src[1] : op->src[0];
+                const ggml_tensor * w       = back ? op->src[2] : op->src[1];
+                const ggml_tensor * targets = back ? op->src[3] : op->src[2];
+                const ggml_tensor * weights = back ? op->src[4] : op->src[3];
+                const ggml_tensor * bias    = back ? op->src[5] : op->src[4];
+                if (!h || !w || !targets || !weights) {
+                    return false;
+                }
+                // retro delta: the optional per-vocab bias is supported (it shifts
+                // every logit inside w_dot_h, in both directions), so Vulkan now
+                // sits with CUDA and Metal rather than refusing the node.
+                // It must be a contiguous F32 vector
+                // covering the vocabulary, which is what ggml_fused_sparse_ce asserts.
+                if (bias != nullptr) {
+                    if (bias->type != GGML_TYPE_F32 || !ggml_is_contiguous(bias) ||
+                        bias->ne[0] != w->ne[1] || ggml_nrows(bias) != 1) {
+                        return false;
+                    }
+                }
+                if (back && (op->src[0] == nullptr || op->src[0]->type != GGML_TYPE_F32)) {
+                    return false; // grad scalar
+                }
+                if (h->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                if (targets->type != GGML_TYPE_I32 || weights->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                // retro delta: targets/weights are
+                // [K, n_tokens], K in 1..GGML_FUSED_SPARSE_CE_K_MAX.
+                if (targets->ne[1] != h->ne[1] || weights->ne[1] != h->ne[1] ||
+                    targets->ne[0] != weights->ne[0] || targets->ne[0] < 1 ||
+                    targets->ne[0] > GGML_FUSED_SPARSE_CE_K_MAX) {
+                    return false;
+                }
+                // A head type is supported iff a pipeline was compiled for it and
+                // the device had the required features (fp16 for quantized/F16
+                // heads, F32 atomic add for the forward) — otherwise the pointer
+                // is null and the op falls back to CPU.
+                if (w->type < 0 || w->type >= GGML_TYPE_COUNT) {
+                    return false;
+                }
+                if (!(back ? device->pipeline_fused_sparse_ce_back[w->type]
+                           : device->pipeline_fused_sparse_ce[w->type])) {
+                    return false;
+                }
+                // The generic dequant streams whole blocks, so n_embd must be a
+                // multiple of the head's block size (trivially 1 for F32/F16).
+                if ((w->ne[0] % ggml_blck_size(w->type)) != 0) {
+                    return false;
+                }
+                if (!ggml_is_contiguous(w)) {
+                    return false;
+                }
+                // Both directions walk the head by pairs — the unit dequantize()
+                // returns — so an odd embedding width would read past the last
+                // element. Every block size but F32/F16's is even already.
+                if ((h->ne[0] % 2) != 0) {
+                    return false;
+                }
+                // Backward keeps one grad_h pair per thread per token of the
+                // tile: n_embd <= ACC_PAIRS * 2 * 256 for a tile of one.
+                if (back && h->ne[0] > 16 * 2 * 256) {
+                    return false;
+                }
+                return true;
             }
         case GGML_OP_CONV_TRANSPOSE_1D:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;

@@ -1266,6 +1266,23 @@ void process_shaders() {
     string_to_spv("ssm_scan_back_ckpt_f32", "ssm_scan_back.comp", {{"SSM_SCAN_BACK_CKPT", "1"}});
     string_to_spv("ssm_scan_back_grad_f32", "ssm_scan_back.comp", {{"SSM_SCAN_BACK_GRAD", "1"}});
 
+    // retro delta: fused sparse cross-entropy.
+    // A single generic shader source per direction; the head is dequantized
+    // through dequant_funcs.glsl, so one variant is compiled per DATA_A_* type
+    // (as for get_rows_quant / mul_mat_vec). Adding a head type = one entry here
+    // plus one line in ggml_vk_load_shaders. The list covers every quant a
+    // projection head realistically uses; all have dequantize()/get_dm() and
+    // need no IQ shared-memory table.
+    string_to_spv("fused_sparse_ce_count", "fused_sparse_ce_count.comp", {});
+    for (const auto& tname : {
+            std::string("f32"),  std::string("f16"),
+            std::string("q4_0"), std::string("q4_1"), std::string("q5_0"), std::string("q5_1"), std::string("q8_0"),
+            std::string("q2_k"), std::string("q3_k"), std::string("q4_k"), std::string("q5_k"), std::string("q6_k") }) {
+        const std::map<std::string, std::string> d = {{"DATA_A_" + to_uppercase(tname), "1"}};
+        string_to_spv("fused_sparse_ce_" + tname,      "fused_sparse_ce.comp",      d);
+        string_to_spv("fused_sparse_ce_back_" + tname, "fused_sparse_ce_back.comp", d);
+    }
+
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
 
     for (auto &c : compiles) {

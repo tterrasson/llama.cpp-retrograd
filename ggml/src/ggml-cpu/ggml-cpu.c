@@ -2146,6 +2146,16 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_cross_entropy_loss_back(params, tensor);
             }
             break;
+        case GGML_OP_FUSED_SPARSE_CE:
+            {
+                ggml_compute_forward_fused_sparse_ce(params, tensor);
+            }
+            break;
+        case GGML_OP_FUSED_SPARSE_CE_BACK:
+            {
+                ggml_compute_forward_fused_sparse_ce_back(params, tensor);
+            }
+            break;
         case GGML_OP_OPT_STEP_ADAMW:
             {
                 ggml_compute_forward_opt_step_adamw(params, tensor);
@@ -2504,6 +2514,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             } break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+        case GGML_OP_FUSED_SPARSE_CE:
+        case GGML_OP_FUSED_SPARSE_CE_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
             {
@@ -3038,6 +3050,24 @@ struct ggml_cplan ggml_graph_plan(
                         // retro delta: the masked/weighted backward reduces the
                         // per-thread active-row counts through wdata.
                         cur = ggml_type_size(GGML_TYPE_F32)*n_tasks;
+                    } break;
+                case GGML_OP_FUSED_SPARSE_CE:
+                    {
+                        // retro delta: per-thread dequantization scratch for one
+                        // projection-head row (n_embd) plus one partial loss sum.
+                        cur = ggml_type_size(GGML_TYPE_F32)*(node->src[0]->ne[0] + 1)*n_tasks;
+                    } break;
+                case GGML_OP_FUSED_SPARSE_CE_BACK:
+                    {
+                        // retro delta: per-thread dequantization scratch for one
+                        // projection-head row plus a per-thread copy of the hidden
+                        // column, which the backward reads after it has started
+                        // writing grad_h over it (feature 3 in-place aliasing).
+                        // n_embd = src[1]->ne[0], src[1] = h.
+                        // retro delta: a third column, the
+                        // softmax accumulator, which the k target rows now read
+                        // after the result has started being written elsewhere.
+                        cur = ggml_type_size(GGML_TYPE_F32)*3*node->src[1]->ne[0]*n_tasks;
                     } break;
                 case GGML_OP_GATED_DELTA_NET:
                     {

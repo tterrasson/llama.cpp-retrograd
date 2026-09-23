@@ -721,6 +721,19 @@ void ggml_vk_buffer_memset_async(vk_context& ctx, vk_buffer& dst, size_t offset,
     ctx->s->buffer->buf.fillBuffer(dst->buffer, offset, size, c);
 }
 
+// retro delta: zero a buffer *inside* the command buffer, always.
+//
+// ggml_vk_buffer_memset_async above takes a host memset shortcut on a UMA device,
+// deferred until just before submission. That is fine for a buffer nothing else in
+// the submission writes, but it cannot be ordered against a GPU dispatch earlier in
+// the same command buffer: the host write always lands first. Any accumulator that
+// is cleared and re-filled more than once per graph therefore needs a real
+// fillBuffer, which the barriers around it can order. Used by the fused sparse CE
+// active-token counter, where the forward and the backward each clear it.
+void ggml_vk_buffer_fill_cmd(vk_context& ctx, vk_buffer& dst, size_t offset, uint32_t c, size_t size) {
+    ctx->s->buffer->buf.fillBuffer(dst->buffer, offset, size, c);
+}
+
 void ggml_vk_buffer_memset(vk_buffer& dst, size_t offset, uint32_t c, size_t size) {
     VK_LOG_DEBUG("ggml_vk_buffer_memset(" << offset << ", " << c << ", " << size << ")");
 

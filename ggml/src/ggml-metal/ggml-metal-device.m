@@ -2089,6 +2089,57 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         // model weight directly); src0 dim0 and dst dim0 must be unit-stride
         // (matches the CPU op's asserts); src1 may carry arbitrary strides.
         // Anything else falls back to CPU.
+        // retro delta: fused sparse cross-entropy. The head is read quantized
+        // in the kernel, one variant per type -- the same whitelist as the
+        // out-prod K-quant family plus the float and legacy 32-value formats.
+        // n_embd is capped by the backward's per-thread accumulator
+        // (FSCE_NTH*16*FSCE_MAXC) and must be a multiple of 16, which every
+        // quant block size already implies.
+        case GGML_OP_FUSED_SPARSE_CE:
+        case GGML_OP_FUSED_SPARSE_CE_BACK:
+        {
+            const bool is_back = op->op == GGML_OP_FUSED_SPARSE_CE_BACK;
+            const struct ggml_tensor * h = op->src[is_back ? 1 : 0];
+            const struct ggml_tensor * w = op->src[is_back ? 2 : 1];
+            const struct ggml_tensor * targets = op->src[is_back ? 3 : 2];
+            switch (w->type) {
+                case GGML_TYPE_F32:
+                case GGML_TYPE_F16:
+                case GGML_TYPE_Q4_0:
+                case GGML_TYPE_Q4_1:
+                case GGML_TYPE_Q5_0:
+                case GGML_TYPE_Q5_1:
+                case GGML_TYPE_Q8_0:
+                case GGML_TYPE_Q2_K:
+                case GGML_TYPE_Q3_K:
+                case GGML_TYPE_Q4_K:
+                case GGML_TYPE_Q5_K:
+                case GGML_TYPE_Q6_K:
+                    break;
+                default:
+                    return false;
+            }
+            // retro delta: k sparse targets per position.
+            if (targets->ne[0] > GGML_FUSED_SPARSE_CE_K_MAX) {
+                return false;
+            }
+            return has_simdgroup_reduction &&
+                   h->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(h) &&
+                   (!is_back || ggml_is_contiguous(op)) &&
+                   h->ne[0] % 16 == 0 &&
+                   h->ne[0] <= 16384;
+        }
+        // retro delta: repeat backward (gradient of a broadcast ADD/MUL/REPEAT
+        // input). F32 only, and both sides unit-strided on dim 0, matching the
+        // CPU op's own asserts; the kernel walks the other axes by stride.
+        case GGML_OP_REPEAT_BACK:
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                   op->type         == GGML_TYPE_F32 &&
+                   op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
+                   op->nb[0]         == ggml_type_size(op->type) &&
+                   ggml_can_repeat(op, op->src[0]);
         case GGML_OP_OUT_PROD:
             return (op->src[0]->type == GGML_TYPE_F32 ||
                     op->src[0]->type == GGML_TYPE_Q5_0 ||

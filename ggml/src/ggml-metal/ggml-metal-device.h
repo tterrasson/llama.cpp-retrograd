@@ -189,6 +189,9 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_opt_step_
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_opt_step_sgd      (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rms_norm_back     (ggml_metal_library_t lib, const struct ggml_tensor * op); // retro delta
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_out_prod          (ggml_metal_library_t lib, const struct ggml_tensor * op); // retro delta
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_repeat_back       (ggml_metal_library_t lib, const struct ggml_tensor * op); // retro delta
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fused_sparse_ce     (ggml_metal_library_t lib, const struct ggml_tensor * op); // retro delta
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fused_sparse_ce_back(ggml_metal_library_t lib, const struct ggml_tensor * op); // retro delta
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max_back     (ggml_metal_library_t lib, const struct ggml_tensor * op); // retro delta
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cross_entropy_loss     (ggml_metal_library_t lib, const struct ggml_tensor * op); // retro delta
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cross_entropy_loss_back(ggml_metal_library_t lib, const struct ggml_tensor * op); // retro delta

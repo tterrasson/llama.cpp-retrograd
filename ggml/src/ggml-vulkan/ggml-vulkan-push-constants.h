@@ -740,6 +740,36 @@ struct vk_op_ssm_conv_back_push_constants {
     uint32_t n_sx;
 };
 
+// retro delta: fused sparse cross-entropy.
+struct vk_op_fused_sparse_ce_push_constants {
+    uint32_t n_embd;
+    uint32_t n_tokens;
+    uint32_t n_vocab;
+    uint32_t h_stride; // elements between hidden-state columns
+    uint32_t d_stride; // elements between grad_h columns (backward only)
+    uint32_t has_bias; // 1 when the head carries a per-vocab bias [n_vocab]
+    uint32_t n_tok;    // tokens per workgroup (the CE shaders' token tile)
+    // retro delta: sparse targets per position, ne[0] of the
+    // targets/weights tensors. 1 is the one-hot objective.
+    uint32_t n_topk;
+};
+
+// retro delta: tokens per workgroup for the fused CE shaders. Decoding the head
+// is what those kernels spend their time on -- one dequantize() call yields two
+// weights, and a K-quant has no vec4 form to widen it -- so a workgroup decodes
+// each vocabulary column once and reuses it for a whole tile of tokens. Both
+// shaders unroll over this bound, and the backward keeps `tile * pairs per
+// invocation` inside its accumulator budget (ACC_PAIRS = 16 pairs), which is
+// what the second term below expresses.
+#define GGML_VK_FUSED_CE_TOK_MAX 8
+
+static uint32_t ggml_vk_fused_sparse_ce_tile(uint32_t n_embd) {
+    const uint32_t wg        = 256;
+    const uint32_t acc_pairs = 16;
+    const uint32_t per_inv   = std::max(1u, (n_embd / 2 + wg - 1) / wg);
+    return std::max(1u, std::min(uint32_t(GGML_VK_FUSED_CE_TOK_MAX), acc_pairs / per_inv));
+}
+
 struct vk_op_ssm_scan_back_push_constants {
     uint32_t d_state, head_dim, n_head, n_group, n_seq_tokens, n_seqs, n_A0;
     uint32_t off_dt, off_A, off_B, off_C, off_s;

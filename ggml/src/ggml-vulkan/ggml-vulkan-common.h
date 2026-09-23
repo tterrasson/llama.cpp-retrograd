@@ -55,6 +55,7 @@ void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, size_t sp
 void ggml_vk_buffer_read(vk_buffer& src, size_t offset, void * dst, size_t size);
 void ggml_vk_buffer_copy_async(vk_context& ctx, vk_buffer& dst, size_t dst_offset, vk_buffer& src, size_t src_offset, size_t size);
 void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& src, size_t src_offset, size_t size);
+void ggml_vk_buffer_fill_cmd(vk_context& ctx, vk_buffer& dst, size_t offset, uint32_t c, size_t size);
 void ggml_vk_buffer_memset_async(vk_context& ctx, vk_buffer& dst, size_t offset, uint32_t c, size_t size);
 void ggml_vk_buffer_memset(vk_buffer& dst, size_t offset, uint32_t c, size_t size);
 vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t size);

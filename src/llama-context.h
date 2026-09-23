@@ -215,7 +215,10 @@ struct llama_context {
             int64_t                 idata_split,
             ggml_opt_epoch_callback callback_train,
             ggml_opt_epoch_callback callback_eval,
-            const float           * label_weights = nullptr);
+            const float           * label_weights = nullptr,
+            // retro delta: sparse teacher distribution per
+            // position, nullable = the scalar labels above.
+            const llama_opt_topk_labels * topk = nullptr);
 
     // retro delta: see llama_opt_preflight
     int32_t opt_preflight(llama_opt_preflight_cb callback, void * userdata);
@@ -226,6 +229,7 @@ struct llama_context {
             const std::vector<llama_token> & tokens,
             const std::vector<llama_token> & labels_sparse,
             const float                    * label_weights, // per label position, nullable
+            const llama_opt_topk_labels    * topk,          // retro delta, nullable
             uint32_t                         n_evals,       // retro delta: physical ubatches to run, 0 = full row
             llama_batch                    & batch,
             ggml_opt_epoch_callback          callback,
@@ -240,6 +244,7 @@ struct llama_context {
             const llama_token      * tokens,
             const llama_token      * labels_sparse,
             const float            * label_weights,
+            const llama_opt_topk_labels * topk, // retro delta, nullable
             const llama_pos        * positions,
             const size_t           * seq_offsets,
             const llama_seq_id     * seq_ids,
@@ -397,6 +402,13 @@ private:
     void * opt_label_storage = nullptr;
     std::vector<size_t> opt_active_label_offsets;
     llama_opt_timing opt_timing = {};
+
+    // retro delta: fused sparse cross-entropy for the packed step.
+    bool    opt_fused_ce = false;
+    int32_t opt_ce_tiles = 1;
+    int32_t opt_ce_seq_chunk = 0;
+    // Resolved (not requested): already forced off when opt_ce_seq_chunk == 0.
+    bool    opt_ce_offload_logsoftmax = false;
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;
