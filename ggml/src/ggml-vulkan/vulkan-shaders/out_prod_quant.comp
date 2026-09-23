@@ -87,8 +87,13 @@ void main() {
 #endif
                 const uint ib = a_base + blk_in_row + k * p.nb01;
                 vec2 q = dequantize(ib, iqs, 0);
+                // get_dm returns (0,0) for the float types, where dequantize()
+                // already yields the final value; applying it there would zero the
+                // tile. Same guard as fused_sparse_ce.comp.
+#if !defined(DATA_A_F32) && !defined(DATA_A_F16)
                 const vec2 dm = get_dm(ib, 0);
                 q = q * dm.x + dm.y;
+#endif
                 v = sel == 0u ? q.x : q.y;
             }
             tile_a[kk * BM + mm] = v;
