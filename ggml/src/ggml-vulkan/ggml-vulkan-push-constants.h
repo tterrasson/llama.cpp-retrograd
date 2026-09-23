@@ -123,6 +123,21 @@ struct vk_flash_attn_push_constants {
 };
 
 static_assert(sizeof(vk_flash_attn_push_constants) <= 128, "sizeof(vk_flash_attn_push_constants) must be <= 128");
+struct vk_flash_attn_back_push_constants {
+    uint32_t N, KV, HSK, HSV;
+    uint32_t n_head, n_head_kv, n_batch;
+    uint32_t q_nb1, q_nb2, q_nb3;
+    uint32_t off_q, off_k, off_v, off_stats;
+    float scale, max_bias, logit_softcap;
+    uint32_t mask_ne1, mask_ne2, mask_ne3;
+    uint32_t flags;
+    // KV gradient window (ggml_flash_attn_ext_set_grad_window). Without one,
+    // KV_GRAD == KV and FLAG_WINDOW is clear.
+    uint32_t KV_GRAD, kv_stride, kv_stream0;
+};
+static_assert(sizeof(vk_flash_attn_back_push_constants) <= 128,
+        "sizeof(vk_flash_attn_back_push_constants) must be <= 128");
+
 
 struct vk_fa_xe_opt_push_constants {
     uint32_t kv_seq_len;

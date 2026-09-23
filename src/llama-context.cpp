@@ -3584,21 +3584,14 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     GGML_ASSERT(model->hparams.n_ctx_train % n_batch  == 0);
     GGML_ASSERT(n_batch                    % n_ubatch == 0);
 
-    if (cparams.flash_attn) {
-        LLAMA_LOG_INFO("%s: disabling flash attention, FLASH_ATTN_EXT has no backward pass\n", __func__);
-        cparams.flash_attn = false;
-    }
-
-    // gradients cannot flow through the KV cache, so the attention reads the K and V of the current ubatch directly
-    if (n_ubatch == cparams.n_ctx) {
-        cparams.training = true;
-    } else {
-        LLAMA_LOG_WARN("%s: n_ubatch (%u) != n_ctx (%u), the K and V projections will not receive gradients\n", __func__, n_ubatch, cparams.n_ctx);
-    }
-
-    // the training graph is different, need to reserve again
-    sched_need_reserve = true;
-    sched_reserve();
+    // retro delta: upstream turns flash attention off here because FLASH_ATTN_EXT
+    // had no backward pass. This fork gives it one (flash_attn_backward), and the
+    // differentiable KV cache goes through it, so the setting is kept as requested.
+    //
+    // Upstream also sets cparams.training here when n_ubatch == n_ctx, so that the
+    // attention reads k_cur/v_cur and bypasses the cache. With kv_differentiable
+    // the K/V gradient goes through the cache at any n_ubatch, so this fork leaves
+    // the flag off and the graph stays the one already reserved.
 
     ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
     opt_params.opt_period      = n_batch / n_ubatch;
@@ -4071,7 +4064,12 @@ bool llama_context::opt_step_packed_sequences(
         auto * res = opt_graph_cache.get();
         const auto gparams = graph_params(
                 res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
-        const bool reuse_graph = opt_cached_compute_ctx && res->can_reuse(gparams);
+        // ggml_backend_sched_split_graph() rewrites node sources in place to
+        // scheduler-owned copy tensors. Reusing that dynamic graph after a
+        // preflight/generation allocation leaves stale Vulkan buffers and can
+        // bind an op to an input of the wrong type. Rebuild until dynamic graph
+        // scheduling gains an immutable clone with input/output remapping.
+        const bool reuse_graph = false;
         if (!reuse_graph) {
             if (opt_cached_compute_ctx) {
                 ggml_opt_set_graph_cache(opt_ctx, false);

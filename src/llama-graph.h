@@ -1182,6 +1182,18 @@ struct llm_graph_context {
     // attention
     //
 
+    // retro delta: `k_cur`/`v_cur`/`kv_idxs` declare the KV gradient window when
+    // `k`/`v` are views over a KV cache -- the rows written at this step are the
+    // only differentiable ones. See ggml_flash_attn_ext_set_grad_window; passing
+    // nullptr keeps the dense behaviour (dK/dV shaped like the full `k`/`v`).
+    struct attn_grad_window {
+        ggml_tensor * k_cur   = nullptr; // [n_embd_head_k, n_head_k, n_tokens]
+        ggml_tensor * v_cur   = nullptr; // [n_embd_head_v, n_head_v, n_tokens]
+        ggml_tensor * kv_idxs = nullptr; // [n_tokens], I32
+        int32_t       stride  = 0;       // KV rows per stream
+        int32_t       stream0 = 0;       // first stream of the current slot
+    };
+
     ggml_tensor * build_attn_mha(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k,       // [n_embd_head_k, n_head_k, n_tokens]
@@ -1192,7 +1204,8 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            const attn_grad_window * grad_window = nullptr) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

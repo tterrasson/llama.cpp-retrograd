@@ -2651,11 +2651,23 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
              int64_t   n_kv_max,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+    const attn_grad_window * grad_window) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
     const auto n_stream = k->ne[3];
+
+    // retro delta: the gradient window rows are laid out exactly like q's tokens,
+    // so they go through the same stream split and permutation as q.
+    auto to_stream_major = [&](ggml_tensor * t) {
+        t = ggml_view_4d(ctx0, t, t->ne[0], t->ne[1], t->ne[2]/n_stream, n_stream,
+                         t->nb[1], t->nb[2], t->nb[2]*(t->ne[2]/n_stream), 0);
+        return ggml_permute(ctx0, t, 0, 2, 1, 3);
+    };
+
+    ggml_tensor * k_cur_w = (grad_window && grad_window->k_cur) ? to_stream_major(grad_window->k_cur) : nullptr;
+    ggml_tensor * v_cur_w = (grad_window && grad_window->v_cur) ? to_stream_major(grad_window->v_cur) : nullptr;
 
     // the stream dim steps over one stream's worth of dim-2 (tokens): (ne[2]/n_stream) rows of stride nb[2].
     // q->nb[3]/n_stream only equals that for a contiguous q; nope-only MLA (glm5-next) passes a permuted
@@ -2688,6 +2700,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+
+        // retro delta: only the rows written at this step carry a gradient. The
+        // transposed V layout has no window (it is not the Flash Attention
+        // layout anyway) and keeps the dense backward.
+        if (k_cur_w && v_cur_w && !v_trans) {
+            ggml_flash_attn_ext_set_grad_window(cur, k_cur_w, v_cur_w, grad_window->kv_idxs,
+                                                grad_window->stride, grad_window->stream0);
+        }
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
@@ -2930,6 +2950,8 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k;
     ggml_tensor * v;
 
+    attn_grad_window grad_window;
+
     if (cparams.training) {
         GGML_ASSERT(mctx_cur->get_n_kv() == n_tokens);
 
@@ -2952,9 +2974,25 @@ ggml_tensor * llm_graph_context::build_attn(
         // retro delta: reading the cache buffer directly only aliases the store
         // above, so the backward pass finds no route from the attention back to
         // k_cur/v_cur and a LoRA on the K/V projections trains as a silent no-op.
-        // Reading the store itself restores that route. Inference keeps the plain
-        // aliasing view: the edge changes graph topology, and nothing on the decode
-        // path needs it.
+        // Reading the store itself (k_set) restores that route: the forward reads
+        // the freshly written cache, which also keeps the store node reachable from
+        // the loss so it is not pruned (and its idxs stay allocated). Inference
+        // keeps the plain aliasing view; nothing on the decode path needs the edge.
+        //
+        // The materialized backward differentiates through set_rows. The fused Flash
+        // Attention backward instead takes a KV gradient window: it derives
+        // k_cur/v_cur directly (dK/dV sized by the rows written this step, not the
+        // whole cache) and does not route a gradient through the full cache view --
+        // ggml_build_backward ignores src[1]/src[2] of a windowed FLASH_ATTN_EXT, so
+        // the two routes never double count. The forward still reads k_set.
+        const bool fused_diff = cparams.kv_differentiable && cparams.flash_attn && kq_b == nullptr;
+        if (fused_diff) {
+            grad_window.k_cur   = k_cur;
+            grad_window.v_cur   = v_cur;
+            grad_window.kv_idxs = inp->get_k_idxs();
+            grad_window.stride  = mctx_cur->get_kv_stride();
+            grad_window.stream0 = mctx_cur->get_kv_stream0();
+        }
         if (!cparams.kv_differentiable) {
             k_set = nullptr;
             v_set = nullptr;
@@ -2966,7 +3004,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il, &grad_window);
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {
