@@ -5915,6 +5915,7 @@ int ggml_metal_op_cross_entropy_loss(ggml_metal_op_t ctx, int idx) {
     ggml_metal_kargs_cross_entropy_loss args = {
         /*.ne00  =*/ (int32_t) ne00,
         /*.nrows =*/ (int32_t) nrows,
+        /*.nactive =*/ op->op_params[1] ? op->op_params[0] : (int32_t) nrows,
     };
 
     const int nth = ggml_metal_op_retro_row_nth(pipeline, ne00);
@@ -5946,6 +5947,7 @@ int ggml_metal_op_cross_entropy_loss_back(ggml_metal_op_t ctx, int idx) {
     ggml_metal_kargs_cross_entropy_loss_back args = {
         /*.ne00  =*/ (int32_t) ne00,
         /*.nrows =*/ (int32_t) nrows,
+        /*.nactive =*/ op->op_params[1] ? op->op_params[0] : (int32_t) nrows,
     };
 
     const int nth = ggml_metal_op_retro_row_nth(pipeline, ne00);

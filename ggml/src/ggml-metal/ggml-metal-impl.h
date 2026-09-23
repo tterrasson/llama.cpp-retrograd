@@ -1425,12 +1425,14 @@ typedef struct {
 typedef struct {
     int32_t ne00;  // n_classes (row width)
     int32_t nrows; // total rows across ne1..ne3
+    int32_t nactive; // rows with a non-zero label distribution
 } ggml_metal_kargs_cross_entropy_loss;
 
 // retro delta: cross-entropy loss backward (contiguous rows)
 typedef struct {
     int32_t ne00;  // n_classes (row width)
     int32_t nrows; // total rows across ne1..ne3
+    int32_t nactive; // rows with a non-zero label distribution
 } ggml_metal_kargs_cross_entropy_loss_back;
 
 // retro delta: get-rows backward (scatter-add of grad rows into the vocab-sized dst)
