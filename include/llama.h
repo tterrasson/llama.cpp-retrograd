@@ -1813,6 +1813,9 @@ extern "C" {
         uint32_t            n_topk;
     } llama_opt_topk_labels;
 
+    // retro delta: synchronous callback cancellation, observed before more GPU work.
+    LLAMA_API void llama_opt_request_stop(struct llama_context * ctx);
+
     LLAMA_API void llama_opt_epoch(
             struct llama_context    * lctx,
             ggml_opt_dataset_t        dataset,
@@ -1856,6 +1859,7 @@ extern "C" {
             uint32_t                  n_tokens,
             size_t                    n_seq_ids,
             uint32_t                  n_sequences,
+            uint32_t                  accumulation_steps,
             ggml_opt_epoch_callback   callback);
 
     // retro delta: monotonic wall-clock counters for optimizer graph work.

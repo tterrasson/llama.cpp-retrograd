@@ -217,6 +217,13 @@ struct llama_context {
     llama_opt_memory opt_memory_get() const { return opt_memory; }
     void opt_memory_sample();
 
+    // retro delta: stop only the current epoch, including its evaluation tail.
+    void opt_request_stop() { opt_stop_requested = true; }
+    // retro delta: drop a step that will not complete - allocation, graph
+    // metadata, partial gradients and sequence state - so the next call starts
+    // from an update boundary. Weights already updated by earlier steps stay.
+    void opt_abandon_step();
+
     // TODO: more flexible combinations of logical/physical batch size and context size
     // retro delta: label_weights optionally scales each label position's loss
     // contribution (dataset layout, nullable = all ones).
@@ -263,6 +270,7 @@ struct llama_context {
             uint32_t                 n_tokens,
             size_t                   n_seq_ids,
             uint32_t                 n_sequences,
+            uint32_t                 accumulation_steps,
             ggml_opt_epoch_callback  callback);
 
 private:
@@ -434,14 +442,22 @@ private:
 
     llama_batch opt_batch = {};
     uint32_t opt_batch_capacity = 0;
+    // retro delta: one retained packed batch geometry, including membership capacity.
+    llama_batch opt_packed_batch = {};
+    uint32_t opt_packed_batch_tokens = 0;
+    uint32_t opt_packed_batch_memberships = 0;
     std::vector<llama_token> opt_tokens;
     std::vector<llama_token> opt_labels_sparse;
     std::vector<uint8_t> opt_compute_meta;
-    ggml_context_ptr opt_cached_compute_ctx;
-    llm_graph_result_ptr opt_graph_cache;
+    ggml_context_ptr opt_packed_compute_ctx;
+    llm_graph_result_ptr opt_packed_graph_storage;
 
-    void * opt_label_storage = nullptr;
-    std::vector<size_t> opt_active_label_offsets;
+    // retro delta: persistent host scratch, not a reusable graph topology.
+    bool opt_stop_requested = false;
+    std::vector<int32_t> opt_ce_targets;
+    std::vector<float> opt_ce_weights;
+    std::vector<size_t> opt_sparse_offsets;
+    std::vector<float> opt_sparse_values;
     llama_opt_timing opt_timing = {};
     llama_opt_memory opt_memory = {}; // retro delta
 

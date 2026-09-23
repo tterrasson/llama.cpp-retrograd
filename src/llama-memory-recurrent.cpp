@@ -1293,7 +1293,8 @@ llama_memory_recurrent_context::llama_memory_recurrent_context(
 
 llama_memory_recurrent_context::llama_memory_recurrent_context(
         llama_memory_recurrent * mem,
-        std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), mem(mem), ubatches(std::move(ubatches)) {}
+        std::vector<llama_ubatch> ubatches,
+        bool indexed) : status(LLAMA_MEMORY_STATUS_SUCCESS), mem(mem), ubatches(std::move(ubatches)), indexed(indexed) {}
 
 llama_memory_recurrent_context::~llama_memory_recurrent_context() = default;
 
@@ -1309,6 +1310,10 @@ bool llama_memory_recurrent_context::next() {
 
 bool llama_memory_recurrent_context::apply() {
     assert(!llama_memory_status_is_fail(status));
+
+    if (indexed) {
+        return true;
+    }
 
     // no ubatches -> this is an update
     if (ubatches.empty()) {
