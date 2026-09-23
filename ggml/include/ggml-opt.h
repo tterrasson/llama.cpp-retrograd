@@ -138,6 +138,12 @@ extern "C" {
     GGML_API ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params);
     GGML_API void ggml_opt_free(ggml_opt_context_t opt_ctx);
 
+    // rebind the optimizer to a (re)created backend scheduler; the new scheduler
+    // must use the same backends as the one passed to ggml_opt_init. Needed when
+    // the owner recreates its scheduler (e.g. on a LoRA adapter change) while the
+    // optimizer context lives on, so ggml_opt_alloc does not use a freed scheduler.
+    GGML_API void ggml_opt_set_backend_sched(ggml_opt_context_t opt_ctx, ggml_backend_sched_t backend_sched);
+
     // set gradients to zero, initialize loss, and optionally reset the optimizer
     GGML_API void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer);
 
