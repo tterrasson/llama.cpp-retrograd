@@ -755,6 +755,29 @@ public:
     std::map<llama_seq_id, llama_sampler *> samplers;
 };
 
+// retro delta: gather indices for the device-side target log-probabilities
+// (llama_set_target_logprobs). The values are computed by llama_context for the
+// ubatch being processed -- they index the flattened [n_vocab * n_outputs]
+// probability buffer, so all the output-row bookkeeping stays in one place --
+// and this input only uploads them.
+class llm_graph_input_target_logprobs : public llm_graph_input_i {
+public:
+    llm_graph_input_target_logprobs(const std::vector<int32_t> * idx) : idx(idx) {}
+    virtual ~llm_graph_input_target_logprobs() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    // Only the *values* of the gather indices change between two decodes of the
+    // same shape, and set_input re-uploads them; the topology is decided by
+    // llm_graph_params::target_logprob_idx, which allow_reuse compares. Without
+    // this the scorer would rebuild the graph for every completion chunk.
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * rows = nullptr; // I32 [n_outputs]
+
+    const std::vector<int32_t> * idx;
+};
+
 //
 // llm_graph_result
 //
@@ -791,6 +814,11 @@ struct llm_graph_params {
     const llama_prec_policy * prec_policy = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+
+    // retro delta: non-null while the decode in flight asked for target
+    // log-probabilities. Its presence changes the graph topology (see
+    // build_target_logprobs), so allow_reuse compares it.
+    const std::vector<int32_t> * target_logprob_idx = nullptr;
 
     static bool samplers_equal(
           const std::map<llama_seq_id, llama_sampler *> & lhs,
@@ -852,6 +880,10 @@ struct llm_graph_params {
         }
 
         if (!samplers_equal(samplers, other.samplers)) {
+            return false;
+        }
+
+        if ((target_logprob_idx != nullptr) != (other.target_logprob_idx != nullptr)) {
             return false;
         }
 
@@ -947,6 +979,12 @@ public:
     std::vector<ggml_tensor *> t_sampled_logits;
     std::vector<ggml_tensor *> t_candidates;
 
+    // retro delta: [1, n_outputs] gathered softmax(logits)[target] (llama.h,
+    // llama_set_target_logprobs). Probabilities, not log-probabilities: the log
+    // is taken on the host, over the n_outputs floats that came back rather
+    // than over the vocabulary.
+    ggml_tensor * t_target_probs = nullptr;
+
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
 
@@ -1033,6 +1071,8 @@ struct llm_graph_context {
     const llama_prec_policy * prec_policy;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+
+    const std::vector<int32_t> * target_logprob_idx; // retro delta
 
     const llm_graph_cb & cb_func;
 
@@ -1393,6 +1433,12 @@ struct llm_graph_context {
     //
 
     void build_sampling() const;
+
+    //
+    // target log-probabilities (retro delta)
+    //
+
+    void build_target_logprobs() const;
 
     //
     // dense (out)
