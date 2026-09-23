@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h"
+#include "ggml-rir/rir_registry.h" // retro delta: RIR variant descriptors (POD, C)
 
 #ifdef __cplusplus
 extern "C" {
@@ -193,8 +194,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_opt_step_
 // retro delta: fixed-block Gefen, one pipeline per variant.
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_opt_step_gefen_stats(ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_opt_step_gefen      (ggml_metal_library_t lib, const struct ggml_tensor * op);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rms_norm_back     (ggml_metal_library_t lib, const struct ggml_tensor * op); // retro delta
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_l2_norm_back      (ggml_metal_library_t lib, const struct ggml_tensor * op); // retro delta
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rir              (ggml_metal_library_t lib, const struct rir_variant_desc * variant); // retro delta: any RIR variant
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_out_prod          (ggml_metal_library_t lib, const struct ggml_tensor * op); // retro delta
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_repeat_back       (ggml_metal_library_t lib, const struct ggml_tensor * op); // retro delta
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fused_sparse_ce     (ggml_metal_library_t lib, const struct ggml_tensor * op); // retro delta
