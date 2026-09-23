@@ -5,6 +5,7 @@
 #import "ggml-backend-impl.h"
 #import "ggml-metal-impl.h"
 #import "ggml-metal-common.h"
+#import "ggml-retro-quant.h"
 
 #include <Foundation/Foundation.h>
 
@@ -1502,6 +1503,18 @@ void ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_eve
     GGML_UNUSED(dev);
 }
 
+// retro delta: does a kernel_out_prod_<name> / kernel_fused_sparse_ce_<name>
+// pipeline exist for this type? Generated from the same table that instantiates
+// them in retro.metal, so the gate and the kernels cannot disagree.
+static bool ggml_metal_retro_is_dequantizable(enum ggml_type type) {
+    switch (type) {
+#define GGML_RETRO_CASE(TYPE, BLK, NL, NAME, VKNAME) case TYPE: return true;
+        GGML_RETRO_DEQUANT_TYPES(GGML_RETRO_CASE)
+#undef GGML_RETRO_CASE
+        default: return false;
+    }
+}
+
 void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t * total) {
     if (@available(macOS 10.12, iOS 16.0, *)) {
         *total     = dev->mtl_device.recommendedMaxWorkingSetSize;
@@ -2117,18 +2130,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                    op->src[1]->nb[0] == ggml_type_size(op->src[1]->type) &&
                    ggml_are_same_shape(op->src[0], op->src[1]) &&
                    ggml_are_same_shape(op->src[0], op);
-        // retro delta: out-prod (weight-gradient GEMM). src0 is F32, Q8_0,
-        // or a K-quant
-        // (the activation-gradient dx = out_prod(W, dy) reads the quantized
-        // model weight directly); src0 dim0 and dst dim0 must be unit-stride
-        // (matches the CPU op's asserts); src1 may carry arbitrary strides.
-        // Anything else falls back to CPU.
-        // retro delta: fused sparse cross-entropy. The head is read quantized
-        // in the kernel, one variant per type -- the same whitelist as the
-        // out-prod K-quant family plus the float and legacy 32-value formats.
-        // n_embd is capped by the backward's per-thread accumulator
-        // (FSCE_NTH*16*FSCE_MAXC) and must be a multiple of 16, which every
-        // quant block size already implies.
+        // retro delta: fused sparse cross-entropy. The head is read quantized in
+        // the kernel, one variant per type. n_embd is capped by the backward's
+        // per-thread accumulator (FSCE_NTH*16*FSCE_MAXC) and must be a multiple of
+        // 16, which every quant block size already implies.
         case GGML_OP_FUSED_SPARSE_CE:
         case GGML_OP_FUSED_SPARSE_CE_BACK:
         {
@@ -2136,22 +2141,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             const struct ggml_tensor * h = op->src[is_back ? 1 : 0];
             const struct ggml_tensor * w = op->src[is_back ? 2 : 1];
             const struct ggml_tensor * targets = op->src[is_back ? 3 : 2];
-            switch (w->type) {
-                case GGML_TYPE_F32:
-                case GGML_TYPE_F16:
-                case GGML_TYPE_Q4_0:
-                case GGML_TYPE_Q4_1:
-                case GGML_TYPE_Q5_0:
-                case GGML_TYPE_Q5_1:
-                case GGML_TYPE_Q8_0:
-                case GGML_TYPE_Q2_K:
-                case GGML_TYPE_Q3_K:
-                case GGML_TYPE_Q4_K:
-                case GGML_TYPE_Q5_K:
-                case GGML_TYPE_Q6_K:
-                    break;
-                default:
-                    return false;
+            if (w->type != GGML_TYPE_F32 && !ggml_metal_retro_is_dequantizable(w->type)) {
+                return false;
             }
             // retro delta: k sparse targets per position.
             if (targets->ne[0] > GGML_FUSED_SPARSE_CE_K_MAX) {
@@ -2174,19 +2165,27 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                    op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
                    op->nb[0]         == ggml_type_size(op->type) &&
                    ggml_can_repeat(op, op->src[0]);
+        // retro delta: out-prod (weight-gradient GEMM). src0 dim0 and dst dim0 must
+        // be unit-stride (matches the CPU op's asserts); src1 may carry arbitrary
+        // strides.
         case GGML_OP_OUT_PROD:
-            return (op->src[0]->type == GGML_TYPE_F32 ||
-                    op->src[0]->type == GGML_TYPE_Q5_0 ||
-                    op->src[0]->type == GGML_TYPE_Q8_0 ||
-                    op->src[0]->type == GGML_TYPE_Q2_K ||
-                    op->src[0]->type == GGML_TYPE_Q3_K ||
-                    op->src[0]->type == GGML_TYPE_Q4_K ||
-                    op->src[0]->type == GGML_TYPE_Q5_K ||
-                    op->src[0]->type == GGML_TYPE_Q6_K) &&
-                   op->src[1]->type == GGML_TYPE_F32 &&
-                   op->type         == GGML_TYPE_F32 &&
-                   op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
-                   op->nb[0]         == ggml_type_size(op->type);
+            if (op->src[1]->type != GGML_TYPE_F32 ||
+                op->type         != GGML_TYPE_F32 ||
+                op->src[0]->nb[0] != ggml_type_size(op->src[0]->type) ||
+                op->nb[0]         != ggml_type_size(op->type)) {
+                return false;
+            }
+            if (op->src[0]->type == GGML_TYPE_F32) {
+                return true; // dedicated element-strided tile loader, no block layout
+            }
+            // Every non-F32 tile loader decodes a whole 16-value chunk per thread,
+            // so a trailing partial chunk would read past the tensor. The gate,
+            // not a host-side GGML_ASSERT in ggml_metal_op_out_prod, is the
+            // right place for it, because an exotic row width must fall back to
+            // another backend rather than abort the process. Every GGUF weight row
+            // is a whole number of quantization blocks anyway.
+            return ggml_metal_retro_is_dequantizable(op->src[0]->type) &&
+                   op->src[0]->ne[0] % 16 == 0;
         // retro delta: soft-max backward. F32, contiguous, same shapes; the
         // kernel implements the max_bias == 0 case only (matching the CPU op's
         // assert and our training graph). Needs simdgroup reductions.

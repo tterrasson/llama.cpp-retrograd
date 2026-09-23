@@ -5198,6 +5198,30 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
 }
 
 // TODO: move these functions here
+// retro delta: can a training op decode this frozen tensor on CUDA? It covers src0
+// of OUT_PROD and the head of FUSED_SPARSE_CE[_BACK], which take the same
+// dequantize-to-F32 path (ggml_get_to_fp32_cuda) and so share one predicate rather
+// than a per-type list each, which could disagree. A row must be a whole number of
+// blocks because the dequantization is sliced along whole columns; that is true of
+// every GGUF weight and is checked here so an exotic shape falls back instead of
+// aborting.
+//
+// This is deliberately a superset of GGML_RETRO_DEQUANT_TYPES (the set every backend
+// decodes and the parity tests sweep): the extra types cost nothing on CUDA because
+// the path is type-generic, whereas Metal and Vulkan need one kernel variant each.
+// BF16 stays out even though ggml_get_to_fp32_cuda covers it:
+// ggml_compute_forward_out_prod GGML_ABORTs on BF16, so accepting it here would turn
+// any split back to the CPU into a crash rather than a fallback.
+static bool ggml_cuda_can_decode_frozen(const ggml_tensor * t) {
+    if (t->type == GGML_TYPE_F32) {
+        return true;
+    }
+    if (t->type != GGML_TYPE_F16 && !ggml_is_quantized(t->type)) {
+        return false;
+    }
+    return t->ne[0] % ggml_blck_size(t->type) == 0;
+}
+
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
@@ -5318,17 +5342,17 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
             } break;
         case GGML_OP_OUT_PROD:
-            // retro delta: quantized src0 is dequantized to F32 in ggml_cuda_out_prod
-            // (contiguous packed layout required), so any quant type with a to_fp32
-            // kernel is accepted in addition to F32. The dequantization runs on
-            // slices of whole src0 columns, so a column must be a whole number of
-            // quantization blocks -- true of every GGUF weight, and required here so
-            // an exotic shape falls back to another backend instead of aborting.
-            return op->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
-                   (op->src[0]->type == GGML_TYPE_F32 ||
-                    (ggml_is_quantized(op->src[0]->type) && ggml_is_contiguous(op->src[0]) &&
-                     op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
-                     op->src[0]->ne[0] % ggml_blck_size(op->src[0]->type) == 0));
+            if (op->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32) {
+                return false;
+            }
+            if (op->src[0]->type == GGML_TYPE_F32) {
+                return true; // strided cuBLAS GEMM straight on src0, no decoding
+            }
+            // The dequant kernels consume a contiguous run of blocks, matching the
+            // packed weight layout (see ggml_cuda_out_prod).
+            return ggml_cuda_can_decode_frozen(op->src[0]) &&
+                   ggml_is_contiguous(op->src[0]) &&
+                   op->src[0]->nb[0] == ggml_type_size(op->src[0]->type);
         case GGML_OP_GET_ROWS:
             {
                 switch (op->src[0]->type) {
@@ -5743,9 +5767,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_FUSED_SPARSE_CE:
         case GGML_OP_FUSED_SPARSE_CE_BACK: {
-            // retro delta: correctness-first CUDA fused vocabulary CE.  Keep
-            // this contract narrower than the conversion layer: every accepted
-            // head type is covered by parity tests and has a to-F32 CUDA path.
+            // retro delta: correctness-first CUDA fused vocabulary CE. The head goes
+            // through the same decoding predicate as out_prod's src0, so the two ops
+            // cannot accept different type sets; the CPU oracle is generic too (it
+            // reads the head through a to_float).
             const bool back = op->op == GGML_OP_FUSED_SPARSE_CE_BACK;
             const ggml_tensor * grad    = back ? op->src[0] : nullptr;
             const ggml_tensor * h       = back ? op->src[1] : op->src[0];
@@ -5771,23 +5796,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     (back && h->ne[0] > 8192)) {
                 return false;
             }
-            switch (w->type) {
-                case GGML_TYPE_F32:
-                case GGML_TYPE_F16:
-                case GGML_TYPE_Q4_0:
-                case GGML_TYPE_Q4_1:
-                case GGML_TYPE_Q5_0:
-                case GGML_TYPE_Q5_1:
-                case GGML_TYPE_Q8_0:
-                case GGML_TYPE_Q2_K:
-                case GGML_TYPE_Q3_K:
-                case GGML_TYPE_Q4_K:
-                case GGML_TYPE_Q5_K:
-                case GGML_TYPE_Q6_K:
-                    return w->ne[0] % ggml_blck_size(w->type) == 0;
-                default:
-                    return false;
-            }
+            return ggml_cuda_can_decode_frozen(w);
         }
         case GGML_OP_OPT_STEP_ADAMW:
             // retro delta: F32 parameters, or F16 parameters with F32 moments and

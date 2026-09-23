@@ -21,6 +21,8 @@
 #include <sys/types.h>
 #include <filesystem>
 
+#include "ggml-retro-quant.h"
+
 #ifdef _WIN32
     #define NOMINMAX
     #include <windows.h>
@@ -255,6 +257,18 @@ std::string lut_load_vec_a(const std::string& type_name) {
         return "8";
     }
     return "4";
+}
+
+// retro delta: the shader-name suffixes of GGML_RETRO_DEQUANT_TYPES, in table
+// order. ggml_vk_load_shaders expands the same table to create one pipeline per
+// entry, so a type present here always has a pipeline and vice versa.
+const std::vector<std::string> & retro_dequant_type_names() {
+    static const std::vector<std::string> names = {
+#define GGML_RETRO_VKNAME(TYPE, BLK, NL, NAME, VKNAME) #VKNAME,
+        GGML_RETRO_DEQUANT_TYPES(GGML_RETRO_VKNAME)
+#undef GGML_RETRO_VKNAME
+    };
+    return names;
 }
 
 static const char path_separator = '/';
@@ -865,11 +879,6 @@ void process_shaders() {
         }
         string_to_spv("get_rows_" + tname + "_f32", shader, merge_maps(base_dict, {{"TEMP_TYPE", "FLOAT_TYPE"}, {data_a_key, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float"}}));
 
-        // out_prod with a quantized src0 (weight-gradient path); reuses the
-        // dequant_funcs.glsl per-element machinery, one variant per quant type.
-        if (tname != "f32" && tname != "f16" && tname != "bf16") {
-            string_to_spv("out_prod_" + tname + "_f32", "out_prod_quant.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
-        }
     }
 
     string_to_spv("get_rows_i32", "get_rows.comp", {{"TEMP_TYPE", "uint"}, {"A_TYPE", "uint"}, {"B_TYPE", "int"}, {"D_TYPE", "uint"}});
@@ -1278,13 +1287,25 @@ void process_shaders() {
     // projection head realistically uses; all have dequantize()/get_dm() and
     // need no IQ shared-memory table.
     string_to_spv("fused_sparse_ce_count", "fused_sparse_ce_count.comp", {});
-    for (const auto& tname : {
-            std::string("f32"),  std::string("f16"),
-            std::string("q4_0"), std::string("q4_1"), std::string("q5_0"), std::string("q5_1"), std::string("q8_0"),
-            std::string("q2_k"), std::string("q3_k"), std::string("q4_k"), std::string("q5_k"), std::string("q6_k") }) {
+
+    // retro delta: the training ops that read a frozen tensor in place. Both
+    // families come from GGML_RETRO_DEQUANT_TYPES so they cannot drift apart --
+    // out_prod used to be generated for every quant type in the file (including
+    // ones no backend gate accepted) while fused_sparse_ce had its own shorter
+    // hand-written list. F32 needs no decoding and is handled separately below.
+    for (const auto & tname : retro_dequant_type_names()) {
         const std::map<std::string, std::string> d = {{"DATA_A_" + to_uppercase(tname), "1"}};
         string_to_spv("fused_sparse_ce_" + tname,      "fused_sparse_ce.comp",      d);
         string_to_spv("fused_sparse_ce_back_" + tname, "fused_sparse_ce_back.comp", d);
+        // out_prod_quant.comp reaches dequant_funcs.glsl, which needs FLOAT_TYPE
+        // from base_dict; fused_sparse_ce.comp defines its own.
+        string_to_spv("out_prod_" + tname + "_f32",    "out_prod_quant.comp",
+                merge_maps(base_dict, merge_maps(d, {{"B_TYPE", "float"}, {"D_TYPE", "float"}})));
+    }
+    {
+        const std::map<std::string, std::string> d = {{"DATA_A_F32", "1"}};
+        string_to_spv("fused_sparse_ce_f32",      "fused_sparse_ce.comp",      d);
+        string_to_spv("fused_sparse_ce_back_f32", "fused_sparse_ce_back.comp", d);
     }
 
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});

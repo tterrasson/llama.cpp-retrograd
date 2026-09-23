@@ -35,12 +35,16 @@
 // ggml_compute_forward_fused_sparse_ce_f32.
 
 // types.glsl defines A_TYPE / QUANT_K / QUANT_R for the head's DATA_A_* type;
-// dequant_funcs.glsl then provides dequantize()/get_dm() reading data_a. It also
-// needs FLOAT_TYPE and the data_a buffers declared first, so the order is:
-// types.glsl -> FLOAT_TYPE + buffer decls -> dequant_funcs.glsl.
+// dequant_funcs.glsl then provides dequantize()/get_dm() reading data_a, and needs
+// the data_a buffers declared first. So the order is:
+// FLOAT_TYPE -> types.glsl -> buffer decls -> dequant_funcs.glsl.
+//
+// FLOAT_TYPE must come before types.glsl, not after: the IQ types declare their
+// shared lookup table as `shared FLOAT_TYPE ...` inside types.glsl.
+#define FLOAT_TYPE float
+
 #include "types.glsl"
 
-#define FLOAT_TYPE float
 #define WG 256
 
 // Tokens per workgroup. Must stay equal to GGML_VK_FUSED_CE_TOK_MAX in
@@ -161,6 +165,11 @@ void column_dots(uint v, uint n_here, out float z[TOK_MAX]) {
 }
 
 void main() {
+#ifdef NEEDS_INIT_IQ_SHMEM
+    // Must precede the early returns below: it barriers, and every return after
+    // this point is workgroup-uniform, so no invocation can strand the others.
+    init_iq_shmem(gl_WorkGroupSize);
+#endif
     const uint n_tok = max(p.n_tok, 1u);
     g_t_base = gl_WorkGroupID.x * n_tok;
     if (g_t_base >= p.n_tokens) {

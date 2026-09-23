@@ -3697,18 +3697,16 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // workgroup (see out_prod.comp), so the workgroup denominators must match the
     // tile, not the 256-thread local size.
     ggml_vk_create_pipeline(device, device->pipeline_out_prod_f32, "out_prod_f32", out_prod_f32_len, out_prod_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {64, 16, 1}, {}, 1);
-#define CREATE_OUT_PROD_QUANT(TYPE, NAMELC) \
-    ggml_vk_create_pipeline(device, device->pipeline_out_prod_quant_f32[TYPE], "out_prod_" #NAMELC "_f32", out_prod_ ## NAMELC ## _f32_len, out_prod_ ## NAMELC ## _f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {64, 16, 1}, {}, 1);
-    CREATE_OUT_PROD_QUANT(GGML_TYPE_Q4_0, q4_0)
-    CREATE_OUT_PROD_QUANT(GGML_TYPE_Q4_1, q4_1)
-    CREATE_OUT_PROD_QUANT(GGML_TYPE_Q5_0, q5_0)
-    CREATE_OUT_PROD_QUANT(GGML_TYPE_Q5_1, q5_1)
-    CREATE_OUT_PROD_QUANT(GGML_TYPE_Q8_0, q8_0)
-    CREATE_OUT_PROD_QUANT(GGML_TYPE_Q2_K, q2_k)
-    CREATE_OUT_PROD_QUANT(GGML_TYPE_Q3_K, q3_k)
-    CREATE_OUT_PROD_QUANT(GGML_TYPE_Q4_K, q4_k)
-    CREATE_OUT_PROD_QUANT(GGML_TYPE_Q5_K, q5_k)
-    CREATE_OUT_PROD_QUANT(GGML_TYPE_Q6_K, q6_k)
+    // One pipeline per GGML_RETRO_DEQUANT_TYPES entry; supports_op gates on the
+    // pipeline being non-null, so this table is the Vulkan answer to "which types
+    // can out_prod decode". F16 is the one entry that needs the fp16 guard: for it
+    // A_TYPE is float16_t, i.e. 16-bit *storage*, unlike the quant types whose
+    // float16_t scales sit inside a block struct.
+#define CREATE_OUT_PROD_QUANT(TYPE, BLK, NL, NAME, VKNAME) \
+    if (TYPE != GGML_TYPE_F16 || device->fp16) { \
+        ggml_vk_create_pipeline(device, device->pipeline_out_prod_quant_f32[TYPE], "out_prod_" #VKNAME "_f32", out_prod_ ## VKNAME ## _f32_len, out_prod_ ## VKNAME ## _f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {64, 16, 1}, {}, 1); \
+    }
+    GGML_RETRO_DEQUANT_TYPES(CREATE_OUT_PROD_QUANT)
 #undef CREATE_OUT_PROD_QUANT
 
     ggml_vk_create_pipeline(device, device->pipeline_snake_f32,  "snake_f32",  snake_f32_len,  snake_f32_data,  "main", 4, sizeof(vk_op_snake_push_constants), {256, 1, 1}, {}, 1);
@@ -3845,18 +3843,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
     CREATE_FUSED_SPARSE_CE(GGML_TYPE_F32, f32);
     if (device->fp16) {
-        // Quantized/F16 heads read float16_t scales, hence the fp16 guard.
-        CREATE_FUSED_SPARSE_CE(GGML_TYPE_F16,  f16);
-        CREATE_FUSED_SPARSE_CE(GGML_TYPE_Q4_0, q4_0);
-        CREATE_FUSED_SPARSE_CE(GGML_TYPE_Q4_1, q4_1);
-        CREATE_FUSED_SPARSE_CE(GGML_TYPE_Q5_0, q5_0);
-        CREATE_FUSED_SPARSE_CE(GGML_TYPE_Q5_1, q5_1);
-        CREATE_FUSED_SPARSE_CE(GGML_TYPE_Q8_0, q8_0);
-        CREATE_FUSED_SPARSE_CE(GGML_TYPE_Q2_K, q2_k);
-        CREATE_FUSED_SPARSE_CE(GGML_TYPE_Q3_K, q3_k);
-        CREATE_FUSED_SPARSE_CE(GGML_TYPE_Q4_K, q4_k);
-        CREATE_FUSED_SPARSE_CE(GGML_TYPE_Q5_K, q5_k);
-        CREATE_FUSED_SPARSE_CE(GGML_TYPE_Q6_K, q6_k);
+        // Quantized/F16 heads read float16_t scales, hence the fp16 guard. Same
+        // table as out_prod above, so a head type and a frozen-projection type
+        // cannot be supported by one op and not the other.
+#define CREATE_FUSED_SPARSE_CE_ROW(TYPE, BLK, NL, NAME, VKNAME) CREATE_FUSED_SPARSE_CE(TYPE, VKNAME);
+        GGML_RETRO_DEQUANT_TYPES(CREATE_FUSED_SPARSE_CE_ROW)
+#undef CREATE_FUSED_SPARSE_CE_ROW
     }
 #undef CREATE_FUSED_SPARSE_CE
 
@@ -8949,7 +8941,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_out_prod_f32;
         }
-        if (ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        // Indexing the table directly also covers F16, which is decodable but not
+        // ggml_is_quantized(); unregistered types leave a null entry.
+        if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_out_prod_quant_f32[src0->type];
         }
         return nullptr;
@@ -16586,7 +16580,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             if (op->src[0]->type == GGML_TYPE_F32) {
                 return true;
             }
-            return ggml_is_quantized(op->src[0]->type) && ggml_is_contiguous(op->src[0]) &&
+            // The pipeline table is the type gate: it is built from
+            // GGML_RETRO_DEQUANT_TYPES, so it cannot disagree with the shaders.
+            return ggml_is_contiguous(op->src[0]) &&
                    device->pipeline_out_prod_quant_f32[op->src[0]->type] != nullptr;
         case GGML_OP_LOG:
         case GGML_OP_TRI:
