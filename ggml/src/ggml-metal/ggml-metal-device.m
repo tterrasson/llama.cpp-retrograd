@@ -6,6 +6,9 @@
 #import "ggml-metal-impl.h"
 #import "ggml-metal-common.h"
 #import "ggml-retro-quant.h"
+// retro delta: the portable half of the RIR contract, which is the whole answer
+// this device gives for a pair whose native kernel is retired.
+#import "ggml-rir/ggml-rir.h"
 
 #include <Foundation/Foundation.h>
 
@@ -146,6 +149,7 @@ int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_wi
     X(POOL,            pool)           \
     X(MISC,            misc)           \
     X(RETRO,           retro)          \
+    X(RIR,             rir)
 // retro delta: the two fork-owned kernel libraries. Their sources are in
 // CMakeLists.txt's METALLIB_KERNEL_SOURCES; without a line here their pipelines
 // are unreachable at runtime ("kernel not found in any metal library").
@@ -2169,27 +2173,22 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 }
             }
         // retro delta: the two backward reductions with no native Metal kernel.
-        // same shape; needs simdgroup reductions. Else falls back to CPU.
+        // No hand-written restatement of the conditions the registry publishes
+        // (F32 throughout, `nb[0] == type_size`, three identical shapes) stands
+        // here: the generated variant is the only implementation, so the
+        // contract *is* the answer: a node
+        // it declines has nowhere to go on this device and must leave for the
+        // CPU, which is exactly what returning false does.
+        //
+        // It is not the same set as before, and that is the point of asking the
+        // contract rather than a copy of it: the RIR contract accepts the packed
+        // QKV view that the equivalent native Vulkan kernel failed on,
+        // and it refuses nothing the matrix or a
+        // real backward graph produces — 60/60 and 30/30 nodes claimed, 100 %
+        // on the graph, which is the condition for removing a native kernel.
         case GGML_OP_RMS_NORM_BACK:
-            return has_simdgroup_reduction &&
-                   op->src[0]->type == GGML_TYPE_F32 &&
-                   op->src[1]->type == GGML_TYPE_F32 &&
-                   op->type         == GGML_TYPE_F32 &&
-                   op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
-                   op->src[1]->nb[0] == ggml_type_size(op->src[1]->type) &&
-                   ggml_are_same_shape(op->src[0], op->src[1]) &&
-                   ggml_are_same_shape(op->src[0], op);
-        // retro delta: L2-norm backward (Qwen3.5 gated delta net k/q
-        // normalization). Same layout contract as RMS-norm backward.
         case GGML_OP_L2_NORM_BACK:
-            return has_simdgroup_reduction &&
-                   op->src[0]->type == GGML_TYPE_F32 &&
-                   op->src[1]->type == GGML_TYPE_F32 &&
-                   op->type         == GGML_TYPE_F32 &&
-                   op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
-                   op->src[1]->nb[0] == ggml_type_size(op->src[1]->type) &&
-                   ggml_are_same_shape(op->src[0], op->src[1]) &&
-                   ggml_are_same_shape(op->src[0], op);
+            return has_simdgroup_reduction && ggml_rir_supports_op(RIR_BACKEND_METAL, op);
         // retro delta: fused sparse cross-entropy. The head is read quantized in
         // the kernel, one variant per type. n_embd is capped by the backward's
         // per-thread accumulator (FSCE_NTH*16*FSCE_MAXC) and must be a multiple of

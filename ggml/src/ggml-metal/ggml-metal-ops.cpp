@@ -9,6 +9,7 @@
 #include "ggml-metal-device.h"
 #include "ggml-metal-fusion.h"
 #include "ggml-metal-tuning.h"
+#include "ggml-rir/ggml-rir.h" // retro delta: RIR variants
 
 #include <cassert>
 #include <algorithm>
@@ -537,13 +538,14 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_opt_step_gefen(ctx, idx);
             } break;
+        // retro delta: the two pairs whose native kernel is retired.
+        // They add no op-specific code at all: the
+        // generated variant is the only implementation, and a node that reaches
+        // here is one `ggml_rir_supports_op` already admitted.
         case GGML_OP_RMS_NORM_BACK: // retro delta
-            {
-                n_fuse = ggml_metal_op_rms_norm_back(ctx, idx);
-            } break;
         case GGML_OP_L2_NORM_BACK: // retro delta
             {
-                n_fuse = ggml_metal_op_l2_norm_back(ctx, idx);
+                n_fuse = ggml_metal_op_rir_only(ctx, idx);
             } break;
         case GGML_OP_OUT_PROD: // retro delta
             {
@@ -871,6 +873,13 @@ int ggml_metal_op_acc(ggml_metal_op_t ctx, int idx) {
 int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
+    // retro delta: RIR selection chain. This encoder
+    // serves a dozen ops; only GGML_OP_SCALE has a registry row, and every
+    // other one leaves here with no variant found and no site counted.
+    if (const int n = ggml_metal_op_rir_try(ctx, idx)) {
+        return n;
+    }
+
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
@@ -1127,6 +1136,14 @@ int ggml_metal_op_cumsum(ggml_metal_op_t ctx, int idx) {
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
+    // retro delta: RIR selection chain. The registry
+    // pins this pair to `observe_generated`, so today the call always measures
+    // and returns 0; promoting it to `prefer_generated` is a one-line change of
+    // the integration table, not of this file.
+    if (const int n = ggml_metal_op_rir_try(ctx, idx)) {
+        return n;
+    }
+
     GGML_ASSERT(ggml_is_contiguous_rows(op->src[0]));
 
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
@@ -1140,8 +1157,6 @@ int ggml_metal_op_cumsum(ggml_metal_op_t ctx, int idx) {
     while (nth < ne00 && 2*nth <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_blk)) {
         nth *= 2;
     }
-
-    GGML_ASSERT(ne00 <= nth*nth);
 
     const int64_t net0 = (ne00 + nth - 1) / nth;
     const int64_t net1 = ne01;
@@ -1158,8 +1173,52 @@ int ggml_metal_op_cumsum(ggml_metal_op_t ctx, int idx) {
     ggml_metal_buffer_id bid_src0 = ggml_metal_get_buffer_id(op->src[0]);
     ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(op);
 
-    ggml_metal_buffer_id bid_tmp = bid_dst;
-    bid_tmp.offs += ggml_nbytes(op);
+    ggml_metal_buffer_id bid_scratch = bid_dst;
+    bid_scratch.offs += ggml_nbytes(op);
+
+    struct cumsum_level {
+        int64_t ne0;
+        uint64_t nb1;
+        uint64_t nb2;
+        uint64_t nb3;
+        ggml_metal_buffer_id bid;
+    };
+
+    // One scan pass reduces a row by `nth`. Keep every level because, once the
+    // top level has been scanned, its offsets have to be propagated back down
+    // to the destination. The Metal allocator reserves one destination-sized
+    // scratch region for CUMSUM; the geometric series below is strictly
+    // smaller than that region for nth > 1.
+    std::vector<cumsum_level> levels;
+    if (ne00 > nth) {
+        GGML_ASSERT(nth > 1);
+
+        int64_t level_ne0 = net0;
+        size_t scratch_offs = 0;
+        const size_t scratch_size = ggml_nbytes(op);
+
+        while (true) {
+            cumsum_level level = {
+                /*.ne0 =*/ level_ne0,
+                /*.nb1 =*/ (uint64_t) level_ne0*sizeof(float),
+                /*.nb2 =*/ (uint64_t) level_ne0*ne01*sizeof(float),
+                /*.nb3 =*/ (uint64_t) level_ne0*ne01*ne02*sizeof(float),
+                /*.bid =*/ bid_scratch,
+            };
+            level.bid.offs += scratch_offs;
+            levels.push_back(level);
+
+            const size_t level_size = (size_t) level_ne0*ne01*ne02*ne03*sizeof(float);
+            GGML_ASSERT(scratch_offs <= scratch_size);
+            GGML_ASSERT(level_size <= scratch_size - scratch_offs);
+            scratch_offs += level_size;
+
+            if (level_ne0 <= nth) {
+                break;
+            }
+            level_ne0 = (level_ne0 + nth - 1) / nth;
+        }
+    }
 
     {
         ggml_metal_kargs_cumsum_blk args = {
@@ -1185,7 +1244,7 @@ int ggml_metal_op_cumsum(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_pipeline(enc, pipeline_blk);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
-        ggml_metal_encoder_set_buffer  (enc, bid_tmp,  2);
+        ggml_metal_encoder_set_buffer  (enc, levels.empty() ? bid_dst : levels[0].bid, 2);
         ggml_metal_encoder_set_buffer  (enc, bid_dst,  3);
 
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
@@ -1193,48 +1252,54 @@ int ggml_metal_op_cumsum(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_dispatch_threadgroups(enc, net0*ne01, ne02, ne03, nth, 1, 1);
     }
 
-    if (ne00 > nth) {
-        ggml_metal_op_concurrency_reset(ctx);
+    if (!levels.empty()) {
+        // Scan the block totals recursively. The old implementation encoded
+        // exactly one such pass and asserted `ne00 <= nth*nth`; a row with more
+        // than nth^2 elements produces too many block totals for that pass.
+        for (size_t i = 0; i < levels.size(); ++i) {
+            ggml_metal_op_concurrency_reset(ctx);
 
-        {
+            const cumsum_level & cur = levels[i];
+            const bool outb = i + 1 < levels.size();
+            const cumsum_level & next = outb ? levels[i + 1] : cur;
+            const int64_t next_ne0 = (cur.ne0 + nth - 1) / nth;
+
             ggml_metal_kargs_cumsum_blk args = {
-                /*.ne00 =*/ net0,
+                /*.ne00 =*/ cur.ne0,
                 /*.ne01 =*/ net1,
                 /*.ne02 =*/ net2,
                 /*.ne03 =*/ net3,
-                /*.nb00 =*/ nbt0,
-                /*.nb01 =*/ nbt1,
-                /*.nb02 =*/ nbt2,
-                /*.nb03 =*/ nbt3,
-                /*.net0 =*/ net0,
+                /*.nb00 =*/ sizeof(float),
+                /*.nb01 =*/ cur.nb1,
+                /*.nb02 =*/ cur.nb2,
+                /*.nb03 =*/ cur.nb3,
+                /*.net0 =*/ next_ne0,
                 /*.net1 =*/ net1,
                 /*.net2 =*/ net2,
                 /*.net3 =*/ net3,
-                /*.nbt0 =*/ nbt0,
-                /*.nbt1 =*/ nbt1,
-                /*.nbt2 =*/ nbt2,
-                /*.nbt3 =*/ nbt3,
-                /*.outb =*/ false,
+                /*.nbt0 =*/ sizeof(float),
+                /*.nbt1 =*/ next.nb1,
+                /*.nbt2 =*/ next.nb2,
+                /*.nbt3 =*/ next.nb3,
+                /*.outb =*/ outb,
             };
 
             ggml_metal_encoder_set_pipeline(enc, pipeline_blk);
             ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
-            ggml_metal_encoder_set_buffer  (enc, bid_tmp, 1);
-            ggml_metal_encoder_set_buffer  (enc, bid_tmp, 2);
-            ggml_metal_encoder_set_buffer  (enc, bid_tmp, 3);
+            ggml_metal_encoder_set_buffer  (enc, cur.bid,  1);
+            ggml_metal_encoder_set_buffer  (enc, next.bid, 2);
+            ggml_metal_encoder_set_buffer  (enc, cur.bid,  3);
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-            ggml_metal_encoder_dispatch_threadgroups(enc, net1, net2, net3, nth, 1, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, next_ne0*net1, net2, net3, nth, 1, 1);
         }
 
-        ggml_metal_op_concurrency_reset(ctx);
-
-        {
+        auto add_block_offsets = [&](int64_t dst_ne0, const cumsum_level & offsets, ggml_metal_buffer_id add_dst) {
             auto pipeline_add = ggml_metal_library_get_pipeline_cumsum_add(lib, op);
 
             ggml_metal_kargs_cumsum_add args = {
-                /*.ne00 =*/ ne00,
+                /*.ne00 =*/ dst_ne0,
                 /*.ne01 =*/ ne01,
                 /*.ne02 =*/ ne02,
                 /*.ne03 =*/ ne03,
@@ -1242,23 +1307,32 @@ int ggml_metal_op_cumsum(ggml_metal_op_t ctx, int idx) {
                 /*.nb01 =*/ nb01,
                 /*.nb02 =*/ nb02,
                 /*.nb03 =*/ nb03,
-                /*.net0 =*/ net0,
+                /*.net0 =*/ offsets.ne0,
                 /*.net1 =*/ net1,
                 /*.net2 =*/ net2,
                 /*.net3 =*/ net3,
-                /*.nbt0 =*/ nbt0,
-                /*.nbt1 =*/ nbt1,
-                /*.nbt2 =*/ nbt2,
-                /*.nbt3 =*/ nbt3,
+                /*.nbt0 =*/ sizeof(float),
+                /*.nbt1 =*/ offsets.nb1,
+                /*.nbt2 =*/ offsets.nb2,
+                /*.nbt3 =*/ offsets.nb3,
             };
 
             ggml_metal_encoder_set_pipeline(enc, pipeline_add);
             ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
-            ggml_metal_encoder_set_buffer  (enc, bid_tmp, 1);
-            ggml_metal_encoder_set_buffer  (enc, bid_dst, 2);
+            ggml_metal_encoder_set_buffer  (enc, offsets.bid, 1);
+            ggml_metal_encoder_set_buffer  (enc, add_dst,     2);
 
-            ggml_metal_encoder_dispatch_threadgroups(enc, net0*ne01, ne02, ne03, nth, 1, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, offsets.ne0*ne01, ne02, ne03, nth, 1, 1);
+        };
+
+        // Propagate the scanned upper levels into the lower block-total arrays.
+        for (size_t i = levels.size(); i-- > 1;) {
+            ggml_metal_op_concurrency_reset(ctx);
+            add_block_offsets(levels[i - 1].ne0, levels[i], levels[i - 1].bid);
         }
+
+        ggml_metal_op_concurrency_reset(ctx);
+        add_block_offsets(ne00, levels[0], bid_dst);
     }
 
     return 1;
@@ -4120,6 +4194,20 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
         }
     }
 
+    // retro delta: RIR selection chain. Placed *after*
+    // the fusion lookahead rather than at the top of the encoder, and the guard
+    // is the point: a generated variant computes one node, so taking a node
+    // that starts a chain of `n_fuse` ADDs would silently trade a fused
+    // dispatch for `n_fuse` separate ones. The lookahead above only reads the
+    // graph and fills `args.o1`, so running it first costs nothing when RIR
+    // does take over. SUB and DIV reach this encoder too and have no registry
+    // row; they leave with no variant found and no site counted.
+    if (n_fuse == 1) {
+        if (const int n = ggml_metal_op_rir_try(ctx, idx)) {
+            return n;
+        }
+    }
+
     // the offsets of src1 and all fused buffers are relative to the start of the src1 buffer
     bid_src1.offs = 0;
 
@@ -4407,6 +4495,20 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
             if (debug_fusion > 1) {
                 GGML_LOG_DEBUG("%s: fuse: %s + SCALE\n", __func__, ggml_op_name(op->op));
             }
+        }
+    }
+
+    // retro delta: RIR selection chain. Placed *after* the
+    // fusion lookahead and guarded on it, for the reason the elementwise band
+    // already established: a generated variant computes one node, so taking a
+    // node that starts a NORM+MUL+ADD chain would trade one dispatch for three.
+    // The lookahead above only reads the graph and fills `args`, so running it
+    // first costs nothing when RIR does take over. GGML_OP_NORM reaches this
+    // encoder too and has no registry row; it leaves with no variant found and
+    // no site counted.
+    if (n_fuse == 1) {
+        if (const int n = ggml_metal_op_rir_try(ctx, idx)) {
+            return n;
         }
     }
 
@@ -5988,95 +6090,120 @@ int ggml_metal_op_opt_step_gefen(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-// retro delta: RMS-norm backward. One threadgroup per row; mirrors the forward
-// kernel_rms_norm dispatch (threads-per-row doubles from a SIMD width up to ne00).
-int ggml_metal_op_rms_norm_back(ggml_metal_op_t ctx, int idx) {
-    ggml_tensor * op = ctx->node(idx);
+// retro delta: the RIR dispatch path. No
+// constant-buffer layout is retyped here: the generated params struct comes
+// from the same `shader_params_layout` that produced the MSL one, so the two
+// cannot drift.
 
-    ggml_metal_library_t lib = ctx->lib;
+// The device half of the RIR contract for this backend, in the shape
+// ggml_rir_evaluate and ggml_rir_preflight_graph consume.
+//
+// Only what needs the device to answer lives here. Element types, rank, shape
+// agreement, stride alignment and u32 representability are portable, decided by
+// `ggml_rir_evaluate_portable` from the registry row; restating them per backend
+// is what let Metal and Vulkan disagree about the same variant. Nothing below
+// names an op, so promoting a second one adds no case.
+//
+// Pure and counter-free: the *same* answer has to serve the require-preflight,
+// which asks about a node it will not encode, and the dispatch site, which is
+// the only one entitled to count.
+int32_t ggml_metal_rir_device_check(void * device_ctx, const ggml_tensor * node) {
+    ggml_metal_library_t lib = (ggml_metal_library_t) device_ctx;
+
+    // Per node, not per op: with more than one lowering per (op, backend) the
+    // variant whose pipeline and threadgroup are checked here must be the one
+    // the dispatch site will encode, and which one that is depends on this
+    // node's shape.
+    const rir_variant_desc * v =
+        ggml_rir_find_variant_for_node(node->op, RIR_BACKEND_METAL, node);
+    if (v == nullptr) {
+        return GGML_RIR_REJECT_WRONG_OP;
+    }
+    auto pipeline = ggml_metal_library_get_pipeline_rir(lib, v);
+    if (!pipeline.pipeline) {
+        return GGML_RIR_REJECT_PIPELINE;
+    }
+    // The threadgroup this pipeline was compiled for must actually fit on the
+    // device; for a variant reducing through a SIMD-group that also means the
+    // collective's width is available.
+    const uint32_t threads = v->workgroup[0]*v->workgroup[1]*v->workgroup[2];
+    const uint32_t needed  = v->requires_subgroup ? (threads > v->min_subgroup ? threads : v->min_subgroup)
+                                                  : threads;
+    if ((uint32_t) ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) < needed) {
+        return GGML_RIR_REJECT_MISSING_FEATURE;
+    }
+    return GGML_RIR_MATCHED;
+}
+
+// Encodes a RIR variant with nothing kernel-specific in the code: the buffers,
+// the constant buffer and the grid all come from the registry row. What is
+// still Metal's is the pipeline object, the encoder and the buffer ids.
+static int ggml_metal_op_rir_dispatch(ggml_metal_op_t ctx, int idx, const rir_variant_desc * v) {
+    ggml_tensor * op = ctx->node(idx);
     ggml_metal_encoder_t enc = ctx->enc;
 
-    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
-    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
-    GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
-    GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
+    auto pipeline = ggml_metal_library_get_pipeline_rir(ctx->lib, v);
 
-    float eps;
-    memcpy(&eps, op->op_params, sizeof(float));
-
-    auto pipeline = ggml_metal_library_get_pipeline_rms_norm_back(lib, op);
-
-    ggml_metal_kargs_rms_norm_back args = {
-        /*.ne00 =*/ ne00,
-        /*.eps  =*/ eps,
-        /*.nb01 =*/ nb01, /*.nb02 =*/ nb02, /*.nb03 =*/ nb03,
-        /*.nb11 =*/ nb11, /*.nb12 =*/ nb12, /*.nb13 =*/ nb13,
-        /*.nb1  =*/ nb1,  /*.nb2  =*/ nb2,  /*.nb3  =*/ nb3,
-    };
-
-    // nth stays a power of two (>= one simdgroup): the kernel's final
-    // cross-simdgroup reduction reads one partial per simdgroup from lanes of
-    // simdgroup 0, which requires every simdgroup to be fully populated.
-    // (Clamping nth to ne00 here previously created a partial trailing
-    // simdgroup and produced wrong sums for row widths like 33.)
-    int nth = 32;
-    while (nth < ne00 && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
-        nth *= 2;
+    // The generated header bounds the buffer and pins each layout with its own
+    // static_assert; the filler places the fields. Both come from the manifest,
+    // so no field of this struct is named here.
+    // Capacity published by ggml-rir.h, checked there against the generated
+    // maximum.
+    alignas(16) char args[RIR_PUSH_CONSTANT_CAPACITY];
+    if (!ggml_rir_fill_params(v, op, args, v->push_constant_bytes)) {
+        GGML_ABORT("ggml-rir: %s params layout mismatch (registry says %u bytes)",
+                v->variant_id, v->push_constant_bytes);
     }
-    nth = std::min(nth, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
+    // RIR binding convention: tensors at 0..n-1 in manifest order, the params
+    // struct right after (the inverse of the native kargs-at-0 layout).
     ggml_metal_encoder_set_pipeline(enc, pipeline);
-    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+    for (uint32_t b = 0; b < v->n_bindings; ++b) {
+        const ggml_tensor * t = ggml_rir_binding_tensor(v, b, op);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(t), b);
+    }
+    ggml_metal_encoder_set_bytes(enc, args, v->push_constant_bytes, v->n_bindings);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
+    uint32_t grid[3];
+    ggml_rir_grid(v, op, grid);
+    ggml_metal_encoder_dispatch_threadgroups(enc, grid[0], grid[1], grid[2],
+            v->workgroup[0], v->workgroup[1], v->workgroup[2]);
 
     return 1;
 }
 
-// retro delta: L2-norm backward. One threadgroup per row; mirrors
-// ggml_metal_op_rms_norm_back's dispatch.
-int ggml_metal_op_l2_norm_back(ggml_metal_op_t ctx, int idx) {
+// The one line an integrated op adds. The mode, the policy, the site
+// attribution, the counters and the `require` enforcement all live in
+// ggml_rir_dispatch_begin; what stays here is Metal's encoding.
+int ggml_metal_op_rir_try(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
-    ggml_metal_library_t lib = ctx->lib;
-    ggml_metal_encoder_t enc = ctx->enc;
-
-    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
-    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
-    GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
-    GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
-
-    float eps;
-    memcpy(&eps, op->op_params, sizeof(float));
-
-    auto pipeline = ggml_metal_library_get_pipeline_l2_norm_back(lib, op);
-
-    ggml_metal_kargs_l2_norm_back args = {
-        /*.ne00 =*/ ne00,
-        /*.eps  =*/ eps,
-        /*.nb01 =*/ nb01, /*.nb02 =*/ nb02, /*.nb03 =*/ nb03,
-        /*.nb11 =*/ nb11, /*.nb12 =*/ nb12, /*.nb13 =*/ nb13,
-        /*.nb1  =*/ nb1,  /*.nb2  =*/ nb2,  /*.nb3  =*/ nb3,
-    };
-
-    int nth = 32;
-    while (nth < ne00 && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
-        nth *= 2;
+    const rir_variant_desc * v = ggml_rir_dispatch_begin(
+            RIR_BACKEND_METAL, op, ggml_metal_rir_device_check, ctx->lib);
+    if (v == nullptr) {
+        return 0;  // native, already counted
     }
-    nth = std::min(nth, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+    const int n = ggml_metal_op_rir_dispatch(ctx, idx, v);
+    ggml_rir_dispatch_end(v);
+    return n;
+}
 
-    ggml_metal_encoder_set_pipeline(enc, pipeline);
-    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
-
-    ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
-
-    return 1;
+// The whole encoder of a pair whose native kernel has been retired:
+// there is no second branch, and that is the shape a
+// finished promotion has. Two ops share it and neither adds a line.
+//
+// It cannot return 0. `ggml_rir_supports_op` is what admitted this node, and it
+// evaluated the same portable contract the site re-evaluates; the only ways to
+// arrive and be refused are a device-half rejection — a build that cannot run
+// on this machine — or a mode lowered after the graph split. Both abort inside
+// `ggml_rir_dispatch_begin`, with the op and the reason.
+int ggml_metal_op_rir_only(ggml_metal_op_t ctx, int idx) {
+    const int n = ggml_metal_op_rir_try(ctx, idx);
+    if (n == 0) {
+        GGML_ABORT("ggml-rir: %s: no variant dispatched and no native kernel (metal)",
+                ggml_op_name(ctx->node(idx)->op));
+    }
+    return n;
 }
 
 // retro delta: repeat backward -- reduce a broadcast input's gradient back onto
@@ -6145,6 +6272,16 @@ int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
     // F32 src0 indexes in elements; quantized src0 can't (block layout),
     // so its kernel takes s01/s02/s03 in bytes instead.
     const int64_t es0 = op->src[0]->type == GGML_TYPE_F32 ? es : 1;
+
+    // retro delta: RIR selection chain. One generated
+    // variant per src0 dtype: F32, plus each quantized format whose
+    // decoder lowering can expand — and the node's own type picks between them.
+    // What is left is the broadcast over ne2/ne3 and
+    // the formats with no portable decoder: both fail the portable contract and
+    // fall through to the native kernel below.
+    if (const int n = ggml_metal_op_rir_try(ctx, idx)) {
+        return n;
+    }
 
     auto pipeline = ggml_metal_library_get_pipeline_out_prod(lib, op);
 

@@ -111,6 +111,12 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 
 #include "ggml-backend-impl.h"
 #include "ggml-retro-quant.h"
+#include "ggml-rir/ggml-rir.h"  // retro delta: RIR AOT variants
+// retro delta: the RIR shader blobs are resolved by name in their own unit, and
+// the constant-buffer capacity is a stable number in ggml-rir.h. Neither the
+// generated shader header nor the generated params header is included here, so
+// adding a RIR kernel does not recompile this 20 000-line unit.
+#include "ggml-vulkan-rir.h"
 
 #include "ggml-vulkan-shaders.hpp"
 
@@ -906,9 +912,13 @@ struct vk_device_struct {
     vk_pipeline pipeline_rms_norm_mul_partials_f32;
     vk_pipeline pipeline_rms_norm_mul_rope_f32_f32;
     vk_pipeline pipeline_rms_norm_mul_rope_f32_f16;
-    vk_pipeline pipeline_rms_norm_back_f32;
     vk_pipeline pipeline_l2_norm_f32;
-    vk_pipeline pipeline_l2_norm_back_f32; // retro delta
+    // retro delta: RIR-generated variants, one pipeline object per *artifact*
+    // — they are distinct SPIR-V modules — keyed by the name the registry
+    // publishes. A map rather than a member per kernel: nothing in this unit
+    // names a generated kernel, so adding one is a registry row and a
+    // shader file, nothing here.
+    std::map<std::string, vk_pipeline> pipeline_rir;
 
     // [src/dst 0=fp32,1=fp16]
     vk_pipeline pipeline_exp[2];

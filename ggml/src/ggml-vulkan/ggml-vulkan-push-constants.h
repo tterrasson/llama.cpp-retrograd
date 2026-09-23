@@ -175,6 +175,19 @@ struct vk_op_gefen_push_constants {
     uint32_t zero_code;
 };
 
+// retro delta: constant buffer of a RIR variant. The *layout* is generated —
+// one struct per production kernel, each with its own static_assert — and
+// `ggml_rir_fill_params` places the fields, so nothing here restates it. What
+// is left is a buffer whose used length is only known from the registry row,
+// hence the explicit size.
+//
+// The capacity is the stable one published by ggml-rir.h, not the generated
+// maximum: this unit must not depend on a header that a new kernel edits.
+struct vk_rir_push_constants {
+    uint32_t data[RIR_PUSH_CONSTANT_CAPACITY / 4];
+    size_t   n_bytes;
+};
+
 struct vk_op_fwht_push_constants {
     uint32_t n_rows;
     uint32_t src_offset;
@@ -1088,6 +1101,15 @@ template <typename T> const T *push_constant_data(const std::vector<T> &t) {
 
 template <typename T, uint32_t N> const T *push_constant_data(const std::array<T, N> &t) {
     return t.data();
+}
+// retro delta: a RIR variant pushes only the prefix its registry row declares,
+// so the length is data, not a type. Non-template overloads, hence preferred
+// over the generic sizeof(T) above.
+static inline size_t push_constant_size(const vk_rir_push_constants &pc) {
+    return pc.n_bytes;
+}
+static inline const void *push_constant_data(const vk_rir_push_constants &pc) {
+    return pc.data;
 }
 
 template <> inline void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_unary_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
