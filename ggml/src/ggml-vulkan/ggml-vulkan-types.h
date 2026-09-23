@@ -394,6 +394,40 @@ enum vk_device_architecture {
     QUALCOMM_ADRENO,
 };
 
+// retro delta: head-dim buckets for the differentiable Flash Attention backward
+// shaders (flash_attn_back_{q,kv}.comp). Each bucket is a separate shader
+// variant whose per-invocation accumulator depth covers head dims up to the
+// listed maximum; dispatch picks the smallest one that fits so narrow-head
+// models keep the shallow variant. Mirrors ggml-cuda/flash-attn-back.cu.
+enum vk_fa_back_bucket {
+    FA_BACK_BUCKET_128,
+    FA_BACK_BUCKET_256,
+    FA_BACK_BUCKET_512,
+    FA_BACK_BUCKETS,
+};
+
+static const uint32_t vk_fa_back_bucket_max_d[FA_BACK_BUCKETS] = { 128, 256, 512 };
+
+// KV cache element type axis, orthogonal to the bucket. F32 is not optional:
+// `cap_flash_attn_back` is probed with an F32 cache (retro_backend.cpp) and
+// clearing that gate is what lets the F16 probe -- and therefore
+// `kv_dtype = "f16"` -- run at all. Mirrors the CUDA and Metal ports.
+enum vk_fa_back_kv {
+    FA_BACK_KV_F16,
+    FA_BACK_KV_F32,
+    FA_BACK_KV_TYPES,
+};
+
+// Largest head dimension any variant covers; the supports check gates on this.
+// Only raise it alongside a new shader variant *and* a gradient-parity test at
+// that head dimension -- an untested variant would report support and produce
+// silently wrong gradients rather than fail. Bounded by
+// GGML_FLASH_ATTN_BACK_MAX_HEAD_DIM, the ceiling the probe harness covers.
+#define VK_FA_BACK_MAX_D 512
+
+static_assert(VK_FA_BACK_MAX_D <= GGML_FLASH_ATTN_BACK_MAX_HEAD_DIM,
+              "advertised head-dim cap exceeds what the probe harness can exercise");
+
 enum vk_conv_shapes {
     CONV_SHAPE_128x128,
     CONV_SHAPE_64x32,
@@ -731,6 +765,7 @@ struct vk_device_struct {
     bool subgroup_size_control;
     uint32_t subgroup_min_size;
     uint32_t subgroup_max_size;
+    bool fa_back_subgroup32;
     bool subgroup_require_full_support;
 
     // floor(log2(maxComputeWorkGroupInvocations))
@@ -997,6 +1032,10 @@ struct vk_device_struct {
     vk_pipeline pipeline_conv2d_dw_cwhn_f32, pipeline_conv2d_dw_cwhn_f16_f32;
 
     std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16;
+    vk_pipeline pipeline_flash_attn_back_q[FA_BACK_KV_TYPES][FA_BACK_BUCKETS];
+    vk_pipeline pipeline_flash_attn_back_kv[FA_BACK_KV_TYPES][FA_BACK_BUCKETS];
+    vk_pipeline pipeline_flash_attn_back_mma_q;
+    vk_pipeline pipeline_flash_attn_back_mma_kv;
 
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
 

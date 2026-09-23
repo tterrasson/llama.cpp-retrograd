@@ -396,6 +396,14 @@ public:
 
     uint32_t get_n_kv() const;
 
+    // retro delta: mapping from a KV gradient window row to its cache row (see
+    // ggml_flash_attn_ext_set_grad_window). `get_kv_stride` is the KV rows per
+    // stream in the underlying buffer; `get_kv_stream0` is the first stream of
+    // the current slot -- together they undo the per-stream offset baked into
+    // the k/v idxs by set_input_k_idxs.
+    int32_t get_kv_stride()  const;
+    int32_t get_kv_stream0() const;
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 

@@ -1040,6 +1040,23 @@ typedef struct {
     uint64_t nb_out; // 0 => snapshots are appended after the attn scores (unfused)
 } ggml_metal_kargs_gated_delta_net;
 
+// retro delta: streaming Flash Attention backward. Mirrors the Vulkan push
+// constants (vk_flash_attn_back_push_constants) field for field so the three
+// ports stay comparable. All offsets and strides are in *float elements*, not
+// bytes. KV_GRAD is the gradient-window row count (== KV when there is no
+// window); kv_stride/kv_stream0 decode kv_idxs (see
+// ggml_flash_attn_ext_set_grad_window).
+typedef struct {
+    int32_t  N, KV, HSK, HSV;
+    int32_t  n_head, n_head_kv, n_batch;
+    int32_t  q_nb1, q_nb2, q_nb3;
+    int32_t  off_q, off_k, off_v, off_stats;
+    float    scale, max_bias, logit_softcap;
+    int32_t  mask_ne1, mask_ne2, mask_ne3;
+    int32_t  flags;
+    int32_t  KV_GRAD, kv_stride, kv_stream0;
+} ggml_metal_kargs_flash_attn_back;
+
 typedef struct {
     int32_t  ne00;
     int32_t  ne01;

@@ -148,6 +148,17 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
     return vk_device_architecture::OTHER;
 }
 
+static vk_fa_back_bucket ggml_vk_fa_back_select_bucket(uint32_t hsk, uint32_t hsv) {
+    const uint32_t hs_max = std::max(hsk, hsv);
+    for (int i = 0; i < FA_BACK_BUCKETS; ++i) {
+        if (hs_max <= vk_fa_back_bucket_max_d[i]) {
+            return (vk_fa_back_bucket) i;
+        }
+    }
+    GGML_ABORT("flash attn back: head dim %u exceeds VK_FA_BACK_MAX_D", hs_max);
+}
+
+
 bool ggml_vk_lightning_indexer_k_type_supported(ggml_type type) {
     return std::find(lightning_indexer_k_types.begin(), lightning_indexer_k_types.end(), type) != lightning_indexer_k_types.end();
 }
@@ -3169,6 +3180,39 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_matmul_split_k_reduce, "split_k_reduce", split_k_reduce_len, split_k_reduce_data, "main", 2, 2 * sizeof(uint32_t), {256 * 4, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_flash_attn_split_k_reduce, "fa_split_k_reduce", fa_split_k_reduce_len, fa_split_k_reduce_data, "main", 3, sizeof(vk_op_flash_attn_split_k_reduce_push_constants), {1, device->subgroup_size, 1}, {device->subgroup_size}, 1, true);
+#define CREATE_FA_BACK_PIPELINES(KVIDX, KV, BUCKET, D)                                          \
+    ggml_vk_create_pipeline(device, device->pipeline_flash_attn_back_q[KVIDX][BUCKET],           \
+            "flash_attn_back_q_f32_" #KV "_d" #D, flash_attn_back_q_f32_##KV##_d##D##_len,       \
+            flash_attn_back_q_f32_##KV##_d##D##_data, "main", 9,                                 \
+            sizeof(vk_flash_attn_back_push_constants), {32, 1, 1}, {}, 1, true, true, 32);       \
+    ggml_vk_create_pipeline(device, device->pipeline_flash_attn_back_kv[KVIDX][BUCKET],          \
+            "flash_attn_back_kv_f32_" #KV "_d" #D, flash_attn_back_kv_f32_##KV##_d##D##_len,     \
+            flash_attn_back_kv_f32_##KV##_d##D##_data, "main", 9,                                \
+            sizeof(vk_flash_attn_back_push_constants), {32, 1, 1}, {}, 1, true, true, 32)
+
+    // retro delta: `required_subgroup_size = 32` above is what makes these usable on
+    // a wave64 device; where 32 is neither native nor selectable the request would
+    // assert, so the pipelines stay null and supports_op falls the op back to the CPU.
+    if (device->fa_back_subgroup32) {
+        CREATE_FA_BACK_PIPELINES(FA_BACK_KV_F16, f16, FA_BACK_BUCKET_128, 128);
+        CREATE_FA_BACK_PIPELINES(FA_BACK_KV_F16, f16, FA_BACK_BUCKET_256, 256);
+        CREATE_FA_BACK_PIPELINES(FA_BACK_KV_F16, f16, FA_BACK_BUCKET_512, 512);
+        CREATE_FA_BACK_PIPELINES(FA_BACK_KV_F32, f32, FA_BACK_BUCKET_128, 128);
+        CREATE_FA_BACK_PIPELINES(FA_BACK_KV_F32, f32, FA_BACK_BUCKET_256, 256);
+        CREATE_FA_BACK_PIPELINES(FA_BACK_KV_F32, f32, FA_BACK_BUCKET_512, 512);
+    }
+#undef CREATE_FA_BACK_PIPELINES
+
+    if (device->fa_back_subgroup32 && device->coopmat_support_16x16x16_f32acc) {
+        ggml_vk_create_pipeline(device, device->pipeline_flash_attn_back_mma_q,
+                "flash_attn_back_mma_q_f32_f16_d128_cm1", flash_attn_back_mma_q_f32_f16_d128_cm1_len,
+                flash_attn_back_mma_q_f32_f16_d128_cm1_data, "main", 9,
+                sizeof(vk_flash_attn_back_push_constants), {256, 1, 1}, {}, 1, true, true, 32);
+        ggml_vk_create_pipeline(device, device->pipeline_flash_attn_back_mma_kv,
+                "flash_attn_back_mma_kv_f32_f16_d128_cm1", flash_attn_back_mma_kv_f32_f16_d128_cm1_len,
+                flash_attn_back_mma_kv_f32_f16_d128_cm1_data, "main", 9,
+                sizeof(vk_flash_attn_back_push_constants), {256, 1, 1}, {}, 1, true, true, 32);
+    }
 
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     if (device->vendor_id == VK_VENDOR_ID_INTEL && (device->architecture == INTEL_XE2 || (device->architecture == INTEL_XE1 && device->coopmat_support && device->uma))) {
@@ -4566,6 +4610,9 @@ vk_device ggml_vk_get_device(size_t idx) {
 
         device->subgroup_require_full_support = subgroup_size_control_features.computeFullSubgroups;
 
+        device->fa_back_subgroup32 = device->subgroup_size == 32 ||
+                (device->subgroup_size_control &&
+                 device->subgroup_min_size <= 32 && 32 <= device->subgroup_max_size);
 #if defined(VK_KHR_cooperative_matrix)
         device->coopmat_support = device->coopmat_support && coopmat_features.cooperativeMatrix;
         device->coopmat1_fa_support = device->coopmat_support && device->subgroup_require_full_support;
@@ -8565,6 +8612,147 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     }
     if (use_mask_opt || use_sparse) {
         ctx->prealloc_y_need_sync = true;
+    }
+}
+
+static void ggml_vk_flash_attn_back(
+        ggml_backend_vk_context * ctx,
+        vk_context & subctx,
+        const ggml_tensor * dst) {
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * out   = dst->src[4];
+    const ggml_tensor * dout    = dst->src[5];
+    const ggml_tensor * sinks   = dst->src[6];
+    const ggml_tensor * kv_idxs = dst->src[9];
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == v->type);
+    GGML_ASSERT(k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_F32);
+    GGML_ASSERT(out->type == GGML_TYPE_F32 && dout->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->ne[0] <= VK_FA_BACK_MAX_D && v->ne[0] <= VK_FA_BACK_MAX_D);
+    GGML_ASSERT(!kv_idxs || (kv_idxs->type == GGML_TYPE_I32 && ggml_is_contiguous(kv_idxs)));
+
+    // Both passes must run the same variant: the dK/dV shader consumes the
+    // per-query LSE/delta the dQ shader wrote.
+    const vk_fa_back_bucket bucket =
+        ggml_vk_fa_back_select_bucket((uint32_t) q->ne[0], (uint32_t) v->ne[0]);
+    const vk_fa_back_kv kv_variant = k->type == GGML_TYPE_F16 ? FA_BACK_KV_F16 : FA_BACK_KV_F32;
+
+    // KV gradient window: dK/dV cover the rows written at this step, not the
+    // whole cache. Without one this is k->ne[1] and the dispatch is unchanged.
+    const uint32_t n_kv_grad = (uint32_t) ggml_flash_attn_back_grad_k(dst)->ne[1];
+
+    size_t off_q = 0;
+    size_t off_k = 0;
+    size_t off_v = 0;
+    size_t off_s = 0;
+    ggml_flash_attn_back_offsets(dst, &off_q, &off_k, &off_v, &off_s);
+
+    float scale;
+    float max_bias;
+    float logit_softcap;
+    memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+
+    const int32_t grad_mask = ggml_get_op_params_i32(dst, 3);
+
+    // retro delta: bit 6 asks the dQ shader to fold the row
+    // log-sum-exp into the sweep that accumulates dQ instead of giving it a pass
+    // of its own. Opt-in, like the CUDA side: the two-sweep form is the default
+    // and the oracle until a measurement clears the folded one. A push constant
+    // rather than a build flag, so a before/after needs no rebuild.
+    const char * fused_env = getenv("GGML_VK_FA_BACK_FUSED_LSE");
+    const bool fused_lse = fused_env != nullptr && std::atoi(fused_env) != 0;
+    const uint32_t flags = (mask ? 1u : 0u) | (sinks ? 2u : 0u) |
+        ((uint32_t) grad_mask << 2) | (kv_idxs ? 32u : 0u) |
+        (fused_lse ? 64u : 0u);
+    const vk_flash_attn_back_push_constants pc = {
+        (uint32_t) q->ne[1], (uint32_t) k->ne[1],
+        (uint32_t) q->ne[0], (uint32_t) v->ne[0],
+        (uint32_t) q->ne[2], (uint32_t) k->ne[2], (uint32_t) q->ne[3],
+        (uint32_t) (q->nb[1] / sizeof(float)),
+        (uint32_t) (q->nb[2] / sizeof(float)),
+        (uint32_t) (q->nb[3] / sizeof(float)),
+        (uint32_t) (off_q / sizeof(float)),
+        (uint32_t) (off_k / sizeof(float)),
+        (uint32_t) (off_v / sizeof(float)),
+        (uint32_t) (off_s / sizeof(float)),
+        scale, max_bias, logit_softcap,
+        mask ? (uint32_t) mask->ne[1] : 1u,
+        mask ? (uint32_t) mask->ne[2] : 1u,
+        mask ? (uint32_t) mask->ne[3] : 1u,
+        flags,
+        n_kv_grad,
+        (uint32_t) ggml_get_op_params_i32(dst, 4),
+        (uint32_t) ggml_get_op_params_i32(dst, 5),
+    };
+
+    const vk_subbuffer q_buf     = ggml_vk_tensor_subbuffer(ctx, q);
+    const vk_subbuffer k_buf     = ggml_vk_tensor_subbuffer(ctx, k);
+    const vk_subbuffer v_buf     = ggml_vk_tensor_subbuffer(ctx, v);
+    const vk_subbuffer out_buf   = ggml_vk_tensor_subbuffer(ctx, out);
+    const vk_subbuffer dout_buf  = ggml_vk_tensor_subbuffer(ctx, dout);
+    const vk_subbuffer dst_buf   = ggml_vk_tensor_subbuffer(ctx, dst);
+    const vk_subbuffer mask_buf  = mask  ? ggml_vk_tensor_subbuffer(ctx, mask)  : k_buf;
+    const vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
+    const vk_subbuffer idxs_buf  = kv_idxs ? ggml_vk_tensor_subbuffer(ctx, kv_idxs) : q_buf;
+
+    const char * mma_env = getenv("GGML_VK_FA_BACK_MMA");
+    const bool mma_enabled = mma_env == nullptr || std::atoi(mma_env) != 0;
+    const bool use_mma = mma_enabled && k->type == GGML_TYPE_F16 &&
+        q->ne[0] == 128 && v->ne[0] == 128 &&
+        ctx->device->coopmat_support_16x16x16_f32acc &&
+        ctx->device->pipeline_flash_attn_back_mma_q &&
+        ctx->device->pipeline_flash_attn_back_mma_kv;
+    vk_pipeline pipeline_q = use_mma
+        ? ctx->device->pipeline_flash_attn_back_mma_q
+        : ctx->device->pipeline_flash_attn_back_q[kv_variant][bucket];
+    vk_pipeline pipeline_kv = use_mma
+        ? ctx->device->pipeline_flash_attn_back_mma_kv
+        : ctx->device->pipeline_flash_attn_back_kv[kv_variant][bucket];
+
+    // O4 point 2: the MMA path is only taken at HSK == HSV == 128 with 16x16x16
+    // F32-accumulate cooperative matrices, so a timing that does not say which
+    // shader ran says nothing. Mirrors GGML_CUDA_FA_BACK_DEBUG.
+    if (getenv("GGML_VK_FA_BACK_DEBUG")) {
+        fprintf(stderr,
+                "fa_back(vk): hsk=%lld hsv=%lld nq=%lld nkv=%lld nhead=%lld nheadk=%lld "
+                "nwin=%u kv=%s mask=%d grads=%c%c%c path=%s lse=%s\n",
+                (long long) q->ne[0], (long long) v->ne[0], (long long) q->ne[1],
+                (long long) k->ne[1], (long long) q->ne[2], (long long) k->ne[2],
+                n_kv_grad, k->type == GGML_TYPE_F16 ? "f16" : "f32", mask ? 1 : 0,
+                (grad_mask & GGML_FLASH_ATTN_BACK_GRAD_Q) ? 'q' : '-',
+                (grad_mask & GGML_FLASH_ATTN_BACK_GRAD_K) ? 'k' : '-',
+                (grad_mask & GGML_FLASH_ATTN_BACK_GRAD_V) ? 'v' : '-',
+                use_mma ? "mma" : "scalar",
+                (!fused_lse || !(grad_mask & GGML_FLASH_ATTN_BACK_GRAD_Q))
+                    ? "two-pass" : "fused");
+    }
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline_q, 1);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline_kv, 1);
+
+    const uint32_t q_dispatch = use_mma
+        ? ((uint32_t) q->ne[1] + 15u)/16u*256u
+        : (uint32_t) q->ne[1]*32u;
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_q,
+            { q_buf, k_buf, v_buf, mask_buf, out_buf, dout_buf, sinks_buf, dst_buf, idxs_buf },
+            pc, { q_dispatch, (uint32_t) q->ne[2], (uint32_t) q->ne[3] });
+
+    // The dK/dV pass consumes the per-query LSE and delta written by the dQ
+    // pass. Keep both dispatches on device and insert the normal Vulkan buffer
+    // dependency used by the other multi-pass training kernels.
+    if (grad_mask & (GGML_FLASH_ATTN_BACK_GRAD_K | GGML_FLASH_ATTN_BACK_GRAD_V)) {
+        ggml_vk_sync_buffers(ctx, subctx);
+        const uint32_t kv_dispatch = use_mma ? (n_kv_grad + 15u)/16u*256u : n_kv_grad*32u;
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_kv,
+                { q_buf, k_buf, v_buf, mask_buf, out_buf, dout_buf, sinks_buf, dst_buf, idxs_buf },
+                pc, { kv_dispatch, (uint32_t) k->ne[2], (uint32_t) k->ne[3] });
     }
 }
 
@@ -12830,6 +13018,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
 
+    case GGML_OP_FLASH_ATTN_BACK:
+        ggml_vk_flash_attn_back(ctx, compute_ctx, node);
+
+        break;
+
     case GGML_OP_RWKV_WKV6:
         ggml_vk_rwkv_wkv6(ctx, compute_ctx, node);
 
@@ -15691,6 +15884,58 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 if (!coopmat2 && !(device->subgroup_shuffle && device->subgroup_vote)) {
                     // scalar/coopmat1 FA uses subgroupShuffle/subgroupAll
+                    return false;
+                }
+                return true;
+            }
+        case GGML_OP_FLASH_ATTN_BACK:
+            {
+                if (!device->fa_back_subgroup32) {
+                    return false;
+                }
+                const ggml_tensor * q     = op->src[0];
+                const ggml_tensor * k     = op->src[1];
+                const ggml_tensor * v     = op->src[2];
+                const ggml_tensor * mask  = op->src[3];
+                const ggml_tensor * out   = op->src[4];
+                const ggml_tensor * dout  = op->src[5];
+                const ggml_tensor * sinks = op->src[6];
+                if (!q || !k || !v || !out || !dout) {
+                    return false;
+                }
+                if (q->type != GGML_TYPE_F32 || out->type != GGML_TYPE_F32 ||
+                    dout->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                // One shader variant per KV element type, so K and V must agree.
+                // F32 is required, not merely nice to have: cap_flash_attn_back is
+                // probed with an F32 cache and that gate precedes the F16 one.
+                if (k->type != v->type ||
+                    (k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_F32)) {
+                    return false;
+                }
+                if (mask && (mask->type != GGML_TYPE_F16 || !ggml_is_contiguous(mask))) {
+                    return false;
+                }
+                if (sinks && sinks->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                if (q->ne[0] > VK_FA_BACK_MAX_D || v->ne[0] > VK_FA_BACK_MAX_D ||
+                    q->ne[0] != k->ne[0] ||
+                    k->ne[1] != v->ne[1] || q->ne[2] % k->ne[2] != 0 ||
+                    k->ne[2] != v->ne[2] || q->ne[3] != k->ne[3] ||
+                    q->ne[3] != v->ne[3]) {
+                    return false;
+                }
+                if (q->nb[0] != sizeof(float) || !ggml_is_contiguous(k) ||
+                    !ggml_is_contiguous(v) || !ggml_is_contiguous(out) ||
+                    !ggml_is_contiguous(dout) || !ggml_is_contiguous(op)) {
+                    return false;
+                }
+                // KV gradient window: contiguous I32 row indices, one per window
+                // row and stream (ggml_flash_attn_ext_set_grad_window).
+                const ggml_tensor * kv_idxs = op->src[9];
+                if (kv_idxs && (kv_idxs->type != GGML_TYPE_I32 || !ggml_is_contiguous(kv_idxs))) {
                     return false;
                 }
                 return true;

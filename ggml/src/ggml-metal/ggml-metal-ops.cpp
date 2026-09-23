@@ -486,6 +486,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_flash_attn_ext(ctx, idx);
             } break;
+        case GGML_OP_FLASH_ATTN_BACK: // retro delta
+            {
+                n_fuse = ggml_metal_op_flash_attn_back(ctx, idx);
+            } break;
         case GGML_OP_SET:
             {
                 n_fuse = ggml_metal_op_set(ctx, idx);
@@ -3855,6 +3859,138 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                 ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, 32*nwg, 1, 1);
             }
         }
+    }
+
+    return 1;
+}
+
+// retro delta: streaming Flash Attention backward -- the kernel that makes an
+// F16 KV cache differentiable (`kv_dtype = "f16"`). Two dispatches over the same
+// packed F32 destination, mirroring ggml_vk_flash_attn_back:
+//
+//   pass q  -- one threadgroup per (query row, head, batch); writes the row
+//              logsumexp / delta statistics, then dQ.
+//   pass kv -- one threadgroup per (gradient-window row, kv head, batch); reads
+//              those statistics, then writes dK/dV.
+//
+// The q pass is dispatched unconditionally even when dQ is not requested: the kv
+// pass depends on its statistics. Nothing is zero-filled first -- every element
+// of every requested segment is written exactly once, and unrequested segments
+// are not allocated at all.
+int ggml_metal_op_flash_attn_back(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * q       = op->src[0];
+    const ggml_tensor * k       = op->src[1];
+    const ggml_tensor * v       = op->src[2];
+    const ggml_tensor * mask    = op->src[3];
+    const ggml_tensor * out     = op->src[4];
+    const ggml_tensor * dout    = op->src[5];
+    const ggml_tensor * sinks   = op->src[6];
+    const ggml_tensor * kv_idxs = op->src[9];
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == v->type);
+    GGML_ASSERT(k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_F32);
+    GGML_ASSERT(out->type == GGML_TYPE_F32 && dout->type == GGML_TYPE_F32);
+    GGML_ASSERT(op->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->ne[0] <= GGML_METAL_FA_BACK_MAX_D && v->ne[0] <= GGML_METAL_FA_BACK_MAX_D);
+    GGML_ASSERT(!kv_idxs || (kv_idxs->type == GGML_TYPE_I32 && ggml_is_contiguous(kv_idxs)));
+
+    // KV gradient window: dK/dV cover the rows written at this step, not the
+    // whole cache. Without one this is k->ne[1] and the dispatch is unchanged.
+    const int32_t n_kv_grad = (int32_t) ggml_flash_attn_back_grad_k(op)->ne[1];
+
+    // Never recompute the packed layout -- ggml owns it (ggml.c).
+    size_t off_q = 0;
+    size_t off_k = 0;
+    size_t off_v = 0;
+    size_t off_s = 0;
+    ggml_flash_attn_back_offsets(op, &off_q, &off_k, &off_v, &off_s);
+
+    float scale;
+    float max_bias;
+    float logit_softcap;
+    memcpy(&scale,         (const float *) op->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (const float *) op->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) op->op_params + 2, sizeof(float));
+
+    const int32_t grad_mask = ggml_get_op_params_i32(op, 3);
+
+    // Bits 2..4 carry ggml_flash_attn_back_grad shifted left by 2; bit 5 is the
+    // window. Must agree with the RETRO_FA_BACK_FLAG_* defines in the shader.
+    const int32_t flags = (mask ? 1 : 0) | (sinks ? 2 : 0) |
+        (grad_mask << 2) | (kv_idxs ? 32 : 0);
+
+    ggml_metal_kargs_flash_attn_back args = {
+        /*.N         =*/ (int32_t) q->ne[1],
+        /*.KV        =*/ (int32_t) k->ne[1],
+        /*.HSK       =*/ (int32_t) q->ne[0],
+        /*.HSV       =*/ (int32_t) v->ne[0],
+        /*.n_head    =*/ (int32_t) q->ne[2],
+        /*.n_head_kv =*/ (int32_t) k->ne[2],
+        /*.n_batch   =*/ (int32_t) q->ne[3],
+        /*.q_nb1     =*/ (int32_t) (q->nb[1]/sizeof(float)),
+        /*.q_nb2     =*/ (int32_t) (q->nb[2]/sizeof(float)),
+        /*.q_nb3     =*/ (int32_t) (q->nb[3]/sizeof(float)),
+        /*.off_q     =*/ (int32_t) (off_q/sizeof(float)),
+        /*.off_k     =*/ (int32_t) (off_k/sizeof(float)),
+        /*.off_v     =*/ (int32_t) (off_v/sizeof(float)),
+        /*.off_stats =*/ (int32_t) (off_s/sizeof(float)),
+        /*.scale         =*/ scale,
+        /*.max_bias      =*/ max_bias,
+        /*.logit_softcap =*/ logit_softcap,
+        /*.mask_ne1  =*/ mask ? (int32_t) mask->ne[1] : 1,
+        /*.mask_ne2  =*/ mask ? (int32_t) mask->ne[2] : 1,
+        /*.mask_ne3  =*/ mask ? (int32_t) mask->ne[3] : 1,
+        /*.flags     =*/ flags,
+        /*.KV_GRAD   =*/ n_kv_grad,
+        /*.kv_stride =*/ ggml_get_op_params_i32(op, 4),
+        /*.kv_stream0=*/ ggml_get_op_params_i32(op, 5),
+    };
+
+    // Metal faults on an unbound buffer argument even when the shader never reads
+    // it, so the optional operands get a live stand-in and the shader gates the
+    // read on `flags` (same trick as the Vulkan port).
+    const ggml_metal_buffer_id bid_q     = ggml_metal_get_buffer_id(q);
+    const ggml_metal_buffer_id bid_k     = ggml_metal_get_buffer_id(k);
+    const ggml_metal_buffer_id bid_v     = ggml_metal_get_buffer_id(v);
+    const ggml_metal_buffer_id bid_out   = ggml_metal_get_buffer_id(out);
+    const ggml_metal_buffer_id bid_dout  = ggml_metal_get_buffer_id(dout);
+    const ggml_metal_buffer_id bid_dst   = ggml_metal_get_buffer_id(op);
+    const ggml_metal_buffer_id bid_mask  = mask    ? ggml_metal_get_buffer_id(mask)    : bid_k;
+    const ggml_metal_buffer_id bid_sinks = sinks   ? ggml_metal_get_buffer_id(sinks)   : bid_q;
+    const ggml_metal_buffer_id bid_idxs  = kv_idxs ? ggml_metal_get_buffer_id(kv_idxs) : bid_q;
+
+    auto bind = [&](ggml_metal_pipeline_with_params pipeline) {
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, bid_q,     1);
+        ggml_metal_encoder_set_buffer  (enc, bid_k,     2);
+        ggml_metal_encoder_set_buffer  (enc, bid_v,     3);
+        ggml_metal_encoder_set_buffer  (enc, bid_mask,  4);
+        ggml_metal_encoder_set_buffer  (enc, bid_out,   5);
+        ggml_metal_encoder_set_buffer  (enc, bid_dout,  6);
+        ggml_metal_encoder_set_buffer  (enc, bid_sinks, 7);
+        ggml_metal_encoder_set_buffer  (enc, bid_dst,   8);
+        ggml_metal_encoder_set_buffer  (enc, bid_idxs,  9);
+    };
+
+    // One threadgroup of 32 threads == one SIMD group, so the cross-thread
+    // reductions are plain simd_sum. Both passes must run the same head-dim
+    // bucket; the pipeline getters share the selector.
+    bind(ggml_metal_library_get_pipeline_flash_attn_back_q(lib, op));
+    ggml_metal_encoder_dispatch_threadgroups(enc, args.N, args.n_head, args.n_batch, 32, 1, 1);
+
+    if (grad_mask & (GGML_FLASH_ATTN_BACK_GRAD_K | GGML_FLASH_ATTN_BACK_GRAD_V)) {
+        // The dK/dV pass consumes the per-query LSE and delta the dQ pass wrote.
+        ggml_metal_op_concurrency_reset(ctx);
+
+        bind(ggml_metal_library_get_pipeline_flash_attn_back_kv(lib, op));
+        ggml_metal_encoder_dispatch_threadgroups(enc, args.KV_GRAD, args.n_head_kv, args.n_batch, 32, 1, 1);
     }
 
     return 1;
