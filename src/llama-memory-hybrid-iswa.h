@@ -51,6 +51,9 @@ public:
             llama_batch_allocr & balloc,
             uint32_t n_ubatch,
             bool embd_all) override;
+    llama_memory_context_ptr init_batch_packed(
+            llama_batch_allocr & balloc,
+            uint32_t n_ubatch) override;
 
     llama_memory_context_ptr init_full() override;
 
@@ -84,6 +87,9 @@ public:
     llama_memory_recurrent * get_mem_recr() const;
 
 private:
+    llama_memory_context_ptr init_batch_impl(
+            llama_batch_allocr & balloc, uint32_t n_ubatch,
+            bool embd_all, bool packed);
     const llama_hparams & hparams;
 
     const std::unique_ptr<llama_kv_cache_iswa> mem_attn;
@@ -111,7 +117,8 @@ public:
            llama_memory_hybrid_iswa * mem,
                     slot_info_vec_t   sinfos_base,
                     slot_info_vec_t   sinfos_swa,
-          std::vector<llama_ubatch>   ubatches);
+          std::vector<llama_ubatch>   ubatches,
+                                bool indexed_recurrent = false);
 
     ~llama_memory_hybrid_iswa_context() = default;
 

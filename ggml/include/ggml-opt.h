@@ -180,6 +180,13 @@ extern "C" {
 
     // set gradients to zero, initialize loss, and optionally reset the optimizer
     GGML_API void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer);
+    // Change the number of physical graphs in the next logical update. This
+    // is legal only at an update boundary; dynamic graphs are rebuilt with the
+    // corresponding GRAD/OPT topology on each evaluation.
+    GGML_API bool ggml_opt_set_period(ggml_opt_context_t opt_ctx, int32_t opt_period);
+    // Abandons an incomplete accumulation period without applying an optimizer
+    // step. Persistent momenta and the published iteration are unchanged.
+    GGML_API bool ggml_opt_abort_accumulation(ggml_opt_context_t opt_ctx);
 
     GGML_API bool ggml_opt_static_graphs(ggml_opt_context_t opt_ctx); // whether the graphs are allocated_statically
 
@@ -197,6 +204,17 @@ extern "C" {
 
     // get the gradient accumulator for a node from the forward graph
     GGML_API struct ggml_tensor * ggml_opt_grad_acc(ggml_opt_context_t opt_ctx, struct ggml_tensor * node);
+
+    // retro delta: the same accumulator, keyed by parameter name.
+    //
+    // ggml_opt_grad_acc() reads the graph, and a dynamic-graph context drops
+    // its graphs at the end of every ggml_opt_eval() - so the gradient the
+    // update step just consumed is unreachable the moment the step returns.
+    // The accumulators themselves live in ctx_static and outlive the graph,
+    // exactly like the momenta below, and the name is what indexes them.
+    // Returns NULL before the first optimizer graph is built and for a name
+    // that is not a parameter of it.
+    GGML_API struct ggml_tensor * ggml_opt_grad_acc_by_name(ggml_opt_context_t opt_ctx, const char * name);
 
     // retro delta: optimizer-state access for training checkpoints.
     //

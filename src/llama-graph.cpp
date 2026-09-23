@@ -154,6 +154,37 @@ bool llm_graph_input_pos::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_conv_idx::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(idx && ubatch && ubatch->pos && ubatch->seq_id);
+    const uint32_t n_tokens = ubatch->n_tokens;
+    std::vector<int32_t> data((size_t) l_cache*n_tokens, (int32_t) n_tokens);
+
+    // The extra row n_tokens is a zero row appended by the graph. A physical
+    // prompt token may belong to several logical sequences; remember it for
+    // each id so every branch resolves its predecessor back into that one row.
+    std::unordered_map<llama_seq_id, std::unordered_map<llama_pos, int32_t>> rows;
+    for (uint32_t t = 0; t < n_tokens; ++t) {
+        for (int32_t s = 0; s < ubatch->n_seq_id[t]; ++s) {
+            rows[ubatch->seq_id[t][s]][ubatch->pos[t]] = (int32_t) t;
+        }
+    }
+    for (uint32_t t = 0; t < n_tokens; ++t) {
+        const llama_seq_id seq = ubatch->seq_id[t][0];
+        const auto found_seq = rows.find(seq);
+        for (uint32_t k = 0; k < l_cache; ++k) {
+            const llama_pos wanted = ubatch->pos[t] - (llama_pos) (l_cache - 1 - k);
+            if (wanted < 0 || found_seq == rows.end()) {
+                continue;
+            }
+            const auto found = found_seq->second.find(wanted);
+            if (found != found_seq->second.end()) {
+                data[(size_t) t*l_cache + k] = found->second;
+            }
+        }
+    }
+    ggml_backend_tensor_set(idx, data.data(), 0, data.size()*sizeof(int32_t));
+}
+
 void llm_graph_input_attn_temp::set_input(const llama_ubatch * ubatch) {
     if (ubatch->pos && attn_scale) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -1100,6 +1131,9 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
     }
 
+    if (!inp_rs) {
+        return;
+    }
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
     if (inp_rs->s_copy) {
@@ -1125,6 +1159,9 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
 
+    if (!inp_rs) {
+        return res && !params.ubatch.equal_seqs();
+    }
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
     res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
@@ -1144,6 +1181,9 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
 
     mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
 
+    if (!inp_rs) {
+        return;
+    }
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
     if (inp_rs->s_copy) {
@@ -1218,6 +1258,9 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
         attn_ctx->get_swa()->set_input_v_rot(inp_attn->self_v_rot_swa);
     }
 
+    if (!inp_rs) {
+        return;
+    }
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
     if (inp_rs->s_copy) {
@@ -1256,6 +1299,9 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask_swa, attn_ctx->get_swa(), params.ubatch, params.cparams);
 
+    if (!inp_rs) {
+        return res && !params.ubatch.equal_seqs();
+    }
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
     res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
@@ -3714,7 +3760,9 @@ ggml_tensor * llm_graph_context::build_rwkv_token_shift_store(
 llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
-    auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
+    auto inp_rs   = ubatch.equal_seqs()
+        ? build_rs_inp_impl(ctx0, ubatch, mctx_cur->get_recr())
+        : nullptr;
     auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
@@ -3736,7 +3784,9 @@ llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k() const
 llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_iswa_context *>(mctx);
 
-    auto inp_rs = build_rs_inp_impl(ctx0, ubatch, mctx_cur->get_recr());
+    auto inp_rs = ubatch.equal_seqs()
+        ? build_rs_inp_impl(ctx0, ubatch, mctx_cur->get_recr())
+        : nullptr;
 
     // build iswa attention input
     const auto * attn_ctx = mctx_cur->get_attn();

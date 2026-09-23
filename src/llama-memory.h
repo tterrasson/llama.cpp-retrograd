@@ -90,6 +90,14 @@ struct llama_memory_i {
             uint32_t n_ubatch,
             bool embd_all) = 0;
 
+    // Packed differentiable graphs preserve their explicit physical layout;
+    // recurrent models must not regroup them into equal-sequence ubatches.
+    virtual llama_memory_context_ptr init_batch_packed(
+            llama_batch_allocr & balloc,
+            uint32_t n_ubatch) {
+        return init_batch(balloc, n_ubatch, true);
+    }
+
     // simulate full cache, used for allocating worst-case compute buffers
     virtual llama_memory_context_ptr init_full() = 0;
 
