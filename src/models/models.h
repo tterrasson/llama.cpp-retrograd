@@ -105,11 +105,14 @@ struct llm_build_lfm_base : public llm_graph_context {
 
     virtual ~llm_build_lfm_base() = default;
 
+    // retro delta: inp_conv_idx carries the per-token conv windows of a packed
+    // ubatch (!equal_seqs); null keeps the upstream equal-seqs path.
     ggml_tensor * build_lfm_shortconv(const llama_model & model,
                                       const llama_memory_recurrent_context * mctx_recr,
                                       llm_graph_input_rs * inp_recr,
                                       ggml_tensor * cur,
-                                      int il);
+                                      int il,
+                                      llm_graph_input_conv_idx * inp_conv_idx = nullptr);
 
     ggml_tensor * build_lfm_dense_ffn(const llama_model & model,
                                       ggml_tensor * cur,

@@ -152,6 +152,16 @@ llama_model_lfm2::graph<iswa>::graph(const llama_model & model, const llm_graph_
     using inp_attn_type   = std::conditional_t<iswa, llm_graph_input_attn_kv_iswa,     llm_graph_input_attn_kv>;
     using mem_hybrid_ctx  = std::conditional_t<iswa, llama_memory_hybrid_iswa_context, llama_memory_hybrid_context>;
 
+    llm_graph_input_conv_idx * inp_conv_idx = nullptr;
+    if (!ubatch.equal_seqs()) {
+        auto inp = std::make_unique<llm_graph_input_conv_idx>(hparams.n_shortconv_l_cache);
+        inp->idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32,
+                hparams.n_shortconv_l_cache * ubatch.n_tokens);
+        ggml_set_input(inp->idx);
+        ggml_set_name(inp->idx, "conv_src_idx");
+        inp_conv_idx = (llm_graph_input_conv_idx *) res->add_input(std::move(inp));
+    }
+
     auto build_attn_block = [&model, this](ggml_tensor *   cur,
                                            ggml_tensor *   inp_pos,
                                            inp_attn_type * inp_attn,
@@ -210,7 +220,7 @@ llama_model_lfm2::graph<iswa>::graph(const llama_model & model, const llm_graph_
 
         if (hparams.is_recr(il)) {
             const auto * mctx_recr = static_cast<const mem_hybrid_ctx *>(mctx)->get_recr();
-            cur = build_lfm_shortconv(model, mctx_recr, inp_hybrid->get_recr(), cur, il);
+            cur = build_lfm_shortconv(model, mctx_recr, inp_hybrid->get_recr(), cur, il, inp_conv_idx);
         } else {
             cur = build_attn_block(cur, inp_pos, inp_hybrid->get_attn(), il);
         }

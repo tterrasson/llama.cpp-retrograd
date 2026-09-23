@@ -10,20 +10,24 @@ ggml_tensor * llm_build_lfm_base::build_lfm_shortconv(const llama_model & model,
                                                       const llama_memory_recurrent_context * mctx_recr,
                                                       llm_graph_input_rs * inp_recr,
                                                       ggml_tensor * cur,
-                                                      int il) {
+                                                      int il,
+                                                      llm_graph_input_conv_idx * inp_conv_idx) {
     const uint32_t kv_head      = mctx_recr->get_head();
     const int64_t  n_seq_tokens = ubatch.n_seq_tokens;
     const int64_t  n_seqs       = ubatch.n_seqs;
     GGML_ASSERT(n_seqs != 0);
-    GGML_ASSERT(ubatch.equal_seqs());
-    GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
+    // retro delta: a packed ubatch (!equal_seqs) takes the indexed-window path below
+    GGML_ASSERT(ubatch.equal_seqs() || inp_conv_idx != nullptr);
 
     GGML_ASSERT(hparams.n_shortconv_l_cache > 1);
     const uint32_t d_conv = hparams.n_shortconv_l_cache - 1;
     const int64_t  n_embd = hparams.n_embd;
 
-    // {n_embd, n_tokens} => {n_embd, n_seq_tokens, n_seqs}
-    cur = ggml_reshape_3d(ctx0, cur, cur->ne[0], n_seq_tokens, n_seqs);
+    if (ubatch.equal_seqs()) {
+        GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
+        // {n_embd, n_tokens} => {n_embd, n_seq_tokens, n_seqs}
+        cur = ggml_reshape_3d(ctx0, cur, cur->ne[0], n_seq_tokens, n_seqs);
+    }
 
     auto * bcx = build_lora_mm(model.layers[il].shortconv.in_proj, cur);
     cb(bcx, "model.layers.{}.conv.in_proj", il);
@@ -37,6 +41,33 @@ ggml_tensor * llm_build_lfm_base::build_lfm_shortconv(const llama_model & model,
                                          1 * chunk_size * ggml_element_size(bcx));
     auto *     x          = ggml_view_3d(ctx0, bcx, chunk_size, bcx->ne[1], bcx->ne[2], bcx->nb[1], bcx->nb[2],
                                          2 * chunk_size * ggml_element_size(bcx));
+
+    // retro delta: packed ubatch, no conv state is read or written
+    if (!ubatch.equal_seqs()) {
+        auto * b_flat = ggml_reshape_2d(ctx0, ggml_cont(ctx0, b), chunk_size, ubatch.n_tokens);
+        auto * c_flat = ggml_reshape_2d(ctx0, ggml_cont(ctx0, c), chunk_size, ubatch.n_tokens);
+        auto * x_flat = ggml_reshape_2d(ctx0, ggml_cont(ctx0, x), chunk_size, ubatch.n_tokens);
+        auto * bx_untransposed = ggml_mul(ctx0, b_flat, x_flat);
+        // Gather each token's logical ShortConv window. The appended row
+        // supplies zeros before position zero. Duplicate prompt indices
+        // deliberately scatter-add in GET_ROWS_BACK during autodiff.
+        auto * bx_zero = ggml_pad_ext(ctx0, bx_untransposed,
+                0, 0, 0, 1, 0, 0, 0, 0);
+        auto * windows = ggml_get_rows(ctx0, bx_zero, inp_conv_idx->idx);
+        windows = ggml_reshape_3d(ctx0, windows, n_embd,
+                hparams.n_shortconv_l_cache, ubatch.n_tokens);
+        auto * kernel = model.layers[il].shortconv.conv;
+        windows = ggml_cont(ctx0, ggml_permute(ctx0, windows, 1, 0, 2, 3));
+        auto * kernel_rows = ggml_repeat(ctx0, kernel, windows);
+        auto * conv_out = ggml_sum_rows(ctx0, ggml_mul(ctx0, windows, kernel_rows));
+        conv_out = ggml_reshape_2d(ctx0, conv_out, n_embd, ubatch.n_tokens);
+        cb(conv_out, "model.layers.{}.conv.conv_indexed", il);
+
+        auto * y = ggml_mul(ctx0, c_flat, conv_out);
+        y = build_lora_mm(model.layers[il].shortconv.out_proj, y);
+        cb(y, "model.layers.{}.conv.out_proj", il);
+        return y;
+    }
 
     auto * bx = ggml_transpose(ctx0, ggml_mul(ctx0, b, x));
 
