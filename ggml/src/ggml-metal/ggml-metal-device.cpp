@@ -676,6 +676,19 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan_back(
     return res;
 }
 
+// retro delta: analytic backward for GATED_DELTA_NET.
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net_back(
+        ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_GATED_DELTA_NET_BACK);
+
+    const char * name = "kernel_gated_delta_net_back_f32";
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    return res;
+}
+
 // retro delta: streaming Flash Attention backward. Variant name is
 // kernel_flash_attn_back_<pass>_f32_<kv type>_d<head-dim bucket>. Both passes must
 // resolve the *same* variant -- the dK/dV pass consumes the per-query LSE/delta
@@ -2601,6 +2614,24 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rms_norm_back(gg
     char name[256];
 
     snprintf(base, 256, "kernel_rms_norm_back_%s", ggml_type_name(op->src[0]->type));
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
+// retro delta: L2-norm backward pipeline (LoRA training on Metal)
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_l2_norm_back(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_L2_NORM_BACK);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_l2_norm_back_%s", ggml_type_name(op->src[0]->type));
     snprintf(name, 256, "%s", base);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);

@@ -520,6 +520,9 @@ extern "C" {
         GGML_OP_RMS_NORM_BACK,
         GGML_OP_GROUP_NORM,
         GGML_OP_L2_NORM,
+        // retro delta: analytic backward for GGML_OP_L2_NORM (needed by Qwen3.5's
+        // gated delta net k/q per-token L2 normalization). See ggml_l2_norm_back.
+        GGML_OP_L2_NORM_BACK,
 
         GGML_OP_MUL_MAT,
         GGML_OP_MUL_MAT_ID,
@@ -603,6 +606,12 @@ extern "C" {
 
         GGML_OP_SSM_CONV_BACK,
         GGML_OP_SSM_SCAN_BACK,
+
+        // retro delta: analytic backward for GGML_OP_GATED_DELTA_NET (Qwen3-Next /
+        // Qwen3.5). Recomputes the per-token recurrence forward (storing the
+        // trajectory of states) then reverse-scans it, mirroring
+        // GGML_OP_SSM_SCAN_BACK's structure. See ggml_gated_delta_net_back.
+        GGML_OP_GATED_DELTA_NET_BACK,
 
         // retro delta: fused sparse cross-entropy over a projection head. Computes
         // the weighted cross-entropy loss (and its gradient wrt the hidden states)
@@ -1440,6 +1449,15 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_l2_norm_inplace(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
+            float                 eps);
+
+    // retro delta: analytic backward for ggml_l2_norm.
+    // a - grad of the l2_norm output
+    // b - x (the l2_norm input from the forward pass)
+    GGML_API struct ggml_tensor * ggml_l2_norm_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
             float                 eps);
 
     // a - x
@@ -2767,6 +2785,44 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
+
+    // retro delta: analytic backward for ggml_gated_delta_net. `grad` is the
+    // gradient of the full packed forward output (attn scores ++ K state
+    // snapshots). Returns a packed tensor [ grad_q | grad_k | grad_v | grad_g |
+    // grad_beta | grad_state ] (flat, in that order); slice with ggml_view_1d.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * grad,
+            int64_t               K);
+
+    // retro delta: same op, with the formulation pinned instead of left to the
+    // backend default. Two implementations of
+    // the same gradients exist: the per-token sequential scan, and a chunkwise
+    // one that replaces the scan inside a chunk of `chunk` tokens by six matrix
+    // products and a unit-triangular solve. `chunk`:
+    //   0  backend default (CPU: sequential; CUDA: chunkwise)
+    //   <0 force the sequential scan -- the reference both are checked against
+    //   >0 force the chunkwise form with this chunk length
+    // Backends without a chunkwise kernel ignore a positive value. Only tests
+    // and the two GGML_*_GDN_BACK_CHUNK environment overrides need this;
+    // graph builders should call ggml_gated_delta_net_back.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_back_chunked(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * grad,
+            int64_t               K,
+            int32_t               chunk);
 
     // DSA lightning indexer
     //
