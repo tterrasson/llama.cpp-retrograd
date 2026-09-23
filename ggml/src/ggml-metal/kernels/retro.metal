@@ -778,9 +778,8 @@ kernel void kernel_conv_rs_gather_f32(
             (s_idx + (int64_t) k)*args.nb00 + (int64_t) c*args.nb01 + (int64_t) s*args.nb02);
 }
 
-// retro delta: stochastic rounding for F16 parameters. Mirrors
-// ggml_sr_uniform / ggml_stochastic_round_f16 in ggml-impl.h bit for bit -- an
-// exact CPU-vs-GPU equality test covers the three implementations.
+// retro delta: stochastic rounding for half-precision parameters. Mirrors the
+// ggml-impl.h helpers bit for bit; an exact CPU-vs-GPU equality test covers it.
 static inline float retro_sr_uniform(uint seed, uint index) {
     uint h = seed ^ (index * 0x9E3779B9u);
     h ^= h >> 16; h *= 0x7FEB352Du;
@@ -789,7 +788,9 @@ static inline float retro_sr_uniform(uint seed, uint index) {
     return float(h >> 8) * (1.0f / 16777216.0f);
 }
 
-static inline ushort retro_f16_neighbour(ushort bits, bool up) {
+// One function for both grids: F16 and BF16 are both sign-magnitude in 16
+// bits, so the neighbour is a magnitude increment either way.
+static inline ushort retro_half_neighbour(ushort bits, bool up) {
     const ushort sign = bits & 0x8000;
     const ushort mag  = bits & 0x7FFF;
     if (mag == 0) {
@@ -806,7 +807,7 @@ static inline float retro_stochastic_round_f16(float x, float u) {
     if (residual == 0.0f) {
         return nearest_f;
     }
-    const ushort other   = retro_f16_neighbour(as_type<ushort>(nearest), residual > 0.0f);
+    const ushort other   = retro_half_neighbour(as_type<ushort>(nearest), residual > 0.0f);
     const float  other_f = float(as_type<half>(other));
     const float  span    = other_f - nearest_f;
     const float  p = (span != 0.0f && isfinite(span)) ? residual / span : 0.0f;
@@ -841,6 +842,101 @@ kernel void kernel_opt_step_adamw_f16(
             - alpha * (gmi * beta1h) / (sqrt(gvi * beta2h) + eps);
     x[gid] = half(retro_stochastic_round_f16(
             updated, retro_sr_uniform(uint(pars[7]), gid)));
+}
+
+// BF16 is the top 16 bits of the F32 with the same value, round-half-to-even
+// on the way down (ggml_compute_fp32_to_bf16). The parameter is a raw 16-bit
+// word here and every arithmetic step is F32, so the kernel needs no `bfloat`.
+static inline ushort retro_f32_to_bf16(float x) {
+    const uint bits = as_type<uint>(x);
+    if ((bits & 0x7FFFFFFFu) > 0x7F800000u) {
+        return ushort((bits >> 16) | 64u);  // NaN, forced quiet
+    }
+    return ushort((bits + (0x7FFFu + ((bits >> 16) & 1u))) >> 16);
+}
+
+static inline float retro_bf16_to_f32(ushort bits) {
+    return as_type<float>(uint(bits) << 16);
+}
+
+// Returns the BF16 bits of `x` after stochastic rounding with uniform `u`.
+static inline ushort retro_stochastic_round_bf16(float x, float u) {
+    const ushort nearest   = retro_f32_to_bf16(x);
+    const float  nearest_f = retro_bf16_to_f32(nearest);
+    const float  residual  = x - nearest_f;
+    if (residual == 0.0f) {
+        return nearest;
+    }
+    const ushort other   = retro_half_neighbour(nearest, residual > 0.0f);
+    const float  other_f = retro_bf16_to_f32(other);
+    const float  span    = other_f - nearest_f;
+    const float  p = (span != 0.0f && isfinite(span)) ? residual / span : 0.0f;
+    return u < p ? other : nearest;
+}
+
+kernel void kernel_opt_step_adamw_bf16(
+        constant    ggml_metal_kargs_opt_step_adamw & args,
+        device       ushort * x,
+        device const float * g,
+        device       float * g_m,
+        device       float * g_v,
+        device const float * pars,
+        uint        gid[[thread_position_in_grid]]) {
+    if (gid >= args.np) {
+        return;
+    }
+
+    const float alpha  = pars[0];
+    const float beta1  = pars[1];
+    const float beta2  = pars[2];
+    const float eps    = pars[3];
+    const float wd     = pars[4];
+    const float beta1h = pars[5];
+    const float beta2h = pars[6];
+    const float gi = g[gid] * pars[8];
+    const float gmi = g_m[gid] * beta1 + gi * (1.0f - beta1);
+    const float gvi = g_v[gid] * beta2 + gi * gi * (1.0f - beta2);
+    g_m[gid] = gmi;
+    g_v[gid] = gvi;
+    const float updated = retro_bf16_to_f32(x[gid]) * (1.0f - alpha * wd)
+            - alpha * (gmi * beta1h) / (sqrt(gvi * beta2h) + eps);
+    x[gid] = retro_stochastic_round_bf16(
+            updated, retro_sr_uniform(uint(pars[7]), gid));
+}
+
+// The same stochastically rounded store as AdamW, over a step with no moments.
+kernel void kernel_opt_step_sgd_f16(
+        constant    ggml_metal_kargs_opt_step_sgd & args,
+        device       half * x,
+        device const float * g,
+        device const float * pars,
+        uint        gid[[thread_position_in_grid]]) {
+    if (gid >= args.np) {
+        return;
+    }
+
+    const float alpha = pars[0];
+    const float keep  = 1.0f - alpha * pars[1];
+    const float updated = float(x[gid]) * keep - alpha * g[gid];
+    x[gid] = half(retro_stochastic_round_f16(
+            updated, retro_sr_uniform(uint(pars[2]), gid)));
+}
+
+kernel void kernel_opt_step_sgd_bf16(
+        constant    ggml_metal_kargs_opt_step_sgd & args,
+        device       ushort * x,
+        device const float * g,
+        device const float * pars,
+        uint        gid[[thread_position_in_grid]]) {
+    if (gid >= args.np) {
+        return;
+    }
+
+    const float alpha = pars[0];
+    const float keep  = 1.0f - alpha * pars[1];
+    const float updated = retro_bf16_to_f32(x[gid]) * keep - alpha * g[gid];
+    x[gid] = retro_stochastic_round_bf16(
+            updated, retro_sr_uniform(uint(pars[2]), gid));
 }
 
 // retro delta: RMS-norm backward for LoRA training.
@@ -1475,6 +1571,26 @@ template [[host_name("kernel_out_prod_f32")]]  kernel out_prod_t kernel_out_prod
 GGML_RETRO_DEQUANT_TYPES(GGML_RETRO_OUT_PROD_PIPELINE)
 #undef GGML_RETRO_OUT_PROD_PIPELINE
 
+// retro delta: BF16 is not a row of the shared table (Vulkan has no BF16
+// decoder to back one), so Metal declares it here, beside the expansion, as
+// F32 is. A block is 16 raw words, so the (block, nl, dequantize) contract
+// holds with nl == 1. The decode is a shift, exact and bit-identical to the
+// CPU's ggml_bf16_to_fp32, and needs no `bfloat`: it does not depend on
+// GGML_METAL_HAS_BF16, unlike the upstream dequantize_bf16.
+struct retro_bf16x16 {
+    ushort4 v[4];
+};
+
+void dequantize_retro_bf16(device const retro_bf16x16 * src, short il, thread float4x4 & reg) {
+    for (short r = 0; r < 4; ++r) {
+        reg[r] = as_type<float4>(uint4(src->v[r]) << 16);
+    }
+    (void) il;
+}
+
+template [[host_name("kernel_out_prod_bf16")]]
+kernel out_prod_t kernel_out_prod_impl<out_prod_tile_dq<retro_bf16x16, 1, dequantize_retro_bf16>>;
+
 // retro delta: threadgroup-wide sum/max over per-simdgroup partials. Safe for any
 // threadgroup size (including a partial trailing simdgroup): only simdgroup 0
 // combines the partials, then the total is re-broadcast through shared memory.
@@ -1984,6 +2100,11 @@ template [[host_name("kernel_fused_sparse_ce_back_f32")]] kernel fused_sparse_ce
     kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<BLK, NL, dequantize_##NAME>;
 GGML_RETRO_DEQUANT_TYPES(GGML_RETRO_FUSED_SPARSE_CE_PIPELINE)
 #undef GGML_RETRO_FUSED_SPARSE_CE_PIPELINE
+
+// retro delta: a BF16 head (a tied token_embd in a BF16 checkpoint), through
+// the decoder out_prod declares alongside its own expansion.
+template [[host_name("kernel_fused_sparse_ce_bf16")]]      kernel fused_sparse_ce_t      kernel_fused_sparse_ce     <retro_bf16x16, 1, dequantize_retro_bf16>;
+template [[host_name("kernel_fused_sparse_ce_back_bf16")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<retro_bf16x16, 1, dequantize_retro_bf16>;
 
 // retro delta: get-rows backward for LoRA training.
 // src0 = grad rows [ne00, nr], src1 = I32 row indices [nr]; dst [ne00, n_vocab]

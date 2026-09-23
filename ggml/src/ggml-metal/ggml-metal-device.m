@@ -1505,12 +1505,16 @@ void ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_eve
 
 // retro delta: does a kernel_out_prod_<name> / kernel_fused_sparse_ce_<name>
 // pipeline exist for this type? Generated from the same table that instantiates
-// them in retro.metal, so the gate and the kernels cannot disagree.
+// them in retro.metal, so the gate and the kernels cannot disagree; the one
+// type declared outside it is spelled on both sides.
 static bool ggml_metal_retro_is_dequantizable(enum ggml_type type) {
     switch (type) {
 #define GGML_RETRO_CASE(TYPE, BLK, NL, NAME, VKNAME) case TYPE: return true;
         GGML_RETRO_DEQUANT_TYPES(GGML_RETRO_CASE)
 #undef GGML_RETRO_CASE
+        // Not a row of the table, whose rows every GPU backend must decode:
+        // retro.metal declares the BF16 pipelines explicitly, as it does F32's.
+        case GGML_TYPE_BF16: return true;
         default: return false;
     }
 }
@@ -2095,9 +2099,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_DIAG:
             return true;
         case GGML_OP_OPT_STEP_ADAMW:
+            // retro delta: F16 and BF16 parameters join F32; moments stay F32.
             return has_simdgroup_reduction
                     && (op->src[0]->type == GGML_TYPE_F32
-                            || op->src[0]->type == GGML_TYPE_F16)
+                            || op->src[0]->type == GGML_TYPE_F16
+                            || op->src[0]->type == GGML_TYPE_BF16)
                     && op->src[1]->type == GGML_TYPE_F32
                     && op->src[2]->type == GGML_TYPE_F32
                     && op->src[3]->type == GGML_TYPE_F32
@@ -2107,7 +2113,16 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     && ggml_is_contiguous(op->src[2])
                     && ggml_is_contiguous(op->src[3]);
         case GGML_OP_OPT_STEP_SGD:
-            return has_simdgroup_reduction;
+            // retro delta: the same three parameter precisions AdamW takes,
+            // over a step with no moments (kernels/retro.metal).
+            return has_simdgroup_reduction
+                    && (op->src[0]->type == GGML_TYPE_F32
+                            || op->src[0]->type == GGML_TYPE_F16
+                            || op->src[0]->type == GGML_TYPE_BF16)
+                    && op->src[1]->type == GGML_TYPE_F32
+                    && op->src[2]->type == GGML_TYPE_F32
+                    && ggml_is_contiguous(op->src[0])
+                    && ggml_is_contiguous(op->src[1]);
         // retro delta: fixed-block Gefen. The two phases are admitted together
         // on purpose: a device that ran the pure one and not the mutating one
         // would be scheduled as a split, and the update would land on a copy of

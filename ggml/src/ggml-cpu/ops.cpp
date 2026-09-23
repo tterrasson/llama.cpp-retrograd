@@ -4702,6 +4702,12 @@ void ggml_compute_forward_out_prod(
             {
                 ggml_compute_forward_out_prod_f16_f32(params, dst);
             } break;
+        // retro delta: BF16 dx = out_prod(W, dy). Block size one, so the
+        // tile path degenerates to a plain offset.
+        case GGML_TYPE_BF16:
+            {
+                ggml_compute_forward_out_prod_q_f32(params, dst);
+            } break;
         case GGML_TYPE_F32:
             {
                 ggml_compute_forward_out_prod_f32(params, dst);
@@ -13334,9 +13340,15 @@ void ggml_compute_forward_opt_step_adamw(
             {
                 ggml_compute_forward_opt_step_adamw_f32(params, dst);
             } break;
+        // retro delta: half-precision parameters, updated in place with a
+        // stochastically rounded store (retro-ops.cpp).
         case GGML_TYPE_F16:
             {
                 ggml_compute_forward_opt_step_adamw_f16(params, dst);
+            } break;
+        case GGML_TYPE_BF16:
+            {
+                ggml_compute_forward_opt_step_adamw_bf16(params, dst);
             } break;
         default:
             {
@@ -13351,7 +13363,7 @@ static void ggml_compute_forward_opt_step_sgd_f32(const ggml_compute_params * pa
     const ggml_tensor * sgd_params = dst->src[2];
 
     GGML_ASSERT(ggml_are_same_shape(src0, src0_grad));
-    GGML_ASSERT(ggml_nelements(sgd_params) == 2);
+    GGML_ASSERT(ggml_nelements(sgd_params) == 3);
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -13369,6 +13381,8 @@ static void ggml_compute_forward_opt_step_sgd_f32(const ggml_compute_params * pa
     const int ir1 = MIN(ir0 + dr, nr);
 
     // using adamw param subset we care about - alpha, wd - could have a separate struct
+    // retro delta: sgd_params_ptr[2] seeds stochastic rounding, needed only
+    // for the half-precision paths; an F32 parameter stores its update exactly.
     const float * sgd_params_ptr   = ggml_get_data_f32(sgd_params);
     const float   alpha            = sgd_params_ptr[0];
     const float   keep             = 1.f - alpha * sgd_params_ptr[1];
@@ -13398,9 +13412,21 @@ void ggml_compute_forward_opt_step_sgd(const ggml_compute_params * params, ggml_
                 ggml_compute_forward_opt_step_sgd_f32(params, dst);
             }
             break;
+        // retro delta: half-precision parameters, updated in place with a
+        // stochastically rounded store (retro-ops.cpp).
+        case GGML_TYPE_F16:
+            {
+                ggml_compute_forward_opt_step_sgd_f16(params, dst);
+            }
+            break;
+        case GGML_TYPE_BF16:
+            {
+                ggml_compute_forward_opt_step_sgd_bf16(params, dst);
+            }
+            break;
         default:
             {
-                GGML_ABORT("fatal error - sgd is F32 only");
+                GGML_ABORT("fatal error");
             }
     }
 }

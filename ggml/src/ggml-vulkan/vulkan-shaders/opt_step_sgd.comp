@@ -1,12 +1,21 @@
 #version 450
 
 #include "generic_head.glsl"
+#include "types.glsl"
+
+#ifdef STOCHASTIC_ROUNDING_BF16
+// BF16 is stored as raw 16-bit words; all arithmetic is F32, only the store is packed.
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#endif
+#include "retro_stochastic_round.glsl"
 
 layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
 
-layout (binding = 0) buffer X {A_TYPE data_x[];};
-layout (binding = 1) readonly buffer G {A_TYPE data_grad[];};
-layout (binding = 2) readonly buffer P {float data_params[2];};
+layout (binding = 0) buffer X {X_TYPE data_x[];};
+// retro delta: the gradient is F32 whatever the parameter is stored as, so it
+// does not share the parameter's type.
+layout (binding = 1) readonly buffer G {float data_grad[];};
+layout (binding = 2) readonly buffer P {float data_params[3];};
 
 void main() {
     const uint i = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
@@ -18,5 +27,17 @@ void main() {
     const float alpha = data_params[0];
     const float keep = 1.f - alpha * data_params[1];
 
-    data_x[i] = data_x[i] * keep - alpha * data_grad[i];
+#ifdef STOCHASTIC_ROUNDING_BF16
+    const float stored = retro_bf16_to_f32(uint(data_x[i]));
+#else
+    const float stored = float(data_x[i]);
+#endif
+    const float updated = stored * keep - alpha * data_grad[i];
+#if defined(STOCHASTIC_ROUNDING_BF16)
+    data_x[i] = X_TYPE(retro_stochastic_round_bf16(updated, retro_sr_uniform(uint(data_params[2]), i)));
+#elif defined(STOCHASTIC_ROUNDING)
+    data_x[i] = X_TYPE(retro_stochastic_round_f16(updated, retro_sr_uniform(uint(data_params[2]), i)));
+#else
+    data_x[i] = X_TYPE(updated);
+#endif
 }

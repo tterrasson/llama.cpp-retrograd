@@ -49,6 +49,10 @@ struct ggml_opt_slot {
     struct ggml_tensor    * tensor = nullptr;
     enum ggml_opt_slot_init init   = GGML_OPT_SLOT_INIT_ZERO;
     uint8_t                 code   = 0;
+    // The parameter a GGML_OPT_SLOT_INIT_PARAMETER slot is widened from, and
+    // null for every other initializer: those are filled from their definition
+    // and have nothing to read.
+    struct ggml_tensor    * source = nullptr;
 };
 
 // AdamW's two F32 moments, zero-initialized. Written as a table rather than
@@ -80,6 +84,13 @@ static const struct ggml_opt_slot_def ggml_opt_slots_gefen_quantized_m[] = {
     { "second_moments", GGML_TYPE_F32, GGML_OPT_SLOT_SHAPE_BLOCKS,    0, GGML_OPT_SLOT_INIT_ZERO, 0 },
 };
 
+// retro delta: the F32 master copy. Not in any optimizer's table on purpose:
+// it belongs to a *parameter* whose store is narrower than its update, and a
+// table keyed by optimizer has no parameter to ask.
+static const struct ggml_opt_slot_def ggml_opt_slot_master = {
+    "master", GGML_TYPE_F32, GGML_OPT_SLOT_SHAPE_PARAMETER, 0, GGML_OPT_SLOT_INIT_PARAMETER, 0,
+};
+
 static const struct ggml_opt_slot_def ggml_opt_shared_slots_gefen[] = {
     { "codebook", GGML_TYPE_F32, GGML_OPT_SLOT_SHAPE_FIXED, GGML_OPT_GEFEN_CODEBOOK_LEVELS,
       GGML_OPT_SLOT_INIT_UNIFORM_CODEBOOK, 0 },
@@ -91,7 +102,26 @@ struct ggml_opt_optimizer_layout ggml_opt_default_optimizer_layout(void) {
     layout.muon.nesterov    = true;
     layout.gefen.variant    = GGML_OPT_GEFEN_VARIANT_SHARED_V;
     layout.gefen.block_size = GGML_OPT_GEFEN_BLOCK_SIZE;
+    layout.master_weights   = false;
     return layout;
+}
+
+bool ggml_opt_master_slot(
+        const struct ggml_opt_optimizer_layout * layout,
+        enum ggml_type                           param_type,
+        struct ggml_opt_slot_def               * out) {
+    if (!layout || !layout->master_weights) {
+        return false;
+    }
+    // F32 is already its own master; a quantized parameter has no gradient to
+    // accumulate into one.
+    if (param_type != GGML_TYPE_F16 && param_type != GGML_TYPE_BF16) {
+        return false;
+    }
+    if (out) {
+        *out = ggml_opt_slot_master;
+    }
+    return true;
 }
 
 static int64_t ggml_opt_gefen_block_size(const struct ggml_opt_optimizer_layout * layout) {
@@ -114,22 +144,27 @@ int64_t ggml_opt_step_graph_nodes(
         const struct ggml_opt_optimizer_layout * layout) {
     // Per-parameter clipping norm, built for every trainable parameter.
     const int64_t clip = 4;
+    // The cast back into the store, for a layout that keeps a master copy.
+    // Counted for every parameter rather than for the half-precision ones: the
+    // budget has no dtype here, and an overcount costs graph headroom while an
+    // undercount aborts the build.
+    const int64_t master = layout && layout->master_weights ? 1 : 0;
     switch (optimizer) {
         case GGML_OPT_OPTIMIZER_TYPE_ADAMW:
             // One kernel, plus the concat carrying the clipping scale.
-            return clip + 4;
+            return master + clip + 4;
         case GGML_OPT_OPTIMIZER_TYPE_SGD:
             // One kernel and the multiply by the clipping scale.
-            return clip + 4;
+            return master + clip + 4;
         case GGML_OPT_OPTIMIZER_TYPE_GEFEN:
             // Two phases, plus their views of the coefficient vector.
-            return clip + 8;
+            return master + clip + 8;
         case GGML_OPT_OPTIMIZER_TYPE_MUON:
             // Rounded up rather than counted exactly per branch: an undercount
             // aborts the graph build.
-            return clip + 48 + 12*(int64_t) ggml_opt_muon_ns_steps(layout);
+            return master + clip + 48 + 12*(int64_t) ggml_opt_muon_ns_steps(layout);
         default:
-            return clip + 8;
+            return master + clip + 8;
     }
 }
 
@@ -225,7 +260,9 @@ int64_t ggml_opt_optimizer_n_params(enum ggml_opt_optimizer_type optimizer) {
         // alpha, beta1, beta2, eps, wd, beta1h, beta2h, and the per-step seed
         // the stochastic rounding of an F16 parameter needs.
         case GGML_OPT_OPTIMIZER_TYPE_ADAMW: return 8;
-        case GGML_OPT_OPTIMIZER_TYPE_SGD:   return 2;
+        // alpha, wd, and the per-step seed for the stochastic rounding of
+        // half-precision parameters.
+        case GGML_OPT_OPTIMIZER_TYPE_SGD:   return 3;
         // alpha, momentum, wd, ns_epsilon. The iteration count and the Nesterov
         // choice are structural and belong to the layout, not here.
         case GGML_OPT_OPTIMIZER_TYPE_MUON:  return 4;
@@ -382,6 +419,12 @@ static ggml_opt_slot ggml_opt_slot_alloc(
     slot.tensor = tensor;
     slot.init   = def.init;
     slot.code   = def.code;
+    if (def.init == GGML_OPT_SLOT_INIT_PARAMETER) {
+        GGML_ASSERT(param && "a parameter-initialized slot needs a parameter to widen");
+        // Const-stripped because the initializer reads it through the backend
+        // API, which takes a mutable tensor; nothing here writes it.
+        slot.source = const_cast<struct ggml_tensor *>(param);
+    }
     return slot;
 }
 
@@ -418,6 +461,10 @@ bool ggml_opt_slot_initial_bytes(
         return false;
     }
     switch (def->init) {
+        case GGML_OPT_SLOT_INIT_PARAMETER:
+            // The bytes are the parameter's, not the definition's; the
+            // allocator widens them and this function has no parameter.
+            return false;
         case GGML_OPT_SLOT_INIT_ZERO:
             std::memset(out, 0, n_bytes);
             return true;
@@ -458,6 +505,28 @@ static void ggml_opt_fill_slot(const ggml_opt_slot & slot) {
         return;
     }
     const size_t nbytes = ggml_nbytes(tensor);
+    if (slot.init == GGML_OPT_SLOT_INIT_PARAMETER) {
+        // The master copy starts where the parameter is, widened exactly: a
+        // half-precision value has an F32 with the same value, so the first
+        // step reads the weights the model file holds and not a rounding of
+        // them.
+        GGML_ASSERT(slot.source && "a parameter-initialized slot has no parameter");
+        GGML_ASSERT(tensor->type == GGML_TYPE_F32 && "the master copy is F32");
+        const int64_t n = ggml_nelements(tensor);
+        GGML_ASSERT(n == ggml_nelements(slot.source));
+        std::vector<uint8_t> stored(ggml_nbytes(slot.source));
+        ggml_backend_tensor_get(slot.source, stored.data(), 0, stored.size());
+        std::vector<float> widened((size_t) n);
+        if (slot.source->type == GGML_TYPE_F32) {
+            std::memcpy(widened.data(), stored.data(), widened.size()*sizeof(float));
+        } else {
+            const struct ggml_type_traits * traits = ggml_get_type_traits(slot.source->type);
+            GGML_ASSERT(traits->to_float && "a master copy of a store nothing can widen");
+            traits->to_float(stored.data(), widened.data(), n);
+        }
+        ggml_backend_tensor_set(tensor, widened.data(), 0, widened.size()*sizeof(float));
+        return;
+    }
     if (slot.init == GGML_OPT_SLOT_INIT_ZERO) {
         // The common case, and the one a backend can do without a host buffer.
         ggml_set_zero(tensor);
@@ -1047,6 +1116,16 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
                 ggml_opt_optimizer_slots(
                         ggml_opt_owner_of(opt_ctx, node), &opt_ctx->layout, &n_defs);
                 n_slot_tensors += (int) n_defs;
+                // retro delta: and the master copy, which no table declares
+                // because it belongs to the parameter's dtype rather than to
+                // the optimizer. Counted here for the same reason it is
+                // allocated below: the static context holds exactly the
+                // tensors this loop counted, so a slot missing here is a
+                // failed ggml_new_tensor once a run has enough parameters to
+                // exhaust the shared-slot headroom.
+                if (ggml_opt_master_slot(&opt_ctx->layout, node->type, nullptr)) {
+                    ++n_slot_tensors;
+                }
             }
         }
         GGML_ASSERT(!(node->flags & GGML_TENSOR_FLAG_LOSS) && "support for extra loss terms not implemented");
@@ -1210,6 +1289,19 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
                     opt_ctx->slots.push_back(ggml_opt_slot_alloc(
                             opt_ctx->ctx_static, defs[slot], node, node->name,
                             ggml_opt_optimizer_name(owner)));
+                }
+                // The master copy, last in the parameter's range. The condition
+                // is here and not in a slot table because it reads the
+                // parameter's own dtype, which a table keyed by optimizer does
+                // not have; the update step is built on the master, so it
+                // carries the parameter flag the step asserts on.
+                struct ggml_opt_slot_def master = {};
+                if (ggml_opt_master_slot(&opt_ctx->layout, node->type, &master)) {
+                    ggml_opt_slot slot = ggml_opt_slot_alloc(
+                            opt_ctx->ctx_static, master, node, node->name,
+                            ggml_opt_optimizer_name(owner));
+                    ggml_set_param(slot.tensor);
+                    opt_ctx->slots.push_back(slot);
                 }
                 opt_ctx->slots_by_param[node->name] = { begin, opt_ctx->slots.size() };
             }
@@ -1379,9 +1471,9 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
                 break;
             case GGML_OPT_OPTIMIZER_TYPE_SGD:
             case GGML_OPT_OPTIMIZER_TYPE_MUON:
-                // Both keep the explicit multiply: SGD's kernel is untouched by
-                // the F16 work, and Muon's step is a graph whose first node can
-                // scale the gradient as cheaply as its kernel would.
+                // Both keep the explicit multiply: SGD's kernel reads an
+                // already-scaled gradient, and Muon's step scales it in its
+                // first node.
                 step_args[type] = declared;
                 break;
             case GGML_OPT_OPTIMIZER_TYPE_GEFEN:
@@ -1408,13 +1500,32 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
                     "optimizer parameter has no slot table; it appeared after the state was allocated");
             const enum ggml_opt_optimizer_type owner = owner_row->second;
             const auto range = opt_ctx->slots_by_param.at(node->name);
-            const size_t n_slots = range.second - range.first;
+            size_t n_slots = range.second - range.first;
             // retro delta: an all-SGD run has no backing slot array.
             const ggml_opt_slot * slots = n_slots ? opt_ctx->slots.data() + range.first : nullptr;
+            // The master copy, if the allocator made one. It sits last in the
+            // range and is not one of the optimizer's own slots, so it comes
+            // off the table the step reads: the step keeps seeing exactly what
+            // its own declaration promised.
+            struct ggml_tensor * master = nullptr;
+            if (n_slots && slots[n_slots-1].init == GGML_OPT_SLOT_INIT_PARAMETER) {
+                master = slots[n_slots-1].tensor;
+                --n_slots;
+            }
             opt_ctx->optimizer_used[owner] = true;
 
+            // With a master copy the update is built on the F32 copy, which is
+            // what selects the F32 kernel on every backend, and the store is
+            // written by the cast that follows. The cast's source is the step
+            // node rather than the master tensor: the step writes the master in
+            // place and returns a view of it, so reading that view is what
+            // orders the two.
             struct ggml_tensor * opt_step = ggml_opt_build_step(
-                    opt_ctx, owner, node, grad, slots, n_slots, step_args[owner], grad_scale);
+                    opt_ctx, owner, master ? master : node, grad, slots, n_slots,
+                    step_args[owner], grad_scale);
+            if (master) {
+                opt_step = ggml_cpy(opt_ctx->ctx_compute, opt_step, node);
+            }
             ggml_format_name(opt_step, "%s step for %s", ggml_opt_optimizer_name(owner), node->name);
             // Every write the step performs is rooted here: a state update that
             // is constructed but not reachable from the graph's outputs is
@@ -2143,6 +2254,9 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
                     GGML_ASSERT(opt_pars.sgd.wd <= 1.0f);
                     values[0] = opt_pars.sgd.alpha;
                     values[1] = opt_pars.sgd.wd;
+                    // retro delta: the same per-step seed AdamW carries, read
+                    // only by the half-precision stores.
+                    values[2] = (float) opt_ctx->iter;
                 } break;
                 case GGML_OPT_OPTIMIZER_TYPE_MUON: {
                     GGML_ASSERT(opt_pars.muon.alpha > 0.0f);

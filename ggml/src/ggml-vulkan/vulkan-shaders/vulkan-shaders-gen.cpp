@@ -1207,7 +1207,10 @@ void process_shaders() {
 
     string_to_spv("opt_step_adamw_f32", "opt_step_adamw.comp", merge_maps(base_dict, {{"X_TYPE", "float"}}));
     string_to_spv("opt_step_adamw_f16", "opt_step_adamw.comp", merge_maps(base_dict, {{"X_TYPE", "float16_t"}, {"STOCHASTIC_ROUNDING", "1"}}));
-    string_to_spv("opt_step_sgd_f32", "opt_step_sgd.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
+    string_to_spv("opt_step_adamw_bf16", "opt_step_adamw.comp", merge_maps(base_dict, {{"X_TYPE", "uint16_t"}, {"STOCHASTIC_ROUNDING_BF16", "1"}}));
+    string_to_spv("opt_step_sgd_f32", "opt_step_sgd.comp", merge_maps(base_dict, {{"X_TYPE", "float"}}));
+    string_to_spv("opt_step_sgd_f16", "opt_step_sgd.comp", merge_maps(base_dict, {{"X_TYPE", "float16_t"}, {"STOCHASTIC_ROUNDING", "1"}}));
+    string_to_spv("opt_step_sgd_bf16", "opt_step_sgd.comp", merge_maps(base_dict, {{"X_TYPE", "uint16_t"}, {"STOCHASTIC_ROUNDING_BF16", "1"}}));
 
     // retro delta: Gefen, one variant per stored layout.
     string_to_spv("opt_step_gefen_stats_shared_v",    "opt_step_gefen_stats.comp", base_dict);
