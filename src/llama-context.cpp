@@ -1015,6 +1015,50 @@ float * llama_context::get_logits_ith(int32_t i) {
     }
 }
 
+// retro delta: see llama.h. The request is validated here and consumed by the
+// next decode, so a failure leaves that decode on the ordinary logits path.
+bool llama_context::set_target_logprobs(const llama_token * targets, size_t n_targets) {
+    tlp.targets.clear();
+
+    if (!targets || n_targets == 0) {
+        LLAMA_LOG_ERROR("%s: target log-probabilities require a non-empty target array\n", __func__);
+        return false;
+    }
+
+    const int32_t n_vocab = model.vocab.n_tokens();
+    for (size_t i = 0; i < n_targets; ++i) {
+        if (targets[i] < 0 || targets[i] >= n_vocab) {
+            LLAMA_LOG_ERROR("%s: target token %d at index %zu is outside the vocabulary\n",
+                    __func__, targets[i], i);
+            return false;
+        }
+    }
+
+    tlp.targets.assign(targets, targets + n_targets);
+
+    return true;
+}
+
+float llama_context::get_target_logprob_ith(int32_t i) {
+    output_reorder();
+
+    if (!tlp.ready || tlp.probs.empty()) {
+        return NAN;
+    }
+
+    try {
+        const int64_t j = output_resolve_row(i);
+        GGML_ASSERT(j < (int64_t) tlp.probs.size());
+        // logf of a gathered probability rather than a host log-softmax over
+        // the vocabulary: the whole point of the request is that the vocabulary
+        // row never left the device.
+        return logf(tlp.probs[j]);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid target logprob id %d, reason: %s\n", __func__, i, err.what());
+        return NAN;
+    }
+}
+
 float * llama_context::get_embeddings() {
     output_reorder();
 
@@ -1778,6 +1822,28 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     const int64_t n_vocab = vocab.n_tokens();
 
+    // retro delta: a target log-probability request covers this decode only,
+    // whether or not the decode succeeds, and `active` must be back down before
+    // any other graph (the optimizer's) is built from this context.
+    struct tlp_request_guard {
+        target_logprob_info & tlp;
+        ~tlp_request_guard() {
+            tlp.targets.clear();
+            tlp.ready  = tlp.active;
+            tlp.active = false;
+        }
+    } tlp_guard { tlp };
+
+    tlp.active = false;
+    if (!tlp.targets.empty()) {
+        if (tlp.targets.size() != batch_inp.tokens.size()) {
+            LLAMA_LOG_ERROR("%s: %zu target log-probabilities were set for a batch of %zu tokens\n",
+                    __func__, tlp.targets.size(), batch_inp.tokens.size());
+            return -1;
+        }
+        tlp.active = true;
+    }
+
     // when computing embeddings, all tokens are output
     const bool output_all   = cparams.embeddings;
     const bool has_samplers = !sampling.samplers.empty();
@@ -1910,6 +1976,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         llama_sampler_backend_begin(entry.second);
     }
 
+    // retro delta: prepare storage for the requested device-side target log-probabilities.
+    if (tlp.active) {
+        if (n_outputs_all == 0) {
+            LLAMA_LOG_ERROR("%s: target log-probabilities were requested for a batch with no outputs\n", __func__);
+            return -1;
+        }
+        tlp.probs.assign(n_outputs_all, 0.0f);
+    } else {
+        tlp.probs.clear();
+    }
+
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
@@ -1930,6 +2007,22 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
             // needs to happen before the graph is built
             n_outputs = n_outputs_new;
+        }
+
+        // retro delta: gather indices for this ubatch's output rows. out_ids
+        // maps a row back to the batch token it came from, which is how the
+        // caller indexed its targets; the row offset addresses the flattened
+        // per-ubatch probability buffer the graph gathers from.
+        if (tlp.active) {
+            const auto & out_ids = balloc->get_out_ids();
+
+            GGML_ASSERT((size_t) (n_outputs_prev + n_outputs) <= out_ids.size());
+
+            tlp.idx.resize(n_outputs);
+            for (int32_t row = 0; row < n_outputs; ++row) {
+                const int64_t out_id = out_ids[n_outputs_prev + row];
+                tlp.idx[row] = tlp.targets[out_id] + row*n_vocab;
+            }
         }
 
         ggml_status status;
@@ -1980,8 +2073,22 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             t_embd = res->get_embd_pooled();
         }
 
+        // retro delta: extract the gathered target probabilities. One float per
+        // output row; the caller reads their log through
+        // llama_get_target_logprob_ith().
+        if (tlp.active && res->t_target_probs && n_outputs > 0) {
+            ggml_backend_t backend_tlp = ggml_backend_sched_get_tensor_backend(sched.get(), res->t_target_probs);
+            GGML_ASSERT(backend_tlp != nullptr);
+            GGML_ASSERT((size_t) (n_outputs_prev + n_outputs) <= tlp.probs.size());
+            ggml_backend_tensor_get_async(backend_tlp, res->t_target_probs,
+                    tlp.probs.data() + n_outputs_prev, 0, n_outputs*sizeof(float));
+        }
+
         // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+        // retro delta: skipped entirely while target log-probabilities are
+        // requested -- not copying the [n_vocab, n_outputs] block is the point
+        // of the request.
+        if (logits.data && t_logits && n_outputs > 0 && !tlp.active && needs_raw_logits(ubatch, sampling.samplers)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
@@ -2361,6 +2468,12 @@ void llama_context::output_reorder() {
             }
         }
 
+        // retro delta: one value per row, permuted like the logits rows it
+        // stands in for.
+        if (i0 < tlp.probs.size() && i1 < tlp.probs.size()) {
+            std::swap(tlp.probs[i0], tlp.probs[i1]);
+        }
+
         if (embd_nextn.size > 0) {
             for (uint64_t k = 0; k < n_embd_out; k++) {
                 std::swap(embd_nextn.data[i0*n_embd_out + k], embd_nextn.data[i1*n_embd_out + k]);
@@ -2580,6 +2693,19 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
+    // retro delta: a reserve graph is a worst-case graph, not the decode that
+    // serves a pending target log-probability request, and its n_outputs is
+    // unrelated to the request's. decode() sets tlp.active before it calls
+    // sched_reserve()/memory_update(), so a reserve reached from there would
+    // otherwise hand build_target_logprobs the previous ubatch's (or an empty)
+    // index vector and trip its size assertion. Size the gather for the graph
+    // being reserved instead: the values do not matter here (a reserve never
+    // runs set_input), only that the buffers reserved include the gather.
+    // decode() rebuilds tlp.idx for every ubatch before the graph it computes.
+    if (tlp.active) {
+        tlp.idx.assign(n_outputs, 0);
+    }
+
     const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
 
     res->reset();
@@ -2624,6 +2750,7 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.prec_policy =*/ &model.prec_policy,
         /*.samplers    =*/ sampling.samplers,
+        /*.target_logprob_idx =*/ tlp.active ? &tlp.idx : nullptr,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -5064,6 +5191,18 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
     }
 
     return res;
+}
+
+// retro delta
+bool llama_set_target_logprobs(llama_context * ctx, const llama_token * targets, size_t n_targets) {
+    return ctx->set_target_logprobs(targets, n_targets);
+}
+
+// retro delta
+float llama_get_target_logprob_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+
+    return ctx->get_target_logprob_ith(i);
 }
 
 float * llama_get_embeddings(llama_context * ctx) {

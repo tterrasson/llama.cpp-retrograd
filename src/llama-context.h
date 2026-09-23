@@ -82,6 +82,10 @@ struct llama_context {
     float * get_logits();
     float * get_logits_ith(int32_t i);
 
+    // retro delta: device-side target log-probabilities (see llama.h).
+    bool  set_target_logprobs(const llama_token * targets, size_t n_targets);
+    float get_target_logprob_ith(int32_t i);
+
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
@@ -367,6 +371,34 @@ private:
     };
 
     sampling_info sampling;
+
+    // retro delta: target log-probability request (llama_set_target_logprobs).
+    struct target_logprob_info {
+        // Requested targets, indexed by batch token. Non-empty only between
+        // llama_set_target_logprobs() and the decode that consumes it.
+        std::vector<llama_token> targets;
+
+        // Set for the duration of the decode that serves the request, and only
+        // then: it is what suppresses the raw logits copy and adds the gather
+        // nodes to the graph, and every other graph the context builds (the
+        // optimizer's included) must not see it.
+        bool active = false;
+
+        // Whether the decode that just finished served a request, i.e. whether
+        // `probs` holds results. Only meaningful after a successful decode.
+        bool ready = false;
+
+        // Gather indices for the ubatch being processed, in output-row order:
+        // targets[out_id] + row*n_vocab. Rebuilt per ubatch by decode(); the
+        // graph input holds a pointer to this vector.
+        std::vector<int32_t> idx;
+
+        // One probability per output row, in the same order as `logits` (so
+        // output_reorder() permutes it the same way). The log is taken on read.
+        std::vector<float> probs;
+    };
+
+    target_logprob_info tlp;
 
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE

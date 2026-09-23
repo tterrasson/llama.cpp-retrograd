@@ -1290,6 +1290,29 @@ void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_target_logprobs::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+
+    GGML_ASSERT(rows && idx);
+    GGML_ASSERT(ggml_backend_buffer_is_host(rows->buffer));
+    GGML_ASSERT((int64_t) idx->size() == rows->ne[0]);
+
+    std::copy(idx->begin(), idx->end(), (int32_t *) rows->data);
+}
+
+bool llm_graph_input_target_logprobs::can_reuse(const llm_graph_params & params) {
+    if (params.target_logprob_idx == nullptr ||
+            (int64_t) params.target_logprob_idx->size() != rows->ne[0]) {
+        return false;
+    }
+
+    // Same topology, new values: point at the caller's current index vector and
+    // let set_input re-upload it.
+    idx = params.target_logprob_idx;
+
+    return true;
+}
+
 bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
     if (samplers.size() != params.samplers.size()) {
         return false;
@@ -1329,6 +1352,8 @@ void llm_graph_result::reset() {
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
+
+    t_target_probs = nullptr;
 
     t_sampled.clear();
     t_sampled_probs.clear();
@@ -1491,6 +1516,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     prec_policy      (params.prec_policy),
     samplers         (params.samplers),
+    target_logprob_idx(params.target_logprob_idx),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
@@ -3976,6 +4002,41 @@ void llm_graph_context::build_sampling() const {
         }
     }
     */
+}
+
+// retro delta: gather softmax(logits)[target] for every output row, so a
+// teacher-forced scorer reads one float per position instead of pulling the
+// whole [n_vocab, n_outputs] logits block across the bus (llama.h,
+// llama_set_target_logprobs).
+//
+// Composed from three ordinary ops rather than a dedicated kernel: every
+// backend already implements them, and where one is missing the scheduler falls
+// back for that node alone. The gather runs on the flattened probability buffer
+// so a single get_rows picks element `target[r] + r*n_vocab` of row r.
+void llm_graph_context::build_target_logprobs() const {
+    if (target_logprob_idx == nullptr || res->t_logits == nullptr) {
+        return;
+    }
+
+    GGML_ASSERT((int64_t) target_logprob_idx->size() == res->t_logits->ne[1]);
+
+    auto inp = std::make_unique<llm_graph_input_target_logprobs>(target_logprob_idx);
+
+    inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, res->t_logits->ne[1]);
+    ggml_set_input(inp->rows);
+    ggml_set_name(inp->rows, "target_logprob_rows");
+
+    ggml_tensor * probs = ggml_soft_max(ctx0, res->t_logits);
+    ggml_tensor * flat  = ggml_reshape_2d(ctx0, probs, 1, ggml_nelements(probs));
+    ggml_tensor * cur   = ggml_get_rows(ctx0, flat, inp->rows);
+
+    cb(cur, "result_target_probs", -1);
+    res->t_target_probs = cur;
+    ggml_set_output(cur);
+
+    res->add_input(std::move(inp));
+
+    ggml_build_forward_expand(gf, cur);
 }
 
 int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional) {
