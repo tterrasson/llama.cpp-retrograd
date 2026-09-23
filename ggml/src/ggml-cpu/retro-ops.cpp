@@ -28,6 +28,94 @@
 
 // ---- l2_norm_back ----
 
+// retro delta: analytic backward for GGML_OP_L2_NORM.
+//
+// forward: y = x * scale, scale = 1/max(norm, eps), norm = sqrt(sum(x*x))
+//
+// Unlike RMS norm, l2_norm floors the scale at 1/eps instead of adding eps
+// under the sqrt, so the two regimes have different gradients:
+//   - norm > eps: scale depends on x, so
+//         dx = (dz - x * (sum(x*dz) / (norm*norm))) * scale
+//   - norm <= eps: scale == 1/eps is locally constant (subgradient), so
+//         dx = dz * scale
+static void ggml_compute_forward_l2_norm_back_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0]; // gradients from forward pass output
+    const ggml_tensor * src1 = dst->src[1]; // src0 (x) from forward pass
+
+    GGML_ASSERT(ggml_are_same_shape(src0, dst) && ggml_are_same_shape(src0, src1));
+
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+    GGML_ASSERT(src1->nb[0] == sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    for (int64_t i03 = 0; i03 < ne03; i03++) {
+        for (int64_t i02 = 0; i02 < ne02; i02++) {
+            for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
+                const int64_t i11 = i01;
+                const int64_t i12 = i02;
+                const int64_t i13 = i03;
+
+                const float * dz = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
+                const float * x  = (float *) ((char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13);
+
+                ggml_float sum_xx = 0.0;
+                ggml_float sum_xdz = 0.0;
+
+                for (int64_t i00 = 0; i00 < ne00; i00++) {
+                    sum_xx  += (ggml_float)(x[i00] * x[i00]);
+                    sum_xdz += (ggml_float)(x[i00] * dz[i00]);
+                }
+
+                float * dx = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
+
+                const float norm = sqrtf((float) sum_xx);
+
+                if (norm > eps) {
+                    const float scale   = 1.0f / norm;
+                    const float scale_x = (float) (-sum_xdz) / (float) sum_xx;
+                    for (int64_t i00 = 0; i00 < ne00; i00++) {
+                        dx[i00] = (dz[i00] + x[i00] * scale_x) * scale;
+                    }
+                } else {
+                    const float scale = 1.0f / eps;
+                    for (int64_t i00 = 0; i00 < ne00; i00++) {
+                        dx[i00] = dz[i00] * scale;
+                    }
+                }
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_l2_norm_back(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_l2_norm_back_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 
 // ---- ssm_conv_back / ssm_scan_back ----
 

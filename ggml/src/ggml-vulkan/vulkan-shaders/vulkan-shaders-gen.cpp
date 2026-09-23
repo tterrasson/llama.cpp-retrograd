@@ -896,6 +896,7 @@ void process_shaders() {
     string_to_spv("rms_norm_partials_f32", "rms_norm_partials.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("rms_norm_back_f32", "rms_norm_back.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("l2_norm_f32", "l2_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+    string_to_spv("l2_norm_back_f32", "l2_norm_back.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
 
     string_to_spv("cpy_32", "copy.comp", {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}});
     string_to_spv("cpy_f32_f16", "copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float16_t"}});
@@ -1270,6 +1271,8 @@ void process_shaders() {
 
     string_to_spv("ssm_conv_f32", "ssm_conv.comp", {{"A_TYPE", "float"}});
     string_to_spv("ssm_conv_back_f32", "ssm_conv_back.comp", {{"A_TYPE", "float"}});
+    string_to_spv("gated_delta_net_back_f32", "gated_delta_net_back.comp", {{"A_TYPE", "float"}});
+    string_to_spv("gated_delta_net_back_chunked_f32", "gated_delta_net_back_chunked.comp", {{"A_TYPE", "float"}});
     string_to_spv("ssm_scan_back_ckpt_f32", "ssm_scan_back.comp", {{"SSM_SCAN_BACK_CKPT", "1"}});
     string_to_spv("ssm_scan_back_grad_f32", "ssm_scan_back.comp", {{"SSM_SCAN_BACK_GRAD", "1"}});
 
