@@ -92,6 +92,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include "ggml-retro-quant.h"
 #include "ggml-vulkan-shaders.hpp"
 
 #if !defined(VK_KHR_shader_bfloat16)
