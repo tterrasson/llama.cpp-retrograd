@@ -4675,6 +4675,11 @@ void llama_opt_init(struct llama_context * ctx, struct llama_model * model, stru
     ctx->opt_init(model, lopt_params);
 }
 
+// retro delta: optimizer handle for checkpointing (see llama.h).
+ggml_opt_context_t llama_opt_context(struct llama_context * ctx) {
+    return ctx->opt_context();
+}
+
 // retro delta: training-graph preflight (see llama.h).
 int32_t llama_opt_preflight(
         struct llama_context   * ctx,
