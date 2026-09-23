@@ -581,6 +581,16 @@ ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
     return result;
 }
 
+void ggml_opt_set_backend_sched(ggml_opt_context_t opt_ctx, ggml_backend_sched_t backend_sched) {
+    // The optimizer keeps its persistent tensors (e.g. AdamW moments) in buffers
+    // tied to the backends, not to the scheduler object, so swapping in a new
+    // scheduler that uses the same backends is safe. The dynamic-graph path
+    // rebuilds and re-allocates the graph against this scheduler on the next
+    // ggml_opt_alloc, so no cached allocation is reused across the swap.
+    opt_ctx->backend_sched = backend_sched;
+    opt_ctx->allocated_graph = nullptr;
+}
+
 void ggml_opt_free(ggml_opt_context_t opt_ctx) {
     if (opt_ctx == nullptr) {
         return;
