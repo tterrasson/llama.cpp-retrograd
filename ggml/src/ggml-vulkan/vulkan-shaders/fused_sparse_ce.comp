@@ -1,0 +1,278 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_atomic_float : require
+
+// retro delta: forward of the fused sparse cross-entropy over a (possibly
+// quantized) projection head. One workgroup per *tile of tokens*. The workgroup
+// partitions the vocabulary across its invocations, each accumulating a partial
+// online log-sum-exp in F32 per token of the tile; a tree reduction merges them
+// into each token's logsumexp. The [n_vocab, n_tokens] logits are never
+// materialized: each logit z[v,t] = dot(w[:,v], h[:,t]) is recomputed on the
+// fly. The per-token contribution sum_j weight[j,t]*(logsumexp_t - z[target[j,t]])
+// is normalized by the active token count and atomically summed into the scalar
+// loss (retro delta: k sparse targets per position, k = 1 being the one-hot
+// objective). All reductions are in F32 so a low-precision head never biases
+// the gradient.
+//
+// The head, not the hidden states, is what this kernel spends its time on: one
+// dequantize() call decodes two weights, and for a K-quant that call is a dozen
+// integer ops with no vec4 form to fall back on. A tile of TOK tokens decodes
+// each column once and feeds every token of the tile from registers, so the
+// per-token cost of walking the vocabulary is divided by the tile width. That
+// is also why h is not staged in shared memory: a tile of it is a few KiB
+// re-read by every column of every invocation, which is what a cache is for,
+// while shared memory would have to be paid out of the budget that bounds the
+// tile itself. `p.n_tok` is the tile the host picked
+// (ggml_vk_fused_sparse_ce_tile); the loops are unrolled over the TOK_MAX bound
+// so every accumulator stays in registers.
+//
+// The head is dequantized through the backend's generic per-type helpers
+// (dequant_funcs.glsl), so a single shader source covers every quant type: the
+// generator (vulkan-shaders-gen.cpp) compiles one variant per DATA_A_* type,
+// exactly like get_rows_quant / mul_mat_vec. See the CPU oracle
+// ggml_compute_forward_fused_sparse_ce_f32.
+
+// types.glsl defines A_TYPE / QUANT_K / QUANT_R for the head's DATA_A_* type;
+// dequant_funcs.glsl then provides dequantize()/get_dm() reading data_a. It also
+// needs FLOAT_TYPE and the data_a buffers declared first, so the order is:
+// types.glsl -> FLOAT_TYPE + buffer decls -> dequant_funcs.glsl.
+#include "types.glsl"
+
+#define FLOAT_TYPE float
+#define WG 256
+
+// Tokens per workgroup. Must stay equal to GGML_VK_FUSED_CE_TOK_MAX in
+// ggml-vulkan.cpp: the host sizes the dispatch grid from it, and the backward
+// bounds its gradient accumulators with the same constant.
+#define TOK_MAX 8
+
+// Distance, inside a block, between the two elements one dequantize() returns,
+// and the iqs step from one such pair to the next. This is the pairing
+// dequant_funcs.glsl documents: (iqs, iqs + y_offset), y_offset being 1 for
+// QUANT_R == 1 and QUANT_K/2 for QUANT_R == 2.
+#define Y_OFFSET ((QUANT_R == 1) ? 1 : (QUANT_K / 2))
+#define QSTEP    (2 / QUANT_R)
+
+layout(local_size_x = WG, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint n_embd;
+    uint n_tokens;
+    uint n_vocab;
+    uint h_stride;
+    uint d_stride;
+    uint has_bias; // retro delta: the optional per-vocab bias of the head
+    uint n_tok;    // tokens per workgroup, 1..TOK_MAX
+    uint n_topk;   // retro delta: sparse targets per position
+} p;
+
+layout(binding = 0) readonly buffer H   {float data_h[];};
+// The head lives at binding 1. dequant_funcs.glsl reads it through data_a and its
+// packed aliases; all three views point at the same binding (as in
+// mul_mat_vec_iface.glsl).
+layout(binding = 1) readonly buffer A   {A_TYPE data_a[];};
+#if defined(A_TYPE_PACKED16)
+layout(binding = 1) readonly buffer A16 {A_TYPE_PACKED16 data_a_packed16[];};
+#endif
+#if defined(A_TYPE_PACKED32)
+layout(binding = 1) readonly buffer A32 {A_TYPE_PACKED32 data_a_packed32[];};
+#endif
+layout(binding = 2) readonly buffer Tgt {int   data_tgt[];};
+layout(binding = 3) readonly buffer Wgt {float data_wgt[];};
+layout(binding = 4) readonly buffer Cnt {uint  data_count[];};
+layout(binding = 5) coherent buffer Dst {float data_dst[];};
+// retro delta: optional per-vocab bias [n_vocab]. When the head has none the host
+// binds a dummy and clears has_bias, since a descriptor set must stay complete.
+layout(binding = 6) readonly buffer Bs  {float data_bias[];};
+
+#include "dequant_funcs.glsl"
+
+shared float sh_max[WG];
+shared float sh_sum[WG];
+// retro delta: the per-token log-sum-exp, published before
+// the k target logits are recomputed against it, rather than captured by the
+// main sweep, which would need TOK_MAX*K slots and a test per entry inside the
+// hot loop.
+// sh_max doubles as the scratch of that second reduction: it has been consumed
+// by the time the k logits are known, so the shared footprint does not grow.
+shared float sh_lse[TOK_MAX];
+
+// First token of this workgroup's tile. Workgroup-uniform.
+uint g_t_base;
+
+float h_at(uint tl, uint e) {
+    return data_h[(g_t_base + tl) * p.h_stride + e];
+}
+
+// z[tl] = dot(w[:,v], h[:,t_base+tl]) (+ bias[v]) in F32, for the whole tile.
+// One pass over the column: the block arithmetic, the scale fetch and the
+// dequantization happen once and every token of the tile reuses them.
+void column_dots(uint v, uint n_here, out float z[TOK_MAX]) {
+    [[unroll]] for (uint tl = 0; tl < TOK_MAX; ++tl) {
+        z[tl] = 0.0f;
+    }
+
+#if QUANT_K == 1
+    // F32/F16 heads: a column is a plain contiguous row of scalars, and
+    // dequantize() indexes it element-wise.
+    const uint a_off = v * p.n_embd;
+    for (uint e = 0; e < p.n_embd; e += 2) {
+        const vec2 dq = dequantize(a_off + e, 0, 0);
+        [[unroll]] for (uint tl = 0; tl < TOK_MAX; ++tl) {
+            if (tl < n_here) {
+                z[tl] += dq.x * h_at(tl, e) + dq.y * h_at(tl, e + 1);
+            }
+        }
+    }
+#else
+    const uint nb    = p.n_embd / QUANT_K;
+    const uint a_off = v * nb;
+    for (uint ibl = 0; ibl < nb; ++ibl) {
+        const uint ib   = a_off + ibl;
+        const uint iybs = ibl * QUANT_K;
+        // Once per block instead of once per pair. The K-quants return a
+        // neutral (1, 0) here and fold their scales into dequantize(), so the
+        // affine below folds away for them at compile time.
+        const vec2 dm = get_dm(ib, 0);
+        for (uint j = 0; j < QUANT_K / 2; ++j) {
+            const uint iqs = j * QSTEP;
+            const uint e0  = iybs + iqs;
+            const uint e1  = e0 + Y_OFFSET;
+            vec2 dq = dequantize(ib, iqs, 0);
+            dq = dq * dm.x + dm.y;
+            [[unroll]] for (uint tl = 0; tl < TOK_MAX; ++tl) {
+                if (tl < n_here) {
+                    z[tl] += dq.x * h_at(tl, e0) + dq.y * h_at(tl, e1);
+                }
+            }
+        }
+    }
+#endif
+
+    // Added after the dot, exactly where the CPU oracle adds it.
+    if (p.has_bias != 0u) {
+        const float b = data_bias[v];
+        [[unroll]] for (uint tl = 0; tl < TOK_MAX; ++tl) {
+            z[tl] += b;
+        }
+    }
+}
+
+void main() {
+    const uint n_tok = max(p.n_tok, 1u);
+    g_t_base = gl_WorkGroupID.x * n_tok;
+    if (g_t_base >= p.n_tokens) {
+        return;
+    }
+    const uint n_here = min(n_tok, p.n_tokens - g_t_base);
+    const uint lid    = gl_LocalInvocationID.x;
+
+    // Token metadata, read redundantly by every invocation: it is a broadcast of
+    // a handful of scalars, and reading it this way keeps the arrays statically
+    // indexed, hence in registers.
+    const uint n_topk = max(p.n_topk, 1u);
+    bool act[TOK_MAX];
+    uint n_act = 0;
+    [[unroll]] for (uint tl = 0; tl < TOK_MAX; ++tl) {
+        act[tl] = false;
+        if (tl < n_here) {
+            for (uint j = 0; j < n_topk; ++j) {
+                const int   g = data_tgt[(g_t_base + tl) * n_topk + j];
+                const float w = data_wgt[(g_t_base + tl) * n_topk + j];
+                if (g >= 0 && uint(g) < p.n_vocab && w != 0.0f) {
+                    act[tl] = true;
+                }
+            }
+            if (act[tl]) {
+                n_act++;
+            }
+        }
+    }
+    if (n_act == 0u) {
+        return; // workgroup-uniform: a tile of inactive tokens contributes nothing
+    }
+
+    float lmax[TOK_MAX];
+    float lsum[TOK_MAX];
+    [[unroll]] for (uint tl = 0; tl < TOK_MAX; ++tl) {
+        lmax[tl] = -3.4e38f; // effectively -inf; the first real logit overrides it
+        lsum[tl] = 0.0f;
+    }
+
+    float z[TOK_MAX];
+    for (uint v = lid; v < p.n_vocab; v += WG) {
+        column_dots(v, n_here, z);
+        [[unroll]] for (uint tl = 0; tl < TOK_MAX; ++tl) {
+            if (tl < n_here && act[tl]) {
+                const float zz = z[tl];
+                if (zz > lmax[tl]) {
+                    lsum[tl] = lsum[tl] * exp(lmax[tl] - zz) + 1.0f;
+                    lmax[tl] = zz;
+                } else {
+                    lsum[tl] += exp(zz - lmax[tl]);
+                }
+            }
+        }
+    }
+
+    // Tree reduction of the partial (max, sum-exp) pairs, merged in F32. One
+    // token at a time, reusing the same scratch: `n_here` is workgroup-uniform,
+    // so every barrier below is reached by the whole workgroup.
+    const uint n_active = data_count[0];
+    [[unroll]] for (uint tl = 0; tl < TOK_MAX; ++tl) {
+        if (tl < n_here) {
+            barrier(); // the previous token is done reading sh_max/sh_sum
+            sh_max[lid] = lmax[tl];
+            sh_sum[lid] = lsum[tl];
+            barrier();
+            [[unroll]] for (uint s = WG / 2u; s > 0u; s >>= 1) {
+                if (lid < s) {
+                    const float m1 = sh_max[lid];
+                    const float s1 = sh_sum[lid];
+                    const float m2 = sh_max[lid + s];
+                    const float s2 = sh_sum[lid + s];
+                    const float m = max(m1, m2);
+                    const float sum = s1 * exp(m1 - m) + s2 * exp(m2 - m);
+                    sh_max[lid] = m;
+                    sh_sum[lid] = sum;
+                }
+                barrier();
+            }
+            if (lid == 0) {
+                sh_lse[tl] = sh_max[0] + log(sh_sum[0]);
+            }
+            barrier();
+
+            // retro delta: sum_j w_j*(lse - z_j). The k
+            // target logits are recomputed here - k columns next to the n_vocab
+            // the sweep above walked - and reduced in one tree sum, so a K = 1
+            // token contributes exactly the previous wgt*(lse - ztgt).
+            const float lse = sh_lse[tl];
+            float contrib = 0.0f;
+            if (act[tl] && n_active > 0u) {
+                for (uint j = lid; j < n_topk; j += WG) {
+                    const int   g = data_tgt[(g_t_base + tl) * n_topk + j];
+                    const float w = data_wgt[(g_t_base + tl) * n_topk + j];
+                    if (g >= 0 && uint(g) < p.n_vocab && w != 0.0f) {
+                        float zt[TOK_MAX];
+                        column_dots(uint(g), n_here, zt);
+                        contrib += w * (lse - zt[tl]);
+                    }
+                }
+            }
+            sh_max[lid] = contrib;
+            barrier();
+            [[unroll]] for (uint s = WG / 2u; s > 0u; s >>= 1) {
+                if (lid < s) {
+                    sh_max[lid] += sh_max[lid + s];
+                }
+                barrier();
+            }
+            if (lid == 0 && act[tl] && n_active > 0u) {
+                atomicAdd(data_dst[0], sh_max[0] / float(n_active));
+            }
+        }
+    }
+}
