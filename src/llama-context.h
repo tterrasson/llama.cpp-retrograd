@@ -366,6 +366,15 @@ private:
     // training
     ggml_opt_context_t opt_ctx = nullptr;
 
+    llama_batch opt_batch = {};
+    uint32_t opt_batch_capacity = 0;
+    std::vector<llama_token> opt_tokens;
+    std::vector<llama_token> opt_labels_sparse;
+    std::vector<uint8_t> opt_compute_meta;
+
+    void * opt_label_storage = nullptr;
+    std::vector<size_t> opt_active_label_offsets;
+
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;
 
