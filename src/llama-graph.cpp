@@ -4354,30 +4354,32 @@ void llm_graph_context::build_sampling() const {
                 }
                 outs[1] = data.sampled;
                 ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
-            }
-
-            if (data.probs != nullptr) {
-                if (active) {
-                    res->t_sampled_probs[row] = data.probs;
+            } else {
+                // retro delta: a fully offloaded sampler only exposes the selected scalar;
+                // do not copy intermediate full-vocabulary tensors back to the host.
+                if (data.probs != nullptr) {
+                    if (active) {
+                        res->t_sampled_probs[row] = data.probs;
+                    }
+                    outs[1] = data.probs;
+                    ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
                 }
-                outs[1] = data.probs;
-                ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
-            }
 
-            if (data.logits != nullptr) {
-                if (active) {
-                    res->t_sampled_logits[row] = data.logits;
+                if (data.logits != nullptr) {
+                    if (active) {
+                        res->t_sampled_logits[row] = data.logits;
+                    }
+                    outs[1] = data.logits;
+                    ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
                 }
-                outs[1] = data.logits;
-                ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
-            }
 
-            if (data.candidates != nullptr) {
-                if (active) {
-                    res->t_candidates[row] = data.candidates;
+                if (data.candidates != nullptr) {
+                    if (active) {
+                        res->t_candidates[row] = data.candidates;
+                    }
+                    outs[1] = data.candidates;
+                    ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
                 }
-                outs[1] = data.candidates;
-                ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
             }
         }
     }
