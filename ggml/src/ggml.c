@@ -7066,6 +7066,17 @@ static void ggml_compute_backward(
                 // noop
             }
         } break;
+        case GGML_OP_SET_ROWS: {
+            if (src0_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_get_rows(ctx, grad, src1));
+            }
+            if (src1_needs_grads) {
+                // row indices are not differentiable
+            }
+            if (src2_needs_grads) {
+                // cache destination is overwritten and is not part of the trainable path
+            }
+        } break;
         case GGML_OP_DIAG_MASK_INF: {
             if (src0_needs_grads) {
                 /* ggml_diag_mask_inf_impl() shouldn't be here */
@@ -7395,12 +7406,16 @@ void ggml_build_backward_expand(
             case GGML_OP_CPY:           // gradients in CPY target are irrelevant
             case GGML_OP_GET_ROWS:      // row indices not differentiable
             case GGML_OP_GET_ROWS_BACK: // same as for GET_ROWS
+            case GGML_OP_SET_ROWS:      // row indices not differentiable
             case GGML_OP_ROPE:          // positions not differentiable
                 ignore_src[1] = true;
                 break;
 
             default:
                 break;
+        }
+        if (node->op == GGML_OP_SET_ROWS) {
+            ignore_src[2] = true; // destination cache is overwritten
         }
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
             if (!node->src[j] || ignore_src[j] || !grads_needed[ggml_hash_find(&cgraph->visited_hash_set, node->src[j])]) {
