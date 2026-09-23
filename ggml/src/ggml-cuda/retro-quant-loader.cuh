@@ -28,6 +28,71 @@
 // to zero it first (k_out_prod_quant does), and a caller that requires whole
 // tiles has to check the extent (fused sparse CE does).
 static constexpr int RETRO_QUANT_TILE    = 256;
+static constexpr int RETRO_QUANT_THREADS = 256;
+
+struct retro_quant_f16_loader {
+    static __device__ __forceinline__ void load(
+            const void * row, const int64_t m0, const int64_t ne0, float * tile) {
+        const int m = threadIdx.x;
+        if (m0 + m < ne0) {
+            tile[m] = __half2float(((const half *) row)[m0 + m]);
+        }
+    }
+};
+
+template<int qk, int qr, dequantize_kernel_t dequantize_kernel>
+struct retro_quant_pair_loader {
+    static __device__ __forceinline__ void load(
+            const void * row, const int64_t m0, const int64_t ne0, float * tile) {
+        const int pair = threadIdx.x;
+        if (pair >= RETRO_QUANT_TILE/2 || m0 + 2*pair >= ne0) {
+            return;
+        }
+
+        const int i00 = 2*pair;
+        const int ib  = (m0 + i00)/qk;
+        const int iqs = ((m0 + i00)%qk)/qr;
+        const int block_start = i00 - i00%qk;
+        const int second = qr == 1 ? 1 : qk/2;
+
+        float2 v;
+        dequantize_kernel(row, ib, iqs, v);
+        tile[block_start + iqs]          = v.x;
+        tile[block_start + iqs + second] = v.y;
+    }
+};
+
+template<int dequant_threads, dequantize_kq_t<float> dequantize_block>
+struct retro_quant_superblock_loader {
+    static __device__ __forceinline__ void load(
+            const void * row, const int64_t m0, const int64_t ne0, float * tile) {
+        GGML_UNUSED(ne0);
+        if (threadIdx.x < dequant_threads) {
+            dequantize_block(row, m0/QK_K, tile, threadIdx.x);
+        }
+    }
+};
+
+struct retro_quant_nvfp4_loader {
+    static __device__ __forceinline__ void load(
+            const void * row, const int64_t m0, const int64_t ne0, float * tile) {
+        const int local = threadIdx.x;
+        const int64_t m = m0 + local;
+        if (m >= ne0) {
+            return;
+        }
+        const block_nvfp4 * blocks = (const block_nvfp4 *) row;
+        const block_nvfp4 & block = blocks[m/QK_NVFP4];
+        const int in_block = m%QK_NVFP4;
+        const int sub = in_block/QK_NVFP4_SUB;
+        const int in_sub = in_block%QK_NVFP4_SUB;
+        const uint8_t q = block.qs[sub*(QK_NVFP4_SUB/2) + in_sub%(QK_NVFP4_SUB/2)];
+        const int nibble = in_sub < QK_NVFP4_SUB/2 ? q & 0x0f : q >> 4;
+        tile[local] = ggml_cuda_ue4m3_to_fp32(block.d[sub])*kvalues_mxfp4[nibble];
+    }
+};
+
+// The type-to-loader mapping is kept declarative. Every dispatch below expands a
 // table from ggml-retro-quant.h, so adding a CPU/Vulkan/CUDA type without a CUDA
 // loader is a compile error rather than a silent trip through a fallback.
 template<ggml_type type> struct retro_quant_traits;
