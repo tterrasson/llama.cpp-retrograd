@@ -2128,6 +2128,10 @@ bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
         // generates fine and aborts here the moment it is trained.
         case GGML_OP_SSM_SCAN_BACK:
         case GGML_OP_GATED_DELTA_NET_BACK:
+        // retro delta: the scalar losses, whose Metal kernels write one partial
+        // per row into scratch past dst and sum them in a fixed order.
+        case GGML_OP_CROSS_ENTROPY_LOSS:
+        case GGML_OP_FUSED_SPARSE_CE:
             return true;
         default:
             return false;

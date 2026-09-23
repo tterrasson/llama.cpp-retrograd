@@ -49,6 +49,8 @@ size_t ggml_metal_op_flash_attn_ext_extra_idx(const struct ggml_tensor * op);
 
 size_t ggml_metal_op_ssm_scan_back_extra_tmp(const struct ggml_tensor * op); // retro delta
 size_t ggml_metal_op_gated_delta_net_back_extra_tmp(const struct ggml_tensor * op); // retro delta
+size_t ggml_metal_op_cross_entropy_loss_extra_tmp(const struct ggml_tensor * op); // retro delta
+size_t ggml_metal_op_fused_sparse_ce_extra_tmp(const struct ggml_tensor * op); // retro delta
 
 int ggml_metal_op_concat            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_repeat            (ggml_metal_op_t ctx, int idx);

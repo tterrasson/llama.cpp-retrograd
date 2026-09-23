@@ -1533,6 +1533,11 @@ typedef struct {
     float   val;
 } ggml_metal_kargs_retro_fill;
 
+// retro delta: fixed-order F32 sum of n values into a scalar
+typedef struct {
+    int64_t n;
+} ggml_metal_kargs_retro_sum;
+
 // retro delta: cross-entropy loss forward (contiguous rows; dst is a scalar)
 typedef struct {
     int32_t ne00;  // n_classes (row width)

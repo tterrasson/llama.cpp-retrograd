@@ -6625,12 +6625,50 @@ int ggml_metal_op_soft_max_back(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-// retro delta: cross-entropy loss forward. Zero the scalar dst, then one
-// threadgroup per row computes the row's loss contribution and atomically
-// accumulates it into dst[0].
+// retro delta: the scalar losses reduce in two dispatches - one partial per
+// row into scratch placed after dst, then a single threadgroup summing them in
+// a fixed order - so the loss is the same bits on every run. An atomic add
+// into dst[0] made it depend on the order the threadgroups finished in.
+size_t ggml_metal_op_cross_entropy_loss_extra_tmp(const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_CROSS_ENTROPY_LOSS);
+
+    return sizeof(float)*ggml_nrows(op->src[0]);
+}
+
+size_t ggml_metal_op_fused_sparse_ce_extra_tmp(const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_FUSED_SPARSE_CE);
+
+    return sizeof(float)*op->src[0]->ne[1];
+}
+
+// retro delta: sums the `n` partials at `bid_tmp` into the scalar `op`, after a
+// barrier on the dispatch that wrote them.
+static void ggml_metal_op_retro_sum_partials(
+        ggml_metal_op_t ctx, ggml_tensor * op, ggml_metal_buffer_id bid_tmp, int64_t n) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    ggml_metal_op_concurrency_reset(ctx);
+
+    auto pipeline = ggml_metal_library_get_pipeline_retro_sum(lib);
+
+    ggml_metal_kargs_retro_sum args = {
+        /*.n =*/ n,
+    };
+
+    const int nth = std::min(1024, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, bid_tmp,                        1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),   2);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, nth, 1, 1);
+}
+
 // retro delta: fused sparse cross-entropy, forward. One threadgroup per token;
-// the head is read quantized inside the kernel, so this op allocates nothing.
-// The scalar destination is atomically accumulated, hence the zero-fill first.
+// the head is read quantized inside the kernel. Each token writes its partial
+// to the scratch after dst, and ggml_metal_op_retro_sum_partials reduces them.
 int ggml_metal_op_fused_sparse_ce(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -6641,7 +6679,8 @@ int ggml_metal_op_fused_sparse_ce(ggml_metal_op_t ctx, int idx) {
     const ggml_tensor * w    = op->src[1];
     const ggml_tensor * bias = op->src[4];
 
-    ggml_metal_op_retro_fill_zero(ctx, op);
+    ggml_metal_buffer_id bid_tmp = ggml_metal_get_buffer_id(op);
+    bid_tmp.offs += ggml_nbytes(op);
 
     auto pipeline = ggml_metal_library_get_pipeline_fused_sparse_ce(lib, op);
 
@@ -6665,11 +6704,13 @@ int ggml_metal_op_fused_sparse_ce(ggml_metal_op_t ctx, int idx) {
     // The bias is optional; bind the hidden states in its place so the slot is
     // always a valid buffer. has_bias is what decides whether it is read.
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(bias ? bias : op->src[0]), 5);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         6);
+    ggml_metal_encoder_set_buffer  (enc, bid_tmp,                              6);
 
     const int nth = std::min(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
     ggml_metal_encoder_dispatch_threadgroups(enc, h->ne[1], 1, 1, nth, 1, 1);
+
+    ggml_metal_op_retro_sum_partials(ctx, op, bid_tmp, h->ne[1]);
 
     return 1;
 }
@@ -6724,7 +6765,8 @@ int ggml_metal_op_cross_entropy_loss(ggml_metal_op_t ctx, int idx) {
     const int64_t ne00  = op->src[0]->ne[0];
     const int64_t nrows = ggml_nrows(op->src[0]);
 
-    ggml_metal_op_retro_fill_zero(ctx, op);
+    ggml_metal_buffer_id bid_tmp = ggml_metal_get_buffer_id(op);
+    bid_tmp.offs += ggml_nbytes(op);
 
     auto pipeline = ggml_metal_library_get_pipeline_cross_entropy_loss(lib, op);
 
@@ -6740,9 +6782,11 @@ int ggml_metal_op_cross_entropy_loss(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+    ggml_metal_encoder_set_buffer  (enc, bid_tmp,                              3);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, nth, 1, 1);
+
+    ggml_metal_op_retro_sum_partials(ctx, op, bid_tmp, nrows);
 
     return 1;
 }
