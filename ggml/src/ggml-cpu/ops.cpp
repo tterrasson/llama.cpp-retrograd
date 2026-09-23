@@ -11880,7 +11880,14 @@ static void ggml_compute_forward_cross_entropy_loss_back_f32(
         assert(sum > 0.0);
         ggml_vec_scale_f32(nc, ds0, 1.0/sum);
 
-        // grad(src0f) = (softmax(src0f) - src1f) * grad(cross_entropy_loss(src0f, src1f)) / nr
+        // retro delta: scale the softmax term by the row's label mass so the
+        // gradient stays exact for weighted labels (sum(labels) != 1), which
+        // Retrograd uses to express detached policy-gradient coefficients:
+        // grad(src0f) = (sum(src1f)*softmax(src0f) - src1f) * grad / n_active.
+        // One-hot rows (label mass 1) are unchanged.
+        float label_mass = 0.0f;
+        ggml_vec_sum_f32(nc, &label_mass, s1);
+        ggml_vec_scale_f32(nc, ds0, label_mass);
         ggml_vec_sub_f32(nc, ds0, ds0, s1);
         ggml_vec_scale_f32(nc, ds0, d_by_nr);
 
