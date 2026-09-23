@@ -6820,11 +6820,18 @@ static void ggml_compute_backward(
             }
         } break;
         case GGML_OP_MUL: {
+            // A transpose/view may feed a strided upstream gradient here (LFM2
+            // ShortConv does exactly that). CPU binary ops require src0's
+            // element dimension to be contiguous, so materialize only when
+            // needed before forming either product of the VJP.
+            struct ggml_tensor * grad_mul = ggml_is_contiguous_rows(grad)
+                ? grad
+                : ggml_cont(ctx, grad);
             if (src0_needs_grads) {
-                ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad, src1));
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad_mul, src1));
             }
             if (src1_needs_grads) {
-                struct ggml_tensor * tmp = ggml_mul(ctx, src0, grad);
+                struct ggml_tensor * tmp = ggml_mul(ctx, src0, grad_mul);
                 if (!ggml_are_same_shape(src0, src1)) {
                     tmp = ggml_repeat_back(ctx, tmp, src1);
                 }
