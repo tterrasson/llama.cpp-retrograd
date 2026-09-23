@@ -47,7 +47,9 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const struct ggml_tensor * op);
 size_t ggml_metal_op_flash_attn_ext_extra_kv_f16(const struct ggml_tensor * op);
 size_t ggml_metal_op_flash_attn_ext_extra_idx(const struct ggml_tensor * op);
 
+size_t ggml_metal_op_ssm_scan_back_extra_tmp(const struct ggml_tensor * op); // retro delta
 size_t ggml_metal_op_gated_delta_net_back_extra_tmp(const struct ggml_tensor * op); // retro delta
+
 int ggml_metal_op_concat            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_repeat            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_acc               (ggml_metal_op_t ctx, int idx);
@@ -65,6 +67,7 @@ int ggml_metal_op_soft_max          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_ssm_conv          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_ssm_scan          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_ssm_conv_back     (ggml_metal_op_t ctx, int idx); // retro delta
+int ggml_metal_op_conv_rs_gather    (ggml_metal_op_t ctx, int idx); // retro delta
 int ggml_metal_op_ssm_scan_back     (ggml_metal_op_t ctx, int idx); // retro delta
 int ggml_metal_op_rwkv              (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_gated_delta_net   (ggml_metal_op_t ctx, int idx);
