@@ -48,6 +48,32 @@ extern "C" {
             int64_t        ne_label,     // number of elements per label
             int64_t        ndata,        // total number of datapoints/labels
             int64_t        ndata_shard); // number of datapoints/labels per shard (unit at which the dataset is shuffled/copied)
+    // View over caller-owned CPU memory. Buffers remain owned by the caller
+    // and must outlive the returned dataset.
+    GGML_API ggml_opt_dataset_t ggml_opt_dataset_init_external(
+            enum ggml_type type_data,
+            enum ggml_type type_label,
+            int64_t        ne_datapoint,
+            int64_t        ne_label,
+            int64_t        ndata,
+            int64_t        ndata_shard,
+            void *         data,
+            void *         labels);
+    // Logical concatenation of two caller-owned CPU-memory datasets. The
+    // split must fall on a shard boundary; batches and shuffling continue to
+    // address one global permutation without copying either segment.
+    GGML_API ggml_opt_dataset_t ggml_opt_dataset_init_external_split(
+            enum ggml_type type_data,
+            enum ggml_type type_label,
+            int64_t        ne_datapoint,
+            int64_t        ne_label,
+            int64_t        ndata_first,
+            int64_t        ndata_second,
+            int64_t        ndata_shard,
+            void *         data_first,
+            void *         labels_first,
+            void *         data_second,
+            void *         labels_second);
     GGML_API void ggml_opt_dataset_free(ggml_opt_dataset_t dataset);
 
     // get underlying tensors that store the data
@@ -226,6 +252,14 @@ extern "C" {
         ggml_opt_context_t    opt_ctx,
         struct ggml_tensor ** checkpoints,
         int                   n_checkpoints);
+
+    // retro delta: type the retained checkpoints are held in across the backward.
+    // GGML_TYPE_F16 halves that term at the cost of recompute bit-parity, since
+    // the recomputed activations then start from a rounded checkpoint.
+    // GGML_TYPE_COUNT (the default) or GGML_TYPE_F32 keeps them unchanged.
+    GGML_API void ggml_opt_set_gradient_checkpoint_type(
+        ggml_opt_context_t opt_ctx,
+        enum ggml_type     type);
 
     // retro delta: what the retained checkpoints actually cost, and for how long.
     //

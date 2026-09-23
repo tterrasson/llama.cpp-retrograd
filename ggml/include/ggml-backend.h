@@ -97,6 +97,12 @@ extern "C" {
 
     GGML_API void ggml_backend_synchronize(ggml_backend_t backend);
 
+    // retro delta: device bytes this backend holds outside any ggml_backend_buffer
+    // (scratch pools, preallocated staging). Zero when the backend does not report
+    // it, which is indistinguishable from "holds none" on purpose: callers use this
+    // to attribute a device-memory delta, not to decide behavior.
+    GGML_API size_t ggml_backend_scratch_bytes(ggml_backend_t backend);
+
     GGML_API ggml_backend_graph_plan_t ggml_backend_graph_plan_create(ggml_backend_t backend, struct ggml_cgraph * cgraph);
     GGML_API void                      ggml_backend_graph_plan_free  (ggml_backend_t backend, ggml_backend_graph_plan_t plan);
 

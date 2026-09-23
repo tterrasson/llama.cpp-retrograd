@@ -567,6 +567,15 @@ void ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event)
     backend->iface.event_wait(backend, event);
 }
 
+// retro delta
+size_t ggml_backend_scratch_bytes(ggml_backend_t backend) {
+    GGML_ASSERT(backend);
+    if (backend->iface.get_scratch_bytes == NULL) {
+        return 0;
+    }
+    return backend->iface.get_scratch_bytes(backend);
+}
+
 static void ggml_backend_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params) {
     GGML_ASSERT(backend);
     if (backend->iface.graph_optimize != NULL) {

@@ -153,6 +153,15 @@ extern "C" {
 
         // (optional) sort/optimize the nodes in the graph
         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params);
+
+        // retro delta: (optional) device bytes the backend holds for its own
+        // account, outside any ggml_backend_buffer. Scratch pools and preallocated
+        // staging buffers are invisible to the buffer-level accounting yet are the
+        // dominant transient term of a training step, so a caller that only sums
+        // buffers cannot prove a VRAM gain or notice a regression. Backends that
+        // grow such storage monotonically (CUDA pool, Vulkan prealloc_*) report a
+        // high-water mark here; leaving this null reports zero.
+        size_t                    (*get_scratch_bytes) (ggml_backend_t backend);
     };
 
     struct ggml_backend {
