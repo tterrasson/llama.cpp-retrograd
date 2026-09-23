@@ -111,6 +111,8 @@ int ggml_metal_op_moe_reduce        (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_tri               (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_opt_step_adamw    (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_opt_step_sgd      (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_opt_step_gefen_stats(ggml_metal_op_t ctx, int idx); // retro delta
+int ggml_metal_op_opt_step_gefen      (ggml_metal_op_t ctx, int idx); // retro delta
 int ggml_metal_op_rms_norm_back     (ggml_metal_op_t ctx, int idx); // retro delta
 int ggml_metal_op_l2_norm_back      (ggml_metal_op_t ctx, int idx); // retro delta
 int ggml_metal_op_out_prod          (ggml_metal_op_t ctx, int idx); // retro delta
