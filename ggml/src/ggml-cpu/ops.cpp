@@ -7,6 +7,8 @@
 #include "ggml.h"
 #include "unary-ops.h"
 #include "vec.h"
+// retro delta: kernels this fork added, called from upstream dispatchers below
+#include "retro-ops.h"
 
 #include <algorithm>
 #include <cfloat>
