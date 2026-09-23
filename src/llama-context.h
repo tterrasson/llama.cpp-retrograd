@@ -234,6 +234,20 @@ struct llama_context {
             int64_t                          ndata_in_loop,
             int64_t                          t_loop_start);
 
+    bool opt_step_packed_sequences(
+            ggml_opt_dataset_t       dataset,
+            ggml_opt_result_t        result,
+            const llama_token      * tokens,
+            const llama_token      * labels_sparse,
+            const float            * label_weights,
+            const llama_pos        * positions,
+            const size_t           * seq_offsets,
+            const llama_seq_id     * seq_ids,
+            uint32_t                 n_tokens,
+            size_t                   n_seq_ids,
+            uint32_t                 n_sequences,
+            ggml_opt_epoch_callback  callback);
+
 private:
     //
     // output
@@ -377,6 +391,8 @@ private:
     std::vector<llama_token> opt_tokens;
     std::vector<llama_token> opt_labels_sparse;
     std::vector<uint8_t> opt_compute_meta;
+    ggml_context_ptr opt_cached_compute_ctx;
+    llm_graph_result_ptr opt_graph_cache;
 
     void * opt_label_storage = nullptr;
     std::vector<size_t> opt_active_label_offsets;
