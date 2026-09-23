@@ -108,6 +108,9 @@ int ggml_metal_op_opt_step_adamw    (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_opt_step_sgd      (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_rms_norm_back     (ggml_metal_op_t ctx, int idx); // retro delta
 int ggml_metal_op_out_prod          (ggml_metal_op_t ctx, int idx); // retro delta
+int ggml_metal_op_repeat_back       (ggml_metal_op_t ctx, int idx); // retro delta
+int ggml_metal_op_fused_sparse_ce   (ggml_metal_op_t ctx, int idx); // retro delta
+int ggml_metal_op_fused_sparse_ce_back(ggml_metal_op_t ctx, int idx); // retro delta
 int ggml_metal_op_soft_max_back     (ggml_metal_op_t ctx, int idx); // retro delta
 int ggml_metal_op_cross_entropy_loss     (ggml_metal_op_t ctx, int idx); // retro delta
 int ggml_metal_op_cross_entropy_loss_back(ggml_metal_op_t ctx, int idx); // retro delta

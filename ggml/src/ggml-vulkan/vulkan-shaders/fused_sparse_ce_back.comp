@@ -1,0 +1,349 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+// retro delta: backward of the fused sparse cross-entropy wrt the hidden states.
+// One workgroup per *tile of tokens*. Pass 1 recomputes each token's logsumexp
+// with the same online, F32-accumulated reduction as the forward
+// (checkpointing, so the [n_vocab, n_tokens] logits are never stored). Pass 2
+// forms
+//   acc[e,t] = sum_v softmax(z[v,t]) * w[e,v]
+// streaming the vocabulary in workgroup-sized tiles: each tile's softmax
+// weights are computed thread-per-vocab into shared memory, then consumed by
+// walking the column so every accumulation stays in F32 registers with no
+// shared-memory atomics. Finally
+// grad_h[:,t] = sum_j (grad * weight[j,t] / n_active) * (acc[:,t] - w[:,target[j,t]]),
+// which for k = 1 is the one-hot gradient (retro delta).
+//
+// Both passes are bound by decoding the head, so both are organised around the
+// unit dequantize() actually returns -- a *pair* of weights -- rather than
+// around a single element. Fetching one element at a time would cost one full
+// dequantize() per element in pass 2, the dominant cost of a training step. For the same reason a tile of TOK tokens shares one
+// decode of each column: the per-token cost of walking the vocabulary is
+// divided by the tile width. `p.n_tok` is the tile the host picked
+// (ggml_vk_fused_sparse_ce_tile), bounded so that TOK * pairs-per-thread stays
+// inside ACC_PAIRS.
+//
+// The head is dequantized through the backend's generic per-type helpers
+// (dequant_funcs.glsl), so a single shader source covers every quant type; the
+// generator compiles one variant per DATA_A_* type. Matches
+// ggml_compute_forward_fused_sparse_ce_back_f32.
+
+// See fused_sparse_ce.comp for the include ordering rationale.
+#include "types.glsl"
+
+#define FLOAT_TYPE float
+#define WG 256
+
+// Tokens per workgroup. Must stay equal to GGML_VK_FUSED_CE_TOK_MAX in
+// ggml-vulkan.cpp and to TOK_MAX in fused_sparse_ce.comp.
+#define TOK_MAX 8
+
+// Columns whose softmax weights are staged at a time. A workgroup computes a
+// full WG-wide slice of them -- one column per invocation, kept in registers --
+// and publishes it in VSUB-wide sub-slices, so the staging buffer costs
+// TOK_MAX * VSUB floats instead of TOK_MAX * WG. That keeps this shader's
+// shared footprint (4 KiB here, plus 2 KiB of reduction scratch) inside the
+// 16 KiB a Vulkan implementation must expose even for the IQ types, whose grid
+// table takes another 8 KiB.
+#define VSUB 128
+
+// Gradient accumulator budget, in pairs, per invocation. The host guarantees
+// `tile * ceil(n_embd / (2*WG)) <= ACC_PAIRS`, which also caps the supported
+// embedding width at ACC_PAIRS * 2 * WG = 8192 for a tile of one.
+#define ACC_PAIRS 16
+
+// See fused_sparse_ce.comp: the (iqs, iqs + Y_OFFSET) pairing of dequantize(),
+// and the iqs step from one pair to the next.
+#define Y_OFFSET ((QUANT_R == 1) ? 1 : (QUANT_K / 2))
+#define QSTEP    (2 / QUANT_R)
+
+layout(local_size_x = WG, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint n_embd;
+    uint n_tokens;
+    uint n_vocab;
+    uint h_stride;
+    uint d_stride;
+    uint has_bias; // retro delta: the optional per-vocab bias of the head
+    uint n_tok;    // tokens per workgroup, 1..TOK_MAX
+    uint n_topk;   // retro delta: sparse targets per position
+} p;
+
+layout(binding = 0) readonly  buffer Grd {float data_grad[];};
+layout(binding = 1) readonly  buffer H   {float data_h[];};
+// The head lives at binding 2 (see fused_sparse_ce.comp for the aliasing note).
+layout(binding = 2) readonly  buffer A   {A_TYPE data_a[];};
+#if defined(A_TYPE_PACKED16)
+layout(binding = 2) readonly  buffer A16 {A_TYPE_PACKED16 data_a_packed16[];};
+#endif
+#if defined(A_TYPE_PACKED32)
+layout(binding = 2) readonly  buffer A32 {A_TYPE_PACKED32 data_a_packed32[];};
+#endif
+layout(binding = 3) readonly  buffer Tgt {int   data_tgt[];};
+layout(binding = 4) readonly  buffer Wgt {float data_wgt[];};
+layout(binding = 5) readonly  buffer Cnt {uint  data_count[];};
+layout(binding = 6) writeonly buffer Dst {float data_dst[];};
+// retro delta: optional per-vocab bias [n_vocab]. It shifts every logit, so it
+// only enters through the logits; grad_h itself has no bias term. When the head
+// has none the host binds a dummy and clears has_bias.
+layout(binding = 7) readonly  buffer Bs  {float data_bias[];};
+
+#include "dequant_funcs.glsl"
+
+shared float sh_max[WG];
+shared float sh_sum[WG];
+shared float sh_lse[TOK_MAX];
+shared float sh_p[TOK_MAX * VSUB];
+
+// First token of this workgroup's tile. Workgroup-uniform.
+uint g_t_base;
+
+float h_at(uint tl, uint e) {
+    return data_h[(g_t_base + tl) * p.h_stride + e];
+}
+
+// The two positions, inside a column, of the pair `pidx`. Pairs tile the
+// embedding axis exactly once, so writing grad_h pair by pair writes every
+// element exactly once.
+uvec2 pair_positions(uint pidx) {
+#if QUANT_K == 1
+    return uvec2(2 * pidx, 2 * pidx + 1);
+#else
+    const uint j    = pidx % (QUANT_K / 2);
+    const uint iybs = (pidx / (QUANT_K / 2)) * QUANT_K;
+    const uint iqs  = j * QSTEP;
+    return uvec2(iybs + iqs, iybs + iqs + Y_OFFSET);
+#endif
+}
+
+// w[:,v] at pair `pidx`, dequantized to F32.
+vec2 w_pair(uint v, uint pidx) {
+#if QUANT_K == 1
+    return dequantize(v * p.n_embd + 2 * pidx, 0, 0);
+#else
+    const uint nb  = p.n_embd / QUANT_K;
+    const uint ib  = v * nb + pidx / (QUANT_K / 2);
+    const uint iqs = (pidx % (QUANT_K / 2)) * QSTEP;
+    const vec2 dm  = get_dm(ib, 0);
+    return dequantize(ib, iqs, 0) * dm.x + dm.y;
+#endif
+}
+
+// z[tl] = dot(w[:,v], h[:,t_base+tl]) (+ bias[v]) in F32 — identical to the
+// forward, and organised the same way: one decode of the column per tile.
+void column_dots(uint v, uint n_here, out float z[TOK_MAX]) {
+    [[unroll]] for (uint tl = 0; tl < TOK_MAX; ++tl) {
+        z[tl] = 0.0f;
+    }
+
+#if QUANT_K == 1
+    const uint a_off = v * p.n_embd;
+    for (uint e = 0; e < p.n_embd; e += 2) {
+        const vec2 dq = dequantize(a_off + e, 0, 0);
+        [[unroll]] for (uint tl = 0; tl < TOK_MAX; ++tl) {
+            if (tl < n_here) {
+                z[tl] += dq.x * h_at(tl, e) + dq.y * h_at(tl, e + 1);
+            }
+        }
+    }
+#else
+    const uint nb    = p.n_embd / QUANT_K;
+    const uint a_off = v * nb;
+    for (uint ibl = 0; ibl < nb; ++ibl) {
+        const uint ib   = a_off + ibl;
+        const uint iybs = ibl * QUANT_K;
+        const vec2 dm   = get_dm(ib, 0);
+        for (uint j = 0; j < QUANT_K / 2; ++j) {
+            const uint iqs = j * QSTEP;
+            const uint e0  = iybs + iqs;
+            const uint e1  = e0 + Y_OFFSET;
+            vec2 dq = dequantize(ib, iqs, 0);
+            dq = dq * dm.x + dm.y;
+            [[unroll]] for (uint tl = 0; tl < TOK_MAX; ++tl) {
+                if (tl < n_here) {
+                    z[tl] += dq.x * h_at(tl, e0) + dq.y * h_at(tl, e1);
+                }
+            }
+        }
+    }
+#endif
+
+    if (p.has_bias != 0u) {
+        const float b = data_bias[v];
+        [[unroll]] for (uint tl = 0; tl < TOK_MAX; ++tl) {
+            z[tl] += b;
+        }
+    }
+}
+
+void main() {
+    const uint n_tok = max(p.n_tok, 1u);
+    g_t_base = gl_WorkGroupID.x * n_tok;
+    if (g_t_base >= p.n_tokens) {
+        return;
+    }
+    const uint n_here   = min(n_tok, p.n_tokens - g_t_base);
+    const uint lid      = gl_LocalInvocationID.x;
+    const uint n_active = data_count[0];
+
+    // retro delta: only the per-position activity is held in
+    // registers - k targets and k weights per token would not fit, and the write
+    // loop below re-reads the entries it needs anyway.
+    const uint n_topk = max(p.n_topk, 1u);
+    bool act[TOK_MAX];
+    uint n_act = 0;
+    [[unroll]] for (uint tl = 0; tl < TOK_MAX; ++tl) {
+        act[tl] = false;
+        if (tl < n_here) {
+            for (uint j = 0; j < n_topk; ++j) {
+                const int   g = data_tgt[(g_t_base + tl) * n_topk + j];
+                const float w = data_wgt[(g_t_base + tl) * n_topk + j];
+                if (g >= 0 && uint(g) < p.n_vocab && w != 0.0f && n_active > 0u) {
+                    act[tl] = true;
+                }
+            }
+            if (act[tl]) {
+                n_act++;
+            } else {
+                // An inactive token still owns its slice of grad_h.
+                for (uint e = lid; e < p.n_embd; e += WG) {
+                    data_dst[(g_t_base + tl) * p.d_stride + e] = 0.0f;
+                }
+            }
+        }
+    }
+    if (n_act == 0u) {
+        return; // workgroup-uniform
+    }
+
+    // Pass 1: logsumexp per token (same F32 online reduction as the forward).
+    float lmax[TOK_MAX];
+    float lsum[TOK_MAX];
+    [[unroll]] for (uint tl = 0; tl < TOK_MAX; ++tl) {
+        lmax[tl] = -3.4e38f; // effectively -inf; the first real logit overrides it
+        lsum[tl] = 0.0f;
+    }
+
+    float z[TOK_MAX];
+    for (uint v = lid; v < p.n_vocab; v += WG) {
+        column_dots(v, n_here, z);
+        [[unroll]] for (uint tl = 0; tl < TOK_MAX; ++tl) {
+            if (tl < n_here && act[tl]) {
+                const float zz = z[tl];
+                if (zz > lmax[tl]) {
+                    lsum[tl] = lsum[tl] * exp(lmax[tl] - zz) + 1.0f;
+                    lmax[tl] = zz;
+                } else {
+                    lsum[tl] += exp(zz - lmax[tl]);
+                }
+            }
+        }
+    }
+
+    // `n_here` is workgroup-uniform, so every barrier below is reached by the
+    // whole workgroup.
+    [[unroll]] for (uint tl = 0; tl < TOK_MAX; ++tl) {
+        if (tl < n_here) {
+            barrier(); // the previous token is done reading sh_max/sh_sum
+            sh_max[lid] = lmax[tl];
+            sh_sum[lid] = lsum[tl];
+            barrier();
+            [[unroll]] for (uint s = WG / 2u; s > 0u; s >>= 1) {
+                if (lid < s) {
+                    const float m1 = sh_max[lid];
+                    const float s1 = sh_sum[lid];
+                    const float m2 = sh_max[lid + s];
+                    const float s2 = sh_sum[lid + s];
+                    const float m = max(m1, m2);
+                    const float sum = s1 * exp(m1 - m) + s2 * exp(m2 - m);
+                    sh_max[lid] = m;
+                    sh_sum[lid] = sum;
+                }
+                barrier();
+            }
+            if (lid == 0) {
+                sh_lse[tl] = sh_max[0] + log(sh_sum[0]);
+            }
+        }
+    }
+    barrier();
+
+    // Pass 2: acc[tl] = sum_v softmax(z[v,tl]) * w[:,v], tiled over the
+    // vocabulary and accumulated pair by pair.
+    const uint n_pairs = p.n_embd / 2;
+    const uint npt     = (n_pairs + WG - 1u) / WG; // pairs owned by this invocation
+
+    vec2 acc[ACC_PAIRS];
+    [[unroll]] for (uint a = 0; a < ACC_PAIRS; ++a) {
+        acc[a] = vec2(0.0f);
+    }
+
+    for (uint tile = 0; tile < p.n_vocab; tile += WG) {
+        const uint v = tile + lid;
+        float zc[TOK_MAX];
+        if (v < p.n_vocab) {
+            column_dots(v, n_here, zc);
+        } else {
+            [[unroll]] for (uint tl = 0; tl < TOK_MAX; ++tl) {
+                zc[tl] = 0.0f;
+            }
+        }
+        // The whole slice is already in registers; publish it VSUB columns at a
+        // time so the staging buffer stays small.
+        for (uint sub = 0; sub < WG; sub += VSUB) {
+            barrier(); // the previous sub-slice is consumed
+            if (lid >= sub && lid < sub + VSUB) {
+                [[unroll]] for (uint tl = 0; tl < TOK_MAX; ++tl) {
+                    if (tl < n_here) {
+                        sh_p[tl * VSUB + (lid - sub)] = (v < p.n_vocab && act[tl])
+                                ? exp(zc[tl] - sh_lse[tl]) : 0.0f;
+                    }
+                }
+            }
+            barrier();
+
+            const uint base = tile + sub;
+            const uint sub_n = (base < p.n_vocab) ? min(uint(VSUB), p.n_vocab - base) : 0u;
+            for (uint j = 0; j < sub_n; ++j) {
+                uint k = 0;
+                for (uint pidx = lid; pidx < n_pairs; pidx += WG, ++k) {
+                    const vec2 dq = w_pair(base + j, pidx);
+                    [[unroll]] for (uint tl = 0; tl < TOK_MAX; ++tl) {
+                        if (tl < n_here) {
+                            acc[tl * npt + k] += sh_p[tl * VSUB + j] * dq;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    const float g = data_grad[0];
+    [[unroll]] for (uint tl = 0; tl < TOK_MAX; ++tl) {
+        if (tl < n_here && act[tl]) {
+            const uint d_off = (g_t_base + tl) * p.d_stride;
+            uint k = 0;
+            for (uint pidx = lid; pidx < n_pairs; pidx += WG, ++k) {
+                const uvec2 e = pair_positions(pidx);
+                // Accumulated in a register and written once: data_dst is a
+                // writeonly binding, so a zero-then-add pass over it is not
+                // available - and would be a second traversal of grad_h anyway.
+                vec2 val = vec2(0.0f);
+                for (uint j = 0; j < n_topk; ++j) {
+                    const int   tgt = data_tgt[(g_t_base + tl) * n_topk + j];
+                    const float wgt = data_wgt[(g_t_base + tl) * n_topk + j];
+                    if (!(tgt >= 0 && uint(tgt) < p.n_vocab && wgt != 0.0f)) {
+                        continue;
+                    }
+                    const float coef = g * wgt / float(n_active);
+                    val += coef * (acc[tl * npt + k] - w_pair(uint(tgt), pidx));
+                }
+                data_dst[d_off + e.x] = val.x;
+                data_dst[d_off + e.y] = val.y;
+            }
+        }
+    }
+}
