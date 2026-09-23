@@ -79,6 +79,7 @@ int ggml_metal_op_mul_mat           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_mul_mat_id        (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_add_id            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_flash_attn_ext    (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_flash_attn_back   (ggml_metal_op_t ctx, int idx); // retro delta
 int ggml_metal_op_bin               (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_silu_back         (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_l2_norm           (ggml_metal_op_t ctx, int idx);
