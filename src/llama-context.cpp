@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -3545,6 +3546,152 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     }
 }
 
+int32_t llama_context::opt_preflight(llama_opt_preflight_cb callback, void * userdata) {
+    GGML_ASSERT(opt_ctx);
+    const uint32_t n_ctx    = llama_model_n_ctx_train(&model);
+    const uint32_t n_batch  = std::min(this->n_batch(),  n_ctx);
+
+    memory->clear(true);
+
+    llama_batch batch = llama_batch_init(n_batch, 0, 1);
+    batch.n_tokens = n_batch;
+    for (uint32_t i = 0; i < n_batch; ++i) {
+        batch.token   [i]    = 0;
+        batch.pos     [i]    = i;
+        batch.n_seq_id[i]    = 1;
+        batch.seq_id  [i][0] = 0;
+        batch.logits  [i]    = true;
+    }
+
+    int32_t n_missing = -1;
+
+    do {
+        {
+            llama_batch_compat compat(this, batch);
+            if (!balloc->init(*compat.batch_ext, model.vocab, true)) {
+                LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
+                break;
+            }
+        }
+
+        auto mctx = memory->init_batch(*balloc, cparams.n_ubatch, true);
+        if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
+            LLAMA_LOG_ERROR("%s: could not initialize batch\n", __func__);
+            break;
+        }
+
+        const uint32_t n_tokens_all = balloc->get_n_tokens();
+        if (output_reserve(n_tokens_all) < n_tokens_all) {
+            LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_tokens_all);
+            break;
+        }
+
+        // the first ubatch is representative: every training ubatch has the
+        // same shape, so it produces the same graph structure
+        const auto & ubatch = mctx->get_ubatch();
+        n_outputs = ubatch.n_tokens;
+        if (!mctx->apply()) {
+            LLAMA_LOG_ERROR("%s: failed to update the memory context\n", __func__);
+            break;
+        }
+
+        auto * res = get_gf_res_prev();
+        const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
+        res->reset();
+        auto * gf = model.build_graph(gparams);
+        if (!gf) {
+            LLAMA_LOG_ERROR("%s: failed to build the forward graph\n", __func__);
+            break;
+        }
+
+        std::vector<ggml_backend_dev_t> devs;
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (!dev) {
+                continue;
+            }
+            const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+            if (type == GGML_BACKEND_DEVICE_TYPE_CPU ||
+                type == GGML_BACKEND_DEVICE_TYPE_GPU ||
+                type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                devs.push_back(dev);
+            }
+        }
+
+        for (ggml_backend_dev_t dev : devs) {
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                const ggml_tensor * node = ggml_graph_node(gf, i);
+                if (node->op == GGML_OP_NONE) {
+                    continue;
+                }
+                if (!ggml_backend_dev_supports_op(dev, node)) {
+                    callback(LLAMA_OPT_PREFLIGHT_DEVICE_FORWARD, dev, node, userdata);
+                }
+            }
+        }
+
+        std::vector<ggml_tensor *> missing(ggml_graph_n_nodes(gf));
+        n_missing = ggml_graph_missing_backward_ops(gf, res->get_logits(), missing.data(), (int) missing.size());
+        for (int i = 0; i < n_missing && i < (int) missing.size(); ++i) {
+            callback(LLAMA_OPT_PREFLIGHT_MISSING_GRAD, nullptr, missing[i], userdata);
+        }
+
+        if (n_missing != 0) {
+            // ggml_build_backward_expand would abort, skip the backward build
+            break;
+        }
+
+        struct ggml_context * ctx_compute_opt;
+        {
+            const size_t size_gf = ggml_graph_size(gf);
+            const size_t size_meta = 4*size_gf*ggml_tensor_overhead() + 2*ggml_graph_overhead_custom(size_gf, /*grads = */ true);
+            struct ggml_init_params params = {
+                /*.mem_size   =*/ size_meta,
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            ctx_compute_opt = ggml_init(params);
+        }
+        ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
+        ggml_opt_alloc(opt_ctx, /*backward =*/ true);
+
+        // ggml_opt_build appended the loss chain to gf, so every node in gf
+        // counts as forward; the remaining graph nodes are backward/optimizer
+        std::set<const ggml_tensor *> forward_nodes;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            forward_nodes.insert(ggml_graph_node(gf, i));
+        }
+        ggml_cgraph * gb = ggml_opt_graph(opt_ctx);
+        for (ggml_backend_dev_t dev : devs) {
+            for (int i = 0; i < ggml_graph_n_nodes(gb); ++i) {
+                const ggml_tensor * node = ggml_graph_node(gb, i);
+                if (node->op == GGML_OP_NONE || forward_nodes.count(node) > 0) {
+                    continue;
+                }
+                if (!ggml_backend_dev_supports_op(dev, node)) {
+                    callback(LLAMA_OPT_PREFLIGHT_DEVICE_BACKWARD, dev, node, userdata);
+                }
+            }
+        }
+
+        ggml_opt_cancel(opt_ctx);
+        ggml_free(ctx_compute_opt);
+    } while (false);
+
+    // same invalidation as opt_epoch_iter: a later llama_decode must never
+    // satisfy can_reuse() against the preflight graph
+    for (auto & res : gf_res_prev) {
+        if (res) {
+            res->reset();
+        }
+    }
+    gf_res_prev_active = nullptr;
+    memory->clear(true);
+    llama_batch_free(batch);
+
+    return n_missing;
+}
+
 void llama_context::opt_epoch_iter(
         ggml_opt_dataset_t               dataset,
         ggml_opt_result_t                result,
@@ -4437,6 +4584,14 @@ bool llama_opt_param_filter_all(const struct ggml_tensor * tensor, void * userda
 
 void llama_opt_init(struct llama_context * ctx, struct llama_model * model, struct llama_opt_params lopt_params) {
     ctx->opt_init(model, lopt_params);
+}
+
+// retro delta: training-graph preflight (see llama.h).
+int32_t llama_opt_preflight(
+        struct llama_context   * ctx,
+        llama_opt_preflight_cb   callback,
+        void                   * userdata) {
+    return ctx->opt_preflight(callback, userdata);
 }
 
 void llama_opt_epoch(

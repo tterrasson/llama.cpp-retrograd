@@ -7523,6 +7523,196 @@ void ggml_build_backward_expand(
     free(grads_needed);
 }
 
+// retro delta: sources whose gradients have no effect on output gradients,
+// mirrors the ignore_src rules of ggml_build_backward_expand.
+static void ggml_backward_ignored_srcs(const struct ggml_tensor * node, bool ignore_src[GGML_MAX_SRC]) {
+    memset(ignore_src, 0, GGML_MAX_SRC*sizeof(bool));
+    switch (node->op) {
+        case GGML_OP_IM2COL:
+        case GGML_OP_IM2COL_BACK:
+            ignore_src[0] = true;
+            break;
+        case GGML_OP_UNARY: {
+            const enum ggml_unary_op uop = ggml_get_unary_op(node);
+            if (uop == GGML_UNARY_OP_SGN || uop == GGML_UNARY_OP_STEP) {
+                ignore_src[0] = true;
+            }
+        } break;
+        case GGML_OP_CPY:
+        case GGML_OP_GET_ROWS:
+        case GGML_OP_GET_ROWS_BACK:
+        case GGML_OP_ROPE:
+            ignore_src[1] = true;
+            break;
+        case GGML_OP_SET_ROWS:
+            ignore_src[1] = true;
+            ignore_src[2] = true;
+            break;
+        default:
+            break;
+    }
+}
+
+// retro delta: whether ggml_compute_backward has a gradient rule for this node.
+// Must be kept in sync with the switch in ggml_compute_backward.
+static bool ggml_backward_op_implemented(const struct ggml_tensor * node) {
+    switch (node->op) {
+        case GGML_OP_NONE:
+        case GGML_OP_DUP:
+        case GGML_OP_ADD:
+        case GGML_OP_ADD1:
+        case GGML_OP_ACC:
+        case GGML_OP_SUB:
+        case GGML_OP_MUL:
+        case GGML_OP_DIV:
+        case GGML_OP_SQR:
+        case GGML_OP_SQRT:
+        case GGML_OP_LOG:
+        case GGML_OP_SIN:
+        case GGML_OP_COS:
+        case GGML_OP_SUM:
+        case GGML_OP_SUM_ROWS:
+        case GGML_OP_MEAN:
+        case GGML_OP_REPEAT:
+        case GGML_OP_REPEAT_BACK:
+        case GGML_OP_RMS_NORM:
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_SCALE:
+        case GGML_OP_SET:
+        case GGML_OP_CPY:
+        case GGML_OP_CONT:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_VIEW:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
+        case GGML_OP_GET_ROWS:
+        case GGML_OP_SET_ROWS:
+        case GGML_OP_DIAG_MASK_INF:
+        case GGML_OP_DIAG_MASK_ZERO:
+        case GGML_OP_SOFT_MAX:
+        case GGML_OP_ROPE:
+        case GGML_OP_IM2COL:
+        case GGML_OP_POOL_2D:
+        case GGML_OP_CONCAT:
+        case GGML_OP_SSM_CONV:
+        case GGML_OP_SSM_SCAN:
+        case GGML_OP_CROSS_ENTROPY_LOSS:
+            return true;
+        case GGML_OP_UNARY:
+            switch (ggml_get_unary_op(node)) {
+                case GGML_UNARY_OP_ABS:
+                case GGML_UNARY_OP_SGN:
+                case GGML_UNARY_OP_NEG:
+                case GGML_UNARY_OP_STEP:
+                case GGML_UNARY_OP_TANH:
+                case GGML_UNARY_OP_RELU:
+                case GGML_UNARY_OP_GELU:
+                case GGML_UNARY_OP_SILU:
+                case GGML_UNARY_OP_EXP:
+                case GGML_UNARY_OP_EXPM1:
+                case GGML_UNARY_OP_SOFTPLUS:
+                    return true;
+                default:
+                    return false;
+            }
+        case GGML_OP_GLU:
+            switch (ggml_get_glu_op(node)) {
+                case GGML_GLU_OP_SWIGLU:
+                case GGML_GLU_OP_GEGLU:
+                    // backward pass only implemented for the split variants
+                    return node->src[1] != NULL;
+                default:
+                    return false;
+            }
+        default:
+            return false;
+    }
+}
+
+int ggml_graph_missing_backward_ops(
+        struct ggml_cgraph  *  cgraph,
+        struct ggml_tensor  *  root,
+        struct ggml_tensor  ** out_nodes,
+        int                    n_out_max) {
+    GGML_ASSERT(cgraph->n_nodes > 0);
+
+    struct ggml_hash_set * hash_set = &cgraph->visited_hash_set;
+    bool * grads_needed  = calloc(hash_set->size, sizeof(bool));
+    bool * receives_grad = calloc(hash_set->size, sizeof(bool));
+
+    // forward scan: same propagation as ggml_build_backward_expand
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        struct ggml_tensor * node = cgraph->nodes[i];
+
+        if (node->type == GGML_TYPE_I32) {
+            continue;
+        }
+
+        bool node_needs_grad = (node->flags & GGML_TENSOR_FLAG_PARAM) || (node->flags & GGML_TENSOR_FLAG_LOSS);
+        bool ignore_src[GGML_MAX_SRC];
+        ggml_backward_ignored_srcs(node, ignore_src);
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (!node->src[j] || ignore_src[j]) {
+                continue;
+            }
+            const size_t isrc = ggml_hash_find(hash_set, node->src[j]);
+            if (isrc != GGML_HASHSET_FULL && ggml_bitset_get(hash_set->used, isrc) && grads_needed[isrc]) {
+                node_needs_grad = true;
+                break;
+            }
+        }
+        if (!node_needs_grad) {
+            continue;
+        }
+        grads_needed[ggml_hash_find(hash_set, node)] = true;
+    }
+
+    // backward scan: a node only enters ggml_compute_backward with a gradient
+    // when a consumer on the path from `root` propagates one to it
+    if (root) {
+        const size_t iroot = ggml_hash_find(hash_set, root);
+        if (iroot != GGML_HASHSET_FULL && ggml_bitset_get(hash_set->used, iroot)) {
+            receives_grad[iroot] = true;
+        }
+    }
+
+    int n_missing = 0;
+    for (int i = cgraph->n_nodes - 1; i >= 0; --i) {
+        struct ggml_tensor * node = cgraph->nodes[i];
+        const size_t inode = ggml_hash_find(hash_set, node);
+
+        if ((node->flags & GGML_TENSOR_FLAG_LOSS) && grads_needed[inode]) {
+            receives_grad[inode] = true;
+        }
+        if (!receives_grad[inode]) {
+            continue;
+        }
+        if (!ggml_backward_op_implemented(node)) {
+            if (out_nodes && n_missing < n_out_max) {
+                out_nodes[n_missing] = node;
+            }
+            ++n_missing;
+            continue;
+        }
+
+        bool ignore_src[GGML_MAX_SRC];
+        ggml_backward_ignored_srcs(node, ignore_src);
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (!node->src[j] || ignore_src[j]) {
+                continue;
+            }
+            const size_t isrc = ggml_hash_find(hash_set, node->src[j]);
+            if (isrc != GGML_HASHSET_FULL && ggml_bitset_get(hash_set->used, isrc) && grads_needed[isrc]) {
+                receives_grad[isrc] = true;
+            }
+        }
+    }
+
+    free(grads_needed);
+    free(receives_grad);
+    return n_missing;
+}
+
 static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     void * ptr = *p;
     ptr = (void *) GGML_PAD((uintptr_t) ptr, align);
