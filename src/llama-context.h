@@ -200,6 +200,8 @@ struct llama_context {
 
     void opt_init(struct llama_model * model, struct llama_opt_params lopt_params);
 
+    llama_opt_timing opt_timing_get() const { return opt_timing; }
+
     // TODO: more flexible combinations of logical/physical batch size and context size
     // retro delta: label_weights optionally scales each label position's loss
     // contribution (dataset layout, nullable = all ones).
@@ -221,6 +223,7 @@ struct llama_context {
             const std::vector<llama_token> & tokens,
             const std::vector<llama_token> & labels_sparse,
             const float                    * label_weights, // per label position, nullable
+            uint32_t                         n_evals,       // retro delta: physical ubatches to run, 0 = full row
             llama_batch                    & batch,
             ggml_opt_epoch_callback          callback,
             bool                             train,
@@ -374,6 +377,7 @@ private:
 
     void * opt_label_storage = nullptr;
     std::vector<size_t> opt_active_label_offsets;
+    llama_opt_timing opt_timing = {};
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;

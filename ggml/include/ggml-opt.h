@@ -83,6 +83,9 @@ extern "C" {
 
     // parameters that control which optimizer is used and how said optimizer tries to find the minimal loss
     struct ggml_opt_optimizer_params {
+        // Maximum global L2 norm across all parameter gradients. Gradients are
+        // scaled together before the optimizer step when this is exceeded.
+        float max_grad_norm;
         struct {
             float alpha; // learning rate
             float beta1; // first AdamW momentum
