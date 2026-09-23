@@ -70,7 +70,13 @@ void main() {
     for (uint i = tid; i < p.KX; i += BLOCK_SIZE) {
         loss += (FLOAT_TYPE(data_a[off + i]) - max_logit - log_sum) * FLOAT_TYPE(data_b[off + i]);
     }
-    loss = -wg_reduce_sum(loss) / FLOAT_TYPE(p.KY);
+    // retro delta: divide by the count of active rows rather than by every row.
+    // A padded row of a packed sequence carries all-zero labels, so it adds
+    // nothing to the numerator; leaving it in the divisor would shrink the loss.
+    // nactive is precomputed on the host and passed in param1; with param1 == KY
+    // this is upstream's mean, and param1 == 0 means every row was ignored.
+    loss = -wg_reduce_sum(loss);
+    loss = p.param1 > 0.0f ? loss / FLOAT_TYPE(p.param1) : FLOAT_TYPE(0.0f);
 
     if (tid == 0) {
         data_d[row] = D_TYPE(loss);

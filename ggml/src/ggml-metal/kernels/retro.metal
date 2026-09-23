@@ -1,5 +1,41 @@
 #include "common.h"
 #include "dequantize.h" // retro delta: quantized training kernels
+// retro delta: repeat backward. dst is the smaller tensor; every element sums
+// the src0 elements that ggml_repeat would have copied onto it, i.e. src0 is
+// walked with a stride of the dst extent along each broadcast axis.
+// Emitted by the autodiff of ADD/MUL/REPEAT when one input is broadcast.
+//
+// The nesting order is the CPU op's (outermost axis first, ascending), so the
+// F32 reassociation matches the reference instead of merely being close to it.
+kernel void kernel_repeat_back_f32(
+        constant ggml_metal_kargs_repeat & args,
+        device const char * src0,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int i3 = tgpig.z;
+    const int i2 = tgpig.y;
+    const int i1 = tgpig.x;
+
+    device char * dst_ptr = dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1;
+
+    for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
+        float acc = 0.0f;
+        for (int k3 = i3; k3 < args.ne03; k3 += args.ne3) {
+            for (int k2 = i2; k2 < args.ne02; k2 += args.ne2) {
+                for (int k1 = i1; k1 < args.ne01; k1 += args.ne1) {
+                    for (int k0 = i0; k0 < args.ne00; k0 += args.ne0) {
+                        acc += *((device const float *)(src0 + k3*args.nb03 + k2*args.nb02 + k1*args.nb01 + k0*args.nb00));
+                    }
+                }
+            }
+        }
+        *((device float *)(dst_ptr + i0*args.nb0)) = acc;
+    }
+}
+
+
 // retro delta: streaming Flash Attention backward, ported line for line from the
 // Vulkan shaders (flash_attn_back_{q,kv}.comp) and mirroring the CUDA kernels
 // (flash-attn-back.cu). This is what makes an F16 KV cache differentiable
@@ -982,6 +1018,333 @@ kernel void kernel_cross_entropy_loss_back_f32(
         d[i00] = active ? (label_mass * sm - s1[i00]) * d_by_nr : 0.0f;
     }
 }
+
+// retro delta: fused sparse cross-entropy over a (possibly quantized)
+// projection head, forward and backward. Ported from the Vulkan shaders
+// (fused_sparse_ce{,_back}.comp), which is the right lineage for Metal: the
+// head is read *in the kernel* through the per-type dequantizers, so no F32
+// scratch copy of it is ever allocated -- unlike the CUDA path, which
+// dequantizes into a tiled buffer. See the CPU oracle
+// ggml_compute_forward_fused_sparse_ce_f32.
+//
+// One threadgroup per token. The [n_vocab, n_tokens] logits are never
+// materialized: each logit z[v,t] = dot(w[:,v], h[:,t]) (+ bias[v]) is
+// recomputed on the fly, and the log-sum-exp is accumulated online in F32.
+//
+// `nl` is the number of 16-element chunks per block of the head's type -- the
+// same convention as kernel_mul_mm, so `dequantize_func(blk, il, reg)` hands
+// back the 16 consecutive logical elements starting at 16*chunk.
+//
+// n_active (the divisor both the loss and the gradient use) is counted inside
+// the threadgroup rather than by a separate dispatch into a scratch buffer as
+// on Vulkan: it is O(n_tokens) next to O(n_vocab * n_embd) of real work, and it
+// keeps this op free of any allocation the graph allocator does not already
+// own -- the property that makes Metal's memory accounting exact (UNIFY.md 4).
+
+#define FSCE_NTH 256
+// Chunks of 16 embedding elements one thread may own in the backward's
+// accumulator. FSCE_NTH*16*FSCE_MAXC = 16384 is the n_embd ceiling that
+// supports_op enforces.
+#define FSCE_MAXC 4
+
+// z[v,t] = dot(w[:,v], h[:,t]), F32 throughout so a low-precision head never
+// biases the gradient.
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread float4x4 &)>
+static float fsce_w_dot_h(
+        device const char  * w,
+        device const float * h_col,
+        uint64_t nb_w,
+        int      v,
+        int      n_chunks) {
+    device const char * w_row = w + (size_t) v*nb_w;
+    float z = 0.0f;
+    for (int c = 0; c < n_chunks; ++c) {
+        float4x4 reg;
+        dequantize_func((device const block_q *) w_row + c/nl, (short) (c%nl), reg);
+        device const float4 * hc = (device const float4 *)(h_col + c*16);
+        z += dot(reg[0], hc[0]) + dot(reg[1], hc[1]) + dot(reg[2], hc[2]) + dot(reg[3], hc[3]);
+    }
+    return z;
+}
+
+// Active tokens: a real target with a non-zero coefficient. Same predicate as
+// the CPU reference, evaluated on device because the targets only exist there.
+// retro delta: a position is active when any of its n_topk
+// entries names a real vocabulary row with a non-zero coefficient, and counts
+// once however many of them do.
+static bool fsce_position_active(
+        device const int   * targets,
+        device const float * weights,
+        int t, int n_topk, int n_vocab) {
+    for (int j = 0; j < n_topk; ++j) {
+        const int tgt = targets[t*n_topk + j];
+        if (tgt >= 0 && tgt < n_vocab && weights[t*n_topk + j] != 0.0f) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int fsce_count_active(
+        device const int   * targets,
+        device const float * weights,
+        int n_tokens,
+        int n_topk,
+        int n_vocab,
+        threadgroup float * sh,
+        ushort tpitg, ushort sgitg, ushort tiisg, ushort ntg) {
+    float local = 0.0f;
+    for (int i = tpitg; i < n_tokens; i += ntg) {
+        if (fsce_position_active(targets, weights, i, n_topk, n_vocab)) {
+            local += 1.0f;
+        }
+    }
+    return (int) retro_tg_sum(local, sh, sgitg, tiisg, ntg);
+}
+
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread float4x4 &)>
+kernel void kernel_fused_sparse_ce(
+        constant ggml_metal_kargs_fused_sparse_ce & args,
+        device const char   * h,
+        device const char   * w,
+        device const int    * targets,
+        device const float  * weights,
+        device const float  * bias,
+        device atomic_float * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3 ntg[[threads_per_threadgroup]]) {
+    threadgroup float sh[32];
+
+    const int t = tgpig.x;
+
+    // Uniform across the threadgroup (it depends on the token only), so the
+    // reductions below can never be reached by some threads and not others.
+    const int n_topk = max(args.n_topk, 1);
+    const int n_active = fsce_count_active(
+            targets, weights, args.n_tokens, n_topk, args.n_vocab, sh, tpitg.x, sgitg, tiisg, ntg.x);
+
+    if (!fsce_position_active(targets, weights, t, n_topk, args.n_vocab) || n_active == 0) {
+        return;
+    }
+
+    device const float * h_col = (device const float *)(h + (size_t) t*args.nb_h);
+    const int n_chunks = args.n_embd/16;
+
+    float lmax = -INFINITY;
+    float lsum = 0.0f;
+    for (int v = tpitg.x; v < args.n_vocab; v += ntg.x) {
+        float z = fsce_w_dot_h<block_q, nl, dequantize_func>(w, h_col, args.nb_w, v, n_chunks);
+        if (args.has_bias) {
+            z += bias[v];
+        }
+        if (z > lmax) {
+            lsum = lsum*exp(lmax - z) + 1.0f;
+            lmax = z;
+        } else {
+            lsum += exp(z - lmax);
+        }
+    }
+
+    // Merge the partial online log-sum-exps: rescale every thread's sum to the
+    // threadgroup max, then add. A thread that was handed no vocabulary row
+    // contributes lsum = 0, and exp(-inf - max) = 0, so it stays neutral.
+    const float lmax_all = retro_tg_max(lmax, sh, sgitg, tiisg, ntg.x);
+    const float lsum_all = retro_tg_sum(lsum*exp(lmax - lmax_all), sh, sgitg, tiisg, ntg.x);
+    const float lse = lmax_all + log(lsum_all);
+
+    // retro delta: the k target logits are recomputed here
+    // rather than captured in the sweep above - k dot products next to n_vocab
+    // of them - and the whole contribution is reduced in one sum. The K = 1
+    // term is then the previous wgt*(lse - ztgt) bit for bit, since summing a
+    // single non-zero over zeros is exact.
+    float contrib = 0.0f;
+    for (int j = tpitg.x; j < n_topk; j += ntg.x) {
+        const int   tgt = targets[t*n_topk + j];
+        const float wgt = weights[t*n_topk + j];
+        if (!(tgt >= 0 && tgt < args.n_vocab && wgt != 0.0f)) {
+            continue;
+        }
+        float z = fsce_w_dot_h<block_q, nl, dequantize_func>(w, h_col, args.nb_w, tgt, n_chunks);
+        if (args.has_bias) {
+            z += bias[tgt];
+        }
+        contrib += wgt*(lse - z);
+    }
+    const float contrib_all = retro_tg_sum(contrib, sh, sgitg, tiisg, ntg.x);
+
+    if (tpitg.x == 0) {
+        atomic_fetch_add_explicit(dst, contrib_all/(float) n_active, memory_order_relaxed);
+    }
+}
+
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread float4x4 &)>
+kernel void kernel_fused_sparse_ce_back(
+        constant ggml_metal_kargs_fused_sparse_ce & args,
+        device const float * grad,
+        device const char  * h,
+        device const char  * w,
+        device const int   * targets,
+        device const float * weights,
+        device const float * bias,
+        device       char  * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3 ntg[[threads_per_threadgroup]]) {
+    threadgroup float sh[32];
+    threadgroup float sh_p[FSCE_NTH];
+
+    const int t = tgpig.x;
+    const int n_chunks = args.n_embd/16;
+
+    const int n_topk = max(args.n_topk, 1);
+    const int n_active = fsce_count_active(
+            targets, weights, args.n_tokens, n_topk, args.n_vocab, sh, tpitg.x, sgitg, tiisg, ntg.x);
+
+    device float * dst_col = (device float *)(dst + (size_t) t*args.nb_d);
+
+    if (!fsce_position_active(targets, weights, t, n_topk, args.n_vocab) || n_active == 0) {
+        for (int e = tpitg.x; e < args.n_embd; e += ntg.x) {
+            dst_col[e] = 0.0f;
+        }
+        return;
+    }
+
+    device const float * h_col = (device const float *)(h + (size_t) t*args.nb_h);
+
+    // Pass 1: the token's log-sum-exp, recomputed exactly as the forward did
+    // rather than stored -- this op checkpoints the logits, it never keeps them.
+    float lmax = -INFINITY;
+    float lsum = 0.0f;
+    for (int v = tpitg.x; v < args.n_vocab; v += ntg.x) {
+        float z = fsce_w_dot_h<block_q, nl, dequantize_func>(w, h_col, args.nb_w, v, n_chunks);
+        if (args.has_bias) {
+            z += bias[v];
+        }
+        if (z > lmax) {
+            lsum = lsum*exp(lmax - z) + 1.0f;
+            lmax = z;
+        } else {
+            lsum += exp(z - lmax);
+        }
+    }
+    const float lmax_all = retro_tg_max(lmax, sh, sgitg, tiisg, ntg.x);
+    const float lsum_all = retro_tg_sum(lsum*exp(lmax - lmax_all), sh, sgitg, tiisg, ntg.x);
+    const float lse = lmax_all + log(lsum_all);
+
+    // Pass 2: acc[e] = sum_v softmax(z[v]) * w[e,v], streamed in threadgroup-sized
+    // vocabulary tiles. Each tile's softmax weights are produced one thread per
+    // vocabulary row, then consumed one thread per 16-element chunk of the
+    // embedding, so every accumulation stays in registers and no atomic or
+    // shared-memory accumulator is needed.
+    //
+    // The consumption half only has n_embd/16 threads to give work to, so it
+    // runs at partial occupancy below n_embd = 4096. Deliberate: it keeps the
+    // decode count identical to pass 1 (one dequantize call per 16 values),
+    // which is what dominates. Splitting the tile across the idle threads would
+    // need a second accumulator per thread and a reduction over it.
+    float4x4 acc[FSCE_MAXC];
+    for (short k = 0; k < FSCE_MAXC; ++k) {
+        acc[k] = float4x4(0.0f);
+    }
+
+    for (int tile = 0; tile < args.n_vocab; tile += ntg.x) {
+        const int v = tile + tpitg.x;
+        float p = 0.0f;
+        if (v < args.n_vocab) {
+            float z = fsce_w_dot_h<block_q, nl, dequantize_func>(w, h_col, args.nb_w, v, n_chunks);
+            if (args.has_bias) {
+                z += bias[v];
+            }
+            p = exp(z - lse);
+        }
+        sh_p[tpitg.x] = p;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const int tile_n = min((int) ntg.x, args.n_vocab - tile);
+        short k = 0;
+        for (int c = tpitg.x; c < n_chunks; c += ntg.x, ++k) {
+            float4x4 a(0.0f);
+            for (int j = 0; j < tile_n; ++j) {
+                float4x4 reg;
+                dequantize_func(
+                        (device const block_q *)(w + (size_t)(tile + j)*args.nb_w) + c/nl,
+                        (short) (c%nl), reg);
+                a += sh_p[j]*reg;
+            }
+            acc[k] += a;
+        }
+        // Also orders the last read of `h` above before the writes below, which
+        // matters because the graph allocator may have placed dst on top of h
+        // (the fused CE's offload_h option).
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // retro delta: grad_h = sum_j coef_j*(acc - w[:,tgt_j]).
+    // Written as a sum of the previous per-target expression, not as
+    // (sum_j coef_j)*acc - sum_j coef_j*w_j, so a K = 1 position reproduces the
+    // one-hot gradient element for element.
+    {
+        short k = 0;
+        for (int c = tpitg.x; c < n_chunks; c += ntg.x, ++k) {
+            device float4 * d = (device float4 *)(dst_col + c*16);
+            for (short r = 0; r < 4; ++r) {
+                d[r] = 0.0f;
+            }
+        }
+    }
+    for (int j = 0; j < n_topk; ++j) {
+        const int   tgt = targets[t*n_topk + j];
+        const float wgt = weights[t*n_topk + j];
+        if (!(tgt >= 0 && tgt < args.n_vocab && wgt != 0.0f)) {
+            continue;
+        }
+        const float coef = grad[0]*wgt/(float) n_active;
+        short k = 0;
+        for (int c = tpitg.x; c < n_chunks; c += ntg.x, ++k) {
+            float4x4 wt;
+            dequantize_func(
+                    (device const block_q *)(w + (size_t) tgt*args.nb_w) + c/nl, (short) (c%nl), wt);
+            device float4 * d = (device float4 *)(dst_col + c*16);
+            for (short r = 0; r < 4; ++r) {
+                d[r] += coef*(acc[k][r] - wt[r]);
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_fused_sparse_ce<float4x4, 1, dequantize_f32>) fused_sparse_ce_t;
+typedef decltype(kernel_fused_sparse_ce_back<float4x4, 1, dequantize_f32>) fused_sparse_ce_back_t;
+
+template [[host_name("kernel_fused_sparse_ce_f32")]]  kernel fused_sparse_ce_t kernel_fused_sparse_ce<float4x4,   1,     dequantize_f32>;
+template [[host_name("kernel_fused_sparse_ce_f16")]]  kernel fused_sparse_ce_t kernel_fused_sparse_ce<half4x4,    1,     dequantize_f16>;
+template [[host_name("kernel_fused_sparse_ce_q4_0")]] kernel fused_sparse_ce_t kernel_fused_sparse_ce<block_q4_0, 2,     dequantize_q4_0>;
+template [[host_name("kernel_fused_sparse_ce_q4_1")]] kernel fused_sparse_ce_t kernel_fused_sparse_ce<block_q4_1, 2,     dequantize_q4_1>;
+template [[host_name("kernel_fused_sparse_ce_q5_0")]] kernel fused_sparse_ce_t kernel_fused_sparse_ce<block_q5_0, 2,     dequantize_q5_0>;
+template [[host_name("kernel_fused_sparse_ce_q5_1")]] kernel fused_sparse_ce_t kernel_fused_sparse_ce<block_q5_1, 2,     dequantize_q5_1>;
+template [[host_name("kernel_fused_sparse_ce_q8_0")]] kernel fused_sparse_ce_t kernel_fused_sparse_ce<block_q8_0, 2,     dequantize_q8_0>;
+template [[host_name("kernel_fused_sparse_ce_q2_K")]] kernel fused_sparse_ce_t kernel_fused_sparse_ce<block_q2_K, QK_NL, dequantize_q2_K>;
+template [[host_name("kernel_fused_sparse_ce_q3_K")]] kernel fused_sparse_ce_t kernel_fused_sparse_ce<block_q3_K, QK_NL, dequantize_q3_K>;
+template [[host_name("kernel_fused_sparse_ce_q4_K")]] kernel fused_sparse_ce_t kernel_fused_sparse_ce<block_q4_K, QK_NL, dequantize_q4_K>;
+template [[host_name("kernel_fused_sparse_ce_q5_K")]] kernel fused_sparse_ce_t kernel_fused_sparse_ce<block_q5_K, QK_NL, dequantize_q5_K>;
+template [[host_name("kernel_fused_sparse_ce_q6_K")]] kernel fused_sparse_ce_t kernel_fused_sparse_ce<block_q6_K, QK_NL, dequantize_q6_K>;
+
+template [[host_name("kernel_fused_sparse_ce_back_f32")]]  kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<float4x4,   1,     dequantize_f32>;
+template [[host_name("kernel_fused_sparse_ce_back_f16")]]  kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<half4x4,    1,     dequantize_f16>;
+template [[host_name("kernel_fused_sparse_ce_back_q4_0")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<block_q4_0, 2,     dequantize_q4_0>;
+template [[host_name("kernel_fused_sparse_ce_back_q4_1")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<block_q4_1, 2,     dequantize_q4_1>;
+template [[host_name("kernel_fused_sparse_ce_back_q5_0")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<block_q5_0, 2,     dequantize_q5_0>;
+template [[host_name("kernel_fused_sparse_ce_back_q5_1")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<block_q5_1, 2,     dequantize_q5_1>;
+template [[host_name("kernel_fused_sparse_ce_back_q8_0")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<block_q8_0, 2,     dequantize_q8_0>;
+template [[host_name("kernel_fused_sparse_ce_back_q2_K")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<block_q2_K, QK_NL, dequantize_q2_K>;
+template [[host_name("kernel_fused_sparse_ce_back_q3_K")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<block_q3_K, QK_NL, dequantize_q3_K>;
+template [[host_name("kernel_fused_sparse_ce_back_q4_K")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<block_q4_K, QK_NL, dequantize_q4_K>;
+template [[host_name("kernel_fused_sparse_ce_back_q5_K")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<block_q5_K, QK_NL, dequantize_q5_K>;
+template [[host_name("kernel_fused_sparse_ce_back_q6_K")]] kernel fused_sparse_ce_back_t kernel_fused_sparse_ce_back<block_q6_K, QK_NL, dequantize_q6_K>;
 
 // retro delta: get-rows backward for LoRA training.
 // src0 = grad rows [ne00, nr], src1 = I32 row indices [nr]; dst [ne00, n_vocab]

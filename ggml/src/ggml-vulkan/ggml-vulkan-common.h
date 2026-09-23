@@ -65,6 +65,7 @@ void ggml_vk_buffer_copy_n_async(vk_context& subctx, const vk_buffer_copy_region
 void ggml_vk_buffer_write_n(const vk_buffer_region * regions, size_t n);
 void ggml_vk_buffer_read_n(const vk_buffer_region * regions, size_t n);
 void ggml_vk_buffer_copy_n(const vk_buffer_copy_region * regions, size_t n);
+void ggml_vk_buffer_fill_cmd(vk_context& ctx, vk_buffer& dst, size_t offset, uint32_t c, size_t size);
 void ggml_vk_buffer_memset_async(vk_context& ctx, vk_buffer& dst, size_t offset, uint32_t c, size_t size);
 void ggml_vk_buffer_memset(vk_buffer& dst, size_t offset, uint32_t c, size_t size);
 vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t size);
