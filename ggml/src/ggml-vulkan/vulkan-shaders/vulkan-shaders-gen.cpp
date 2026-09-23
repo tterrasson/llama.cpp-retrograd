@@ -271,6 +271,15 @@ const std::vector<std::string> & retro_dequant_type_names() {
     return names;
 }
 
+const std::vector<std::string> & retro_out_prod_type_names() {
+    static const std::vector<std::string> names = {
+#define GGML_RETRO_VKNAME(TYPE, BLK, NL, NAME, VKNAME) #VKNAME,
+        GGML_RETRO_OUT_PROD_TYPES(GGML_RETRO_VKNAME)
+#undef GGML_RETRO_VKNAME
+    };
+    return names;
+}
+
 static const char path_separator = '/';
 
 std::string join_paths(const std::string& path1, const std::string& path2) {
@@ -1288,15 +1297,15 @@ void process_shaders() {
     // need no IQ shared-memory table.
     string_to_spv("fused_sparse_ce_count", "fused_sparse_ce_count.comp", {});
 
-    // retro delta: the training ops that read a frozen tensor in place. Both
-    // families come from GGML_RETRO_DEQUANT_TYPES so they cannot drift apart --
-    // out_prod used to be generated for every quant type in the file (including
-    // ones no backend gate accepted) while fused_sparse_ce had its own shorter
-    // hand-written list. F32 needs no decoding and is handled separately below.
+    // The CE head keeps the conservative cross-backend table; OUT_PROD has a
+    // CPU/CUDA/Vulkan extension for every format those three decoders share.
     for (const auto & tname : retro_dequant_type_names()) {
         const std::map<std::string, std::string> d = {{"DATA_A_" + to_uppercase(tname), "1"}};
         string_to_spv("fused_sparse_ce_" + tname,      "fused_sparse_ce.comp",      d);
         string_to_spv("fused_sparse_ce_back_" + tname, "fused_sparse_ce_back.comp", d);
+    }
+    for (const auto & tname : retro_out_prod_type_names()) {
+        const std::map<std::string, std::string> d = {{"DATA_A_" + to_uppercase(tname), "1"}};
         // out_prod_quant.comp reaches dequant_funcs.glsl, which needs FLOAT_TYPE
         // from base_dict; fused_sparse_ce.comp defines its own.
         string_to_spv("out_prod_" + tname + "_f32",    "out_prod_quant.comp",

@@ -5219,7 +5219,8 @@ static bool ggml_cuda_can_decode_frozen(const ggml_tensor * t) {
     if (t->type != GGML_TYPE_F16 && !ggml_is_quantized(t->type)) {
         return false;
     }
-    return t->ne[0] % ggml_blck_size(t->type) == 0;
+    return ggml_get_to_fp32_cuda(t->type) != nullptr &&
+           t->ne[0] % ggml_blck_size(t->type) == 0;
 }
 
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
