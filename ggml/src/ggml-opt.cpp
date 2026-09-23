@@ -623,18 +623,22 @@ struct ggml_tensor * ggml_opt_loss(ggml_opt_context_t opt_ctx) {
 }
 
 void ggml_opt_set_loss_active_rows(ggml_opt_context_t opt_ctx, int32_t n_active_rows) {
-    opt_ctx->loss->op_params[0] = n_active_rows;
-    opt_ctx->loss->op_params[1] = 1;
-    for (int i = 0; i < opt_ctx->gb_grad->n_nodes; ++i) {
-        ggml_tensor * node = opt_ctx->gb_grad->nodes[i];
-        if (node->op == GGML_OP_CROSS_ENTROPY_LOSS || node->op == GGML_OP_CROSS_ENTROPY_LOSS_BACK) {
-            node->op_params[0] = n_active_rows;
-            node->op_params[1] = 1;
-        }
+    // Only stamp actual cross-entropy nodes. With opt_period > 1 the loss
+    // tensor is a SCALE node whose op_params[0] holds the (float) scale
+    // factor; overwriting it would corrupt both the reported loss and the
+    // gradient seed. The graph loops below reach the underlying CE nodes.
+    if (opt_ctx->loss->op == GGML_OP_CROSS_ENTROPY_LOSS) {
+        opt_ctx->loss->op_params[0] = n_active_rows;
+        opt_ctx->loss->op_params[1] = 1;
     }
-    if (opt_ctx->gb_opt) {
-        for (int i = 0; i < opt_ctx->gb_opt->n_nodes; ++i) {
-            ggml_tensor * node = opt_ctx->gb_opt->nodes[i];
+    // Depending on the build/eval mode only a subset of the graphs exists.
+    ggml_cgraph * graphs[3] = { opt_ctx->gf, opt_ctx->gb_grad, opt_ctx->gb_opt };
+    for (ggml_cgraph * graph : graphs) {
+        if (!graph) {
+            continue;
+        }
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            ggml_tensor * node = graph->nodes[i];
             if (node->op == GGML_OP_CROSS_ENTROPY_LOSS || node->op == GGML_OP_CROSS_ENTROPY_LOSS_BACK) {
                 node->op_params[0] = n_active_rows;
                 node->op_params[1] = 1;
