@@ -204,6 +204,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cross_ent
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cross_entropy_loss_back(ggml_metal_library_t lib, const struct ggml_tensor * op); // retro delta
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_get_rows_back     (ggml_metal_library_t lib, const struct ggml_tensor * op); // retro delta
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_retro_fill        (ggml_metal_library_t lib); // retro delta: flat F32 fill helper
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_retro_sum         (ggml_metal_library_t lib); // retro delta: fixed-order F32 sum helper
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_memset            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_count_equal       (ggml_metal_library_t lib, const struct ggml_tensor * op);
 
