@@ -1,0 +1,239 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+// retro delta: head-dim elements owned by each invocation, one variant per
+// bucket (4 -> head dim <= 128, 8 -> <= 256, 16 -> <= 512, 18 would be <= 576).
+// Only registers scale with the head dimension here, so wide-head models cost a
+// deeper accumulator and nothing else; narrow models keep the shallow variant. Mirrors the CUDA
+// bucket dispatch in ggml-cuda/flash-attn-back.cu.
+#ifndef FA_BACK_SLOTS
+#define FA_BACK_SLOTS 4
+#endif
+
+// retro delta: KV cache element type. Both F16 and F32 are built, and F32 is not
+// optional: `cap_flash_attn_back` is probed with an F32 cache
+// (retro_backend.cpp) and clearing that gate is the precondition for the F16
+// probe -- and therefore for `kv_dtype = "f16"` -- ever running. Mirrors the CUDA
+// and Metal ports.
+#ifdef KV_F32
+#define KV_TYPE float
+#else
+#define KV_TYPE float16_t
+#endif
+
+layout(push_constant) uniform parameter {
+    uint N; uint KV; uint HSK; uint HSV;
+    uint n_head; uint n_head_kv; uint n_batch;
+    uint q_nb1; uint q_nb2; uint q_nb3;
+    uint off_q; uint off_k; uint off_v; uint off_stats;
+    float scale; float max_bias; float logit_softcap;
+    uint mask_ne1; uint mask_ne2; uint mask_ne3;
+    uint flags;
+    uint KV_GRAD; uint kv_stride; uint kv_stream0;
+} p;
+
+layout(binding = 0) readonly buffer Q      { float     q[]; };
+layout(binding = 1) readonly buffer K      { KV_TYPE   k[]; };
+layout(binding = 2) readonly buffer V      { KV_TYPE   v[]; };
+layout(binding = 3) readonly buffer Mask   { float16_t mask[]; };
+layout(binding = 4) readonly buffer Out    { float     out_data[]; };
+layout(binding = 5) readonly buffer DOut   { float     dout[]; };
+layout(binding = 6) readonly buffer Sinks  { float     sinks[]; };
+layout(binding = 7) buffer Grad            { float     grad[]; };
+layout(binding = 8) readonly buffer KvIdxs { int       kv_idxs[]; };
+
+// Bits 2..4 carry ggml_flash_attn_back_grad shifted left by 2.
+const uint FLAG_MASK   = 1u;
+const uint FLAG_SINKS  = 2u;
+const uint FLAG_GRAD_Q = 4u;
+// retro delta: set to fold the row log-sum-exp into the sweep that
+// accumulates dQ -- the accumulators are rescaled by exp(m_old - m_new) as the
+// maximum moves and divided by the final sum once. Same algebra as the two
+// sweeps below, half the Q.K work, a different summation order; hence opt-in
+// (GGML_VK_FA_BACK_FUSED_LSE=1) while the two-sweep form stays the default. A
+// push constant, so a before/after needs no rebuild.
+const uint FLAG_FUSED_LSE = 64u;
+
+float alibi_slope(uint head) {
+    if (p.max_bias <= 0.0f) {
+        return 1.0f;
+    }
+    uint n = 1u << uint(floor(log2(float(p.n_head))));
+    float base = head < n
+        ? pow(2.0f, -p.max_bias / float(n))
+        : pow(2.0f, -p.max_bias / (2.0f * float(n)));
+    int exponent = head < n ? int(head + 1u) : int(2u * (head - n) + 1u);
+    return pow(base, float(exponent));
+}
+
+float mask_value(uint key, uint row, uint head, uint batch) {
+    if ((p.flags & FLAG_MASK) == 0u) {
+        return 0.0f;
+    }
+    uint mh = head % p.mask_ne2;
+    uint mb = batch % p.mask_ne3;
+    uint index = key + p.KV * (row + p.mask_ne1 * (mh + p.mask_ne2 * mb));
+    return float(mask[index]);
+}
+
+float score_from_dot(float dot, uint key, uint row, uint head, uint batch) {
+    float score = p.logit_softcap != 0.0f
+        ? p.logit_softcap * tanh(dot * p.scale / p.logit_softcap)
+        : dot * p.scale;
+    return score + alibi_slope(head) * mask_value(key, row, head, batch);
+}
+
+float score_derivative(float dot) {
+    if (p.logit_softcap == 0.0f) {
+        return p.scale;
+    }
+    float t = tanh(dot * p.scale / p.logit_softcap);
+    return p.scale * (1.0f - t * t);
+}
+
+void main() {
+    const uint lid   = gl_LocalInvocationID.x;
+    const uint row   = gl_WorkGroupID.x;
+    const uint head  = gl_WorkGroupID.y;
+    const uint batch = gl_WorkGroupID.z;
+    if (row >= p.N || head >= p.n_head || batch >= p.n_batch) {
+        return;
+    }
+
+    const uint kv_head = head / (p.n_head / p.n_head_kv);
+    const uint q_base = batch * p.q_nb3 + head * p.q_nb2 + row * p.q_nb1;
+    const uint k_head_base = (batch * p.n_head_kv + kv_head) * p.KV * p.HSK;
+    const uint v_head_base = (batch * p.n_head_kv + kv_head) * p.KV * p.HSV;
+    const uint out_base = ((batch * p.N + row) * p.n_head + head) * p.HSV;
+    const uint stat_index = (batch * p.n_head + head) * p.N + row;
+
+    float delta_part = 0.0f;
+    for (uint id = lid; id < p.HSV; id += 32u) {
+        delta_part += dout[out_base + id] * out_data[out_base + id];
+    }
+    float delta = subgroupAdd(delta_part);
+
+    const bool grad_q = (p.flags & FLAG_GRAD_Q) != 0u;
+    const bool fused = grad_q && (p.flags & FLAG_FUSED_LSE) != 0u;
+
+    float dq[FA_BACK_SLOTS];
+    for (uint slot = 0u; slot < FA_BACK_SLOTS; ++slot) {
+        dq[slot] = 0.0f;
+    }
+
+    float row_max = -3.402823466e+38f;
+    float row_sum = 0.0f;
+    if (fused) {
+        // One sweep: the log-sum-exp and dQ share the Q.K dot product, and the
+        // accumulators carry the running maximum instead of a final one.
+        for (uint key = 0u; key < p.KV; ++key) {
+            float qk_part = 0.0f;
+            for (uint id = lid; id < p.HSK; id += 32u) {
+                qk_part += q[q_base + id] * float(k[k_head_base + key * p.HSK + id]);
+            }
+            float dot_qk = subgroupAdd(qk_part);
+            float score = score_from_dot(dot_qk, key, row, head, batch);
+            float new_max = max(row_max, score);
+            float rescale = exp(row_max - new_max);
+            row_sum = row_sum * rescale + exp(score - new_max);
+            row_max = new_max;
+
+            float dv_part = 0.0f;
+            for (uint id = lid; id < p.HSV; id += 32u) {
+                dv_part += dout[out_base + id] * float(v[v_head_base + key * p.HSV + id]);
+            }
+            float dot_dv = subgroupAdd(dv_part);
+            float ds = exp(score - new_max) * (dot_dv - delta) * score_derivative(dot_qk);
+            for (uint slot = 0u; slot < FA_BACK_SLOTS; ++slot) {
+                uint id = lid + 32u * slot;
+                if (id < p.HSK) {
+                    dq[slot] = dq[slot] * rescale + ds * float(k[k_head_base + key * p.HSK + id]);
+                }
+            }
+        }
+    } else {
+        for (uint key = 0u; key < p.KV; ++key) {
+            float part = 0.0f;
+            for (uint id = lid; id < p.HSK; id += 32u) {
+                part += q[q_base + id] * float(k[k_head_base + key * p.HSK + id]);
+            }
+            float dot = subgroupAdd(part);
+            float score = score_from_dot(dot, key, row, head, batch);
+            float new_max = max(row_max, score);
+            row_sum = row_sum * exp(row_max - new_max) + exp(score - new_max);
+            row_max = new_max;
+        }
+    }
+    if ((p.flags & FLAG_SINKS) != 0u) {
+        float score = sinks[head];
+        float new_max = max(row_max, score);
+        float rescale = exp(row_max - new_max);
+        row_sum = row_sum * rescale + exp(score - new_max);
+        row_max = new_max;
+        // The sink can move the maximum too, and it contributes to the
+        // denominator without contributing to dQ.
+        for (uint slot = 0u; slot < FA_BACK_SLOTS; ++slot) {
+            dq[slot] *= rescale;
+        }
+    }
+
+    float lse = row_max + log(row_sum);
+    if (lid == 0u) {
+        grad[p.off_stats + stat_index] = lse;
+        grad[p.off_stats + p.N * p.n_head * p.n_batch + stat_index] = delta;
+    }
+
+    // The dK/dV pass consumes the statistics written above, so they are produced
+    // unconditionally; the dQ accumulation below is the expensive part and is
+    // skipped when the packed result has no dQ segment. The branch is uniform
+    // across the workgroup (push constant), so the subgroup reductions inside
+    // the loop stay well formed.
+    if (!grad_q) {
+        return;
+    }
+
+    if (fused) {
+        // Finish the online normalization: dq holds sum_key exp(score - row_max)
+        // (...) k, so one division by the final sum is the whole difference from
+        // exp(score - lse). A fully masked row has no contribution to normalize.
+        float inv_sum = row_sum > 0.0f ? 1.0f / row_sum : 0.0f;
+        for (uint slot = 0u; slot < FA_BACK_SLOTS; ++slot) {
+            dq[slot] *= inv_sum;
+        }
+    }
+    // The two-sweep form only: its second pass over the cache.
+    for (uint key = 0u; !fused && key < p.KV; ++key) {
+        float qk_part = 0.0f;
+        for (uint id = lid; id < p.HSK; id += 32u) {
+            qk_part += q[q_base + id] * float(k[k_head_base + key * p.HSK + id]);
+        }
+        float dot_qk = subgroupAdd(qk_part);
+
+        float dv_part = 0.0f;
+        for (uint id = lid; id < p.HSV; id += 32u) {
+            dv_part += dout[out_base + id] * float(v[v_head_base + key * p.HSV + id]);
+        }
+        float dot_dv = subgroupAdd(dv_part);
+        float probability = exp(score_from_dot(dot_qk, key, row, head, batch) - lse);
+        float ds = probability * (dot_dv - delta) * score_derivative(dot_qk);
+        for (uint slot = 0u; slot < FA_BACK_SLOTS; ++slot) {
+            uint id = lid + 32u * slot;
+            if (id < p.HSK) {
+                dq[slot] += ds * float(k[k_head_base + key * p.HSK + id]);
+            }
+        }
+    }
+
+    for (uint slot = 0u; slot < FA_BACK_SLOTS; ++slot) {
+        uint id = lid + 32u * slot;
+        if (id < p.HSK) {
+            uint gq = p.off_q + (((batch * p.n_head + head) * p.N + row) * p.HSK + id);
+            grad[gq] = dq[slot];
+        }
+    }
+}
