@@ -1,4 +1,5 @@
 #include "common.h"
+#include "dequantize.h" // retro delta: quantized training kernels
 
 // retro delta: RMS-norm backward for LoRA training.
 // src0 = dz (grad of output), src1 = x (forward input), same shape. Per row:
@@ -64,40 +65,220 @@ kernel void kernel_rms_norm_back_f32(
 }
 
 // retro delta: out-prod (weight-gradient GEMM) for LoRA training.
-// dst[i0,i1,i2,i3] = sum_k src0[i0,k,i02,i03] * src1[i1,k,i2,i3]
-// with GQA broadcast i02 = i2/dps2, i03 = i3/dps3. Correctness-first: one thread
+// dst[i0,i1,i2,i3] = Σ_k src0[i0,k,i02,i03] * src1[i1,k,i2,i3]
+// with GQA broadcast i02 = i2/dps2, i03 = i3/dps3.
+//
+// Tiled GEMM over the contraction axis ne01, ported from the Vulkan out_prod
 // shader. One dst element per thread with the reduction advanced one k at a
-kernel void kernel_out_prod_f32(
+// time would pay two threadgroup barriers per k, loaded 16 of 64 threads'
+// worth of operands per step, and yielded a single fused multiply-add per pair
+// of threadgroup reads, in a threadgroup of 64 threads -- two SIMD groups,
+// under the occupancy Apple silicon needs.
+//
+// The tiling fixes all of it: one barrier pair per BK-slice instead of per k
+// (BK times fewer), every one of the 256 threads participating in both
+// cooperative loads, and OUT_PROD_TM dst rows per thread so each src1 value
+// read from threadgroup memory feeds TM FMAs rather than one.
+//
+// BM is 64 while BN stays 16 on purpose: dst is ne00 x n_tokens, tall and thin
+// in the training regime (ne1 is the token count, and n_ubatch is small), so a
+// square tile would spend most of itself on columns that do not exist.
+//
+// The accumulation order is deliberately unchanged -- k ascends within a slice
+// and the slices ascend -- so every dst element sums the same terms in the same
+// sequence, with the same operations, as a scalar kernel would: bit-exact
+// against it by construction. The probes in tests/metal_ops.rs consequently pass
+// at their original tolerances against the CPU oracle; widening one would mean
+// the arithmetic had changed.
+#define OUT_PROD_BM  64
+#define OUT_PROD_BN  16
+#define OUT_PROD_BK  16
+#define OUT_PROD_TM   4
+#define OUT_PROD_NTH 256
+
+// The only part that differs per src0 type: filling one BK x BM slice of src0
+// into threadgroup memory, laid out [kk][mm]. F32 reads a float, the legacy
+// quants decode one element at a time, the K-quants decode 16 at a time and so
+// run one thread per 16-value chunk. Out-of-range lanes store zero rather than
+// skipping, so the inner product below needs no per-element predicate.
+//
+// `s01/s02/s03` are element strides for the F32 variant and byte strides for
+// the quantized ones (see ggml_metal_kargs_out_prod); each loader owns that
+// convention, which is why the base pointer is computed here and not by the
+// caller.
+struct out_prod_tile_f32 {
+    static void load(
+            threadgroup float * tile0,
+            device const char * src0,
+            constant ggml_metal_kargs_out_prod & args,
+            int64_t i02, int64_t i03, int64_t m0, int64_t k0, ushort tiitg) {
+        device const float * base0 = (device const float *) src0 + i02*args.s02 + i03*args.s03;
+        for (ushort l = tiitg; l < OUT_PROD_BK*OUT_PROD_BM; l += OUT_PROD_NTH) {
+            const int64_t m = m0 + (l % OUT_PROD_BM);
+            const int64_t k = k0 + (l / OUT_PROD_BM);
+            tile0[l] = (m < args.ne0 && k < args.ne01) ? base0[m + k*args.s01] : 0.0f;
+        }
+    }
+};
+
+// Q8_0: 32 signed 8-bit values per block, one shared scale.
+struct out_prod_tile_q8_0 {
+    static void load(
+            threadgroup float * tile0,
+            device const char * src0,
+            constant ggml_metal_kargs_out_prod & args,
+            int64_t i02, int64_t i03, int64_t m0, int64_t k0, ushort tiitg) {
+        device const char * base0 = src0 + i02*args.s02 + i03*args.s03;
+        for (ushort l = tiitg; l < OUT_PROD_BK*OUT_PROD_BM; l += OUT_PROD_NTH) {
+            const int64_t m = m0 + (l % OUT_PROD_BM);
+            const int64_t k = k0 + (l / OUT_PROD_BM);
+            float v = 0.0f;
+            if (m < args.ne0 && k < args.ne01) {
+                device const block_q8_0 * blk =
+                    (device const block_q8_0 *)(base0 + k*args.s01) + m/QK8_0;
+                v = (float) blk->d * blk->qs[m % QK8_0];
+            }
+            tile0[l] = v;
+        }
+    }
+};
+
+// Q5_0: 32 five-bit values per block -- low nibbles in qs, fifth bits in qh,
+// zero point -16.
+struct out_prod_tile_q5_0 {
+    static void load(
+            threadgroup float * tile0,
+            device const char * src0,
+            constant ggml_metal_kargs_out_prod & args,
+            int64_t i02, int64_t i03, int64_t m0, int64_t k0, ushort tiitg) {
+        device const char * base0 = src0 + i02*args.s02 + i03*args.s03;
+        for (ushort l = tiitg; l < OUT_PROD_BK*OUT_PROD_BM; l += OUT_PROD_NTH) {
+            const int64_t m = m0 + (l % OUT_PROD_BM);
+            const int64_t k = k0 + (l / OUT_PROD_BM);
+            float v = 0.0f;
+            if (m < args.ne0 && k < args.ne01) {
+                device const block_q5_0 * blk =
+                    (device const block_q5_0 *)(base0 + k*args.s01) + m/QK5_0;
+                const short iq  = m % QK5_0;
+                const short il  = iq & 15;
+                const uint  qh  = *((device const uint *) blk->qh);
+                const int   low = iq < 16 ? (blk->qs[il] & 0x0f) : (blk->qs[il] >> 4);
+                const int   q   = low | (int) (((qh >> iq) & 1u) << 4);
+                v = (float) blk->d * (float) (q - 16);
+            }
+            tile0[l] = v;
+        }
+    }
+};
+
+// K-quants: the block decoders hand back 16 adjacent values at once, so one
+// thread owns one 16-value chunk of the tile row rather than one element. BM is
+// a multiple of 16 and the host asserts ne0 is too, so a chunk never straddles
+// the end of the tensor and never crosses a QK_K block.
+template<typename block_q, void (*dequantize_func)(device const block_q *, short, thread float4x4 &)>
+struct out_prod_tile_k {
+    static void load(
+            threadgroup float * tile0,
+            device const char * src0,
+            constant ggml_metal_kargs_out_prod & args,
+            int64_t i02, int64_t i03, int64_t m0, int64_t k0, ushort tiitg) {
+        constexpr ushort n_chunks = OUT_PROD_BM / 16;
+        device const char * base0 = src0 + i02*args.s02 + i03*args.s03;
+        for (ushort l = tiitg; l < OUT_PROD_BK*n_chunks; l += OUT_PROD_NTH) {
+            const ushort kk = l / n_chunks;
+            const ushort cc = l % n_chunks;
+            const int64_t m = m0 + cc*16;
+            const int64_t k = k0 + kk;
+            float4x4 values(0.0f);
+            if (m < args.ne0 && k < args.ne01) {
+                dequantize_func(
+                        (device const block_q *)(base0 + k*args.s01) + m/QK_K,
+                        (short) ((m % QK_K) / 16), values);
+            }
+            threadgroup float * out = tile0 + kk*OUT_PROD_BM + cc*16;
+            for (ushort j = 0; j < 16; ++j) {
+                out[j] = values[j/4][j%4];
+            }
+        }
+    }
+};
+
+template<typename loader>
+kernel void kernel_out_prod_impl(
         constant ggml_metal_kargs_out_prod & args,
-        device const float * src0,
+        device const char  * src0,
         device const float * src1,
         device       float * dst,
-        uint gid[[thread_position_in_grid]]) {
-    const int64_t total = args.ne0 * args.ne1 * args.ne2 * args.ne3;
-    if ((int64_t) gid >= total) {
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]]) {
+    threadgroup float tile0[OUT_PROD_BK*OUT_PROD_BM];
+    threadgroup float tile1[OUT_PROD_BK*OUT_PROD_BN];
+
+    // tn varies fastest, so neighbouring threads read consecutive tile1 entries
+    // and their TM tile0 reads collapse onto few distinct addresses.
+    const ushort tn = tiitg % OUT_PROD_BN;
+    const ushort tm = tiitg / OUT_PROD_BN;
+
+    const int64_t m0 = (int64_t) tgpig.x * OUT_PROD_BM;
+    const int64_t n0 = (int64_t) tgpig.y * OUT_PROD_BN;
+    const int64_t i2 = (int64_t) tgpig.z % args.ne2;
+    const int64_t i3 = (int64_t) tgpig.z / args.ne2;
+    // Uniform across the threadgroup, so this early return cannot strand a
+    // thread at the barriers below -- unlike a per-element bounds test.
+    if (i3 >= args.ne3) {
         return;
     }
 
-    const int64_t i0 = (int64_t) gid % args.ne0;
-    int64_t r        = (int64_t) gid / args.ne0;
-    const int64_t i1 = r % args.ne1;
-    r /= args.ne1;
-    const int64_t i2 = r % args.ne2;
-    const int64_t i3 = r / args.ne2;
-
     const int64_t i02 = i2 / args.dps2;
     const int64_t i03 = i3 / args.dps3;
+    const int64_t off1 = i2*args.s12 + i3*args.s13;
 
-    const int64_t off0 = i0 + i02*args.s02 + i03*args.s03;
-    const int64_t off1 = i1*args.s10 + i2*args.s12 + i3*args.s13;
-
-    float acc = 0.0f;
-    for (int64_t k = 0; k < args.ne01; ++k) {
-        acc += src0[off0 + k*args.s01] * src1[off1 + k*args.s11];
+    float acc[OUT_PROD_TM];
+    for (ushort r = 0; r < OUT_PROD_TM; ++r) {
+        acc[r] = 0.0f;
     }
 
-    dst[i0 + i1*args.s1 + i2*args.s2 + i3*args.s3] = acc;
+    for (int64_t k0 = 0; k0 < args.ne01; k0 += OUT_PROD_BK) {
+        loader::load(tile0, src0, args, i02, i03, m0, k0, tiitg);
+        for (ushort l = tiitg; l < OUT_PROD_BK*OUT_PROD_BN; l += OUT_PROD_NTH) {
+            const int64_t n = n0 + (l % OUT_PROD_BN);
+            const int64_t k = k0 + (l / OUT_PROD_BN);
+            tile1[l] = (n < args.ne1 && k < args.ne01)
+                    ? src1[off1 + n*args.s10 + k*args.s11] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (ushort kk = 0; kk < OUT_PROD_BK; ++kk) {
+            const float bv = tile1[kk*OUT_PROD_BN + tn];
+            for (ushort r = 0; r < OUT_PROD_TM; ++r) {
+                acc[r] += tile0[kk*OUT_PROD_BM + tm*OUT_PROD_TM + r] * bv;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const int64_t n = n0 + tn;
+    if (n >= args.ne1) {
+        return;
+    }
+    for (ushort r = 0; r < OUT_PROD_TM; ++r) {
+        const int64_t m = m0 + tm*OUT_PROD_TM + r;
+        if (m < args.ne0) {
+            dst[m + n*args.s1 + i2*args.s2 + i3*args.s3] = acc[r];
+        }
+    }
 }
+
+typedef decltype(kernel_out_prod_impl<out_prod_tile_f32>) out_prod_t;
+
+template [[host_name("kernel_out_prod_f32")]]  kernel out_prod_t kernel_out_prod_impl<out_prod_tile_f32>;
+template [[host_name("kernel_out_prod_q8_0")]] kernel out_prod_t kernel_out_prod_impl<out_prod_tile_q8_0>;
+template [[host_name("kernel_out_prod_q5_0")]] kernel out_prod_t kernel_out_prod_impl<out_prod_tile_q5_0>;
+
+template [[host_name("kernel_out_prod_q2_K")]] kernel out_prod_t kernel_out_prod_impl<out_prod_tile_k<block_q2_K, dequantize_q2_K>>;
+template [[host_name("kernel_out_prod_q3_K")]] kernel out_prod_t kernel_out_prod_impl<out_prod_tile_k<block_q3_K, dequantize_q3_K>>;
+template [[host_name("kernel_out_prod_q4_K")]] kernel out_prod_t kernel_out_prod_impl<out_prod_tile_k<block_q4_K, dequantize_q4_K>>;
+template [[host_name("kernel_out_prod_q5_K")]] kernel out_prod_t kernel_out_prod_impl<out_prod_tile_k<block_q5_K, dequantize_q5_K>>;
+template [[host_name("kernel_out_prod_q6_K")]] kernel out_prod_t kernel_out_prod_impl<out_prod_tile_k<block_q6_K, dequantize_q6_K>>;
 
 // retro delta: threadgroup-wide sum/max over per-simdgroup partials. Safe for any
 // threadgroup size (including a partial trailing simdgroup): only simdgroup 0
