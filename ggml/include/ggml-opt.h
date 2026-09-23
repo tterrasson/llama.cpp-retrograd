@@ -194,6 +194,17 @@ extern "C" {
     // must be called exactly once prior to calling ggml_opt_eval
     GGML_API void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward);
 
+    // retro delta: the graph selected and allocated by the last ggml_opt_alloc
+    // (forward, grad, or opt depending on the build type), NULL when none is
+    // allocated. Used by the training preflight to inspect the concrete graph
+    // without evaluating it.
+    GGML_API struct ggml_cgraph * ggml_opt_graph(ggml_opt_context_t opt_ctx);
+
+    // retro delta: abandon a graph prepared with ggml_opt_alloc without
+    // evaluating it, so the next ggml_opt_alloc starts from a clean state.
+    // With dynamic graphs the caller frees the compute context afterwards.
+    GGML_API void ggml_opt_cancel(ggml_opt_context_t opt_ctx);
+
     // do forward pass, increment result if not NULL, do backward pass if allocated
     GGML_API void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result);
 
