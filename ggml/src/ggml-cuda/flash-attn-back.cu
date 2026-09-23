@@ -1,17 +1,49 @@
 #include "flash-attn-back.cuh"
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 
-// retro delta: reference (materialized, per-query-row) Flash Attention backward.
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(TURING_MMA_AVAILABLE)
+#include <mma.h>
+namespace wmma = nvcuda::wmma;
+#endif
+
+// retro delta: streaming Flash Attention backward. The query kernel runs one
 // Correctness-first: one thread computes the full gradient for a single query row
-// (batch ib, head ih, query iq), recomputing scores/softmax/O exactly as the fork
-// CPU reference does, then accumulating dQ/dK/dV. dQ rows are unique per thread
-// and written directly; dK/dV are shared across query rows and GQA head groups,
-// so they use atomicAdd into the zero-initialized result. This is not a
+// warp per (batch, head, query), reuses O from the forward pass for
+// D = dot(dO, O), and only recomputes the row LSE before accumulating dQ. The KV
+// kernel runs one warp per (batch, KV head, gradient-window row) and reduces all
+// contributing query rows in a fixed order before writing dK/dV once. This
+// avoids reconstructing the forward output and the contended,
+// non-deterministic atomics a per-query scatter into dK/dV would need.
 // memory-optimal flash kernel; it is validated against the CPU oracle and can be
 // specialized later without changing the probe contract.
+//
+// REGS = ceil(max(hsk,hsv)/32) is a template parameter rather than a single
+// compile-time cap: the warp split means the head dimension only costs 4*REGS
+// registers per lane (qv, dov, o_acc, dq), so wide-head models (Qwen3.5/GDN at
+// head_dim=256, Gemma-4's global-attention layers at 512, MLA at 576) fit fine
+// — but instantiating everything at the widest bucket would make the common
+// head_dim<=128 models pay the extra registers and occupancy for nothing.
+// Dispatch picks the smallest bucket that covers the shape. Note that 4*REGS is
+// the real number: 64 registers of accumulator at the 512 bucket, which costs
+// occupancy but stays far from the 255-register/thread ceiling.
 
-#define FA_BACK_MAX_D 128
+// Head-dimension elements owned by each lane, per bucket. Adding a bucket for a
+// wider head dimension (MLA at 576 would be REGS 18) is a two-line change here
+// plus a matching FA_BACK_MAX_D bump — but do it with a parity test at that
+// head dimension, never on the strength of "it's the same code".
+#define FA_BACK_REGS_SMALL  4   // head dim <= 128 (most dense models)
+#define FA_BACK_REGS_WIDE   8   // head dim <= 256 (Qwen3.5/GDN, Gemma2)
+#define FA_BACK_REGS_XWIDE 16   // head dim <= 512 (Gemma-4 global-attn layers)
+
+// The supports check in ggml-cuda.cu gates on FA_BACK_MAX_D, so the widest
+// bucket must cover exactly that or shapes get accepted and then assert.
+static_assert(FA_BACK_REGS_XWIDE*WARP_SIZE == FA_BACK_MAX_D,
+              "widest kernel bucket must match the advertised head-dim cap");
+static_assert(FA_BACK_MAX_D <= GGML_FLASH_ATTN_BACK_MAX_HEAD_DIM,
+              "advertised head-dim cap exceeds what the probe harness can exercise");
 
 static __device__ __forceinline__ float fab_load(const char * base, int64_t idx,
                                                   int64_t stride0, bool is_f16) {
@@ -21,10 +53,455 @@ static __device__ __forceinline__ float fab_load(const char * base, int64_t idx,
     return *(const float *) (base + idx*stride0);
 }
 
+// Maps a gradient-window row to its row in the KV cache view. `kv_idxs` holds
+// the same global indices the forward ggml_set_rows() used, so the stream plane
+// has to be subtracted back out (see ggml_flash_attn_ext_set_grad_window).
+struct fa_back_window {
+    const int32_t * idxs;   // [nwin, nbatch], stream-major; null when dense
+    int64_t         nwin;   // rows carrying a gradient, per stream
+    int64_t         stride; // KV rows per stream in the underlying cache
+    int64_t         stream0;
+};
+
+static __device__ __forceinline__ int64_t fab_window_key(
+        const fa_back_window & w, int64_t ib, int64_t j) {
+    if (!w.idxs) {
+        return j;
+    }
+    return (int64_t) w.idxs[ib*w.nwin + j] - w.stride*(w.stream0 + ib);
+}
+
+// Tensor-core fast path. One block owns a 16x16 (query x KV) tile. Q and dO are rounded
+// to F16 while being staged next to the native F16 K/V cache; both score
+// products use tensor cores and accumulate in F32. The nonlinear attention
+// algebra and the gradient accumulators remain F32. The scalar kernels below
+// remain the reference/fallback for F32 caches, unusual head shapes, non-NVIDIA
+// devices, and when GGML_CUDA_FA_BACK_MMA=0.
+#define FA_BACK_MMA_TILE 16
+#define FA_BACK_MMA_MAX_D 256
+#define FA_BACK_MMA_THREADS 256
+#define FA_BACK_MMA_OWNED ((FA_BACK_MMA_TILE*FA_BACK_MMA_MAX_D)/FA_BACK_MMA_THREADS)
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(TURING_MMA_AVAILABLE)
+
+static __device__ __forceinline__ void fab_mma_scores(
+        const half * a, const half * b_rows, float * scores, int d) {
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c;
+    wmma::fill_fragment(c, 0.0f);
+    for (int id = 0; id < d; id += 16) {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> af;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> bf;
+        wmma::load_matrix_sync(af, a + id, d);
+        // b_rows is [16, d] row-major, hence B = b_rows^T is column-major.
+        wmma::load_matrix_sync(bf, b_rows + id, d);
+        wmma::mma_sync(c, af, bf, c);
+    }
+    wmma::store_matrix_sync(scores, c, 16, wmma::mem_row_major);
+}
+
+static __device__ __forceinline__ float fab_mma_score(
+        float dot, const half * mask, int64_t key, size_t nbm0,
+        bool has_mask, float scale, float softcap) {
+    float score = softcap != 0.0f ? softcap*tanhf(dot*scale/softcap) : dot*scale;
+    if (has_mask) {
+        score += __half2float(*(const half *) ((const char *) mask + key*nbm0));
+    }
+    return score;
+}
+
+static __device__ __forceinline__ float fab_mma_deriv(float dot, float scale, float softcap) {
+    if (softcap == 0.0f) {
+        return scale;
+    }
+    const float t = tanhf(dot*scale/softcap);
+    return scale*(1.0f - t*t);
+}
+
+template<int>
+static __global__ void flash_attn_back_mma_q_kernel(
+        const char * __restrict__ q, const half * __restrict__ k,
+        const half * __restrict__ v, const char * __restrict__ mask,
+        const char * __restrict__ out, const char * __restrict__ dO,
+        float * __restrict__ dst, const fa_back_mma_args a) {
+    const int64_t d = a.d, nq = a.nq, nkv = a.nkv, nhead = a.nhead, ratio = a.ratio;
+    const size_t nbq0 = a.nbq0, nbq1 = a.nbq1, nbq2 = a.nbq2, nbq3 = a.nbq3;
+    const size_t nbk1 = a.nbk1, nbk2 = a.nbk2, nbk3 = a.nbk3;
+    const size_t nbv1 = a.nbv1, nbv2 = a.nbv2, nbv3 = a.nbv3;
+    const size_t nbm0 = a.nbm0, nbm1 = a.nbm1, nbm3 = a.nbm3;
+    const size_t nbo0 = a.nbo0, nbo1 = a.nbo1, nbo2 = a.nbo2, nbo3 = a.nbo3;
+    const size_t nbd0 = a.nbd0, nbd1 = a.nbd1, nbd2 = a.nbd2, nbd3 = a.nbd3;
+    const size_t off_s = a.off_s;
+    const bool has_mask = a.has_mask, want_dq = a.want_dq;
+    const float scale = a.scale, softcap = a.softcap;
+    const int tid = threadIdx.x;
+    const int64_t q0 = int64_t(blockIdx.x)*FA_BACK_MMA_TILE;
+    const int64_t ih = blockIdx.y;
+    const int64_t ib = blockIdx.z;
+    const int64_t ikh = ih/ratio;
+
+    extern __shared__ char raw[];
+    half * sq = (half *) raw;
+    half * sd = sq + FA_BACK_MMA_TILE*d;
+    half * sk = sd + FA_BACK_MMA_TILE*d;
+    half * sv = sk + FA_BACK_MMA_TILE*d;
+    float * qk = (float *) (sv + FA_BACK_MMA_TILE*d);
+    float * dov = qk + FA_BACK_MMA_TILE*FA_BACK_MMA_TILE;
+    float * row_m = dov + FA_BACK_MMA_TILE*FA_BACK_MMA_TILE;
+    float * row_l = row_m + FA_BACK_MMA_TILE;
+    float * row_delta = row_l + FA_BACK_MMA_TILE;
+    float * row_rescale = row_delta + FA_BACK_MMA_TILE;
+
+    for (int idx = tid; idx < FA_BACK_MMA_TILE*d; idx += blockDim.x) {
+        const int qr = idx/d;
+        const int id = idx - qr*d;
+        const int64_t iq = q0 + qr;
+        if (iq < nq) {
+            const char * qr_ptr = q + iq*nbq1 + ih*nbq2 + ib*nbq3;
+            const char * do_ptr = dO + ih*nbd1 + iq*nbd2 + ib*nbd3;
+            sq[idx] = __float2half(*(const float *) (qr_ptr + id*nbq0));
+            sd[idx] = __float2half(*(const float *) (do_ptr + id*nbd0));
+        } else {
+            sq[idx] = __float2half(0.0f);
+            sd[idx] = __float2half(0.0f);
+        }
+    }
+    if (tid < FA_BACK_MMA_TILE) {
+        const int64_t iq = q0 + tid;
+        float delta = 0.0f;
+        if (iq < nq) {
+            const char * out_row = out + ih*nbo1 + iq*nbo2 + ib*nbo3;
+            const char * do_row = dO + ih*nbd1 + iq*nbd2 + ib*nbd3;
+            for (int id = 0; id < d; ++id) {
+                delta += *(const float *) (out_row + id*nbo0) *
+                         *(const float *) (do_row + id*nbd0);
+            }
+        }
+        row_m[tid] = -INFINITY;
+        row_l[tid] = 0.0f;
+        row_delta[tid] = delta;
+    }
+    __syncthreads();
+
+    // retro delta: the two sweeps of the KV cache below are one
+    // sweep when the log-sum-exp is folded into the pass that accumulates dQ.
+    // Pass 1 existed only to know row_m/row_l before dividing by them; the
+    // online form rescales the dQ accumulators by exp(m_old - m_new) instead and
+    // divides by row_l once, at the end. It removes a full pass of K loads and
+    // one of the three tensor-core sweeps per tile, and it is the *same* algebra
+    // -- what it is not is the same summation order, which is why the scalar
+    // kernel stays the oracle and the parity is a tolerance.
+    //
+    // With want_dq false there is nothing to fold into, so the LSE-only sweep is
+    // still the right shape: the KV kernel needs the statistics either way.
+    const bool two_pass = !a.fused_lse || !want_dq;
+
+    // Pass 1 (two-sweep form): tensor-core Q.K^T and online LSE.
+    for (int64_t kv0 = 0; two_pass && kv0 < nkv; kv0 += FA_BACK_MMA_TILE) {
+        for (int idx = tid; idx < FA_BACK_MMA_TILE*d; idx += blockDim.x) {
+            const int kr = idx/d;
+            const int id = idx - kr*d;
+            const int64_t ik = kv0 + kr;
+            sk[idx] = ik < nkv ? *(const half *) ((const char *) k + ik*nbk1 + ikh*nbk2 + ib*nbk3 + id*sizeof(half))
+                               : __float2half(0.0f);
+        }
+        __syncthreads();
+        if (tid < WARP_SIZE) {
+            fab_mma_scores(sq, sk, qk, (int) d);
+        }
+        __syncthreads();
+        if (tid < FA_BACK_MMA_TILE && q0 + tid < nq) {
+            float m = row_m[tid];
+            float l = row_l[tid];
+            const half * mask_row = has_mask ? (const half *) (mask + (q0 + tid)*nbm1 + ib*nbm3) : nullptr;
+            const int n = (int) min((int64_t) FA_BACK_MMA_TILE, nkv - kv0);
+            for (int kr = 0; kr < n; ++kr) {
+                const float score = fab_mma_score(qk[tid*FA_BACK_MMA_TILE + kr], mask_row,
+                                                  kv0 + kr, nbm0, has_mask, scale, softcap);
+                if (score == -INFINITY) {
+                    continue;
+                }
+                const float mn = fmaxf(m, score);
+                l = l*expf(m - mn) + expf(score - mn);
+                m = mn;
+            }
+            row_m[tid] = m;
+            row_l[tid] = l;
+        }
+        __syncthreads();
+    }
+
+    // does the same: the KV kernel reads this back as exp(score - lse), so the
+    // sentinel has to drive that to zero for *any* score it might see.
+    // -INFINITY would drive it to +inf, i.e. NaN in dK/dV, the moment the two
+    // kernels ever disagreed about which entries are masked.
+#define FAB_MMA_WRITE_STATS()                                                       \
+    if (tid < FA_BACK_MMA_TILE && q0 + tid < nq) {                                  \
+        const int64_t stat = (ib*nhead + ih)*nq + q0 + tid;                         \
+        const int64_t nstats = gridDim.z*nhead*nq;                                  \
+        float * stats = (float *) ((char *) dst + off_s);                           \
+        stats[stat] = row_l[tid] > 0.0f ? row_m[tid] + logf(row_l[tid]) : -INFINITY; \
+        stats[nstats + stat] = row_delta[tid];                                      \
+    }
+
+    if (two_pass) {
+        FAB_MMA_WRITE_STATS();
+        if (!want_dq) {
+            return;
+        }
+    }
+
+    float dq[FA_BACK_MMA_OWNED];
+#pragma unroll
+    for (int i = 0; i < FA_BACK_MMA_OWNED; ++i) { dq[i] = 0.0f; }
+
+    // Pass 2: both tensor-core products, followed by F32 softmax algebra and dQ.
+    for (int64_t kv0 = 0; kv0 < nkv; kv0 += FA_BACK_MMA_TILE) {
+        for (int idx = tid; idx < FA_BACK_MMA_TILE*d; idx += blockDim.x) {
+            const int kr = idx/d;
+            const int id = idx - kr*d;
+            const int64_t ik = kv0 + kr;
+            if (ik < nkv) {
+                sk[idx] = *(const half *) ((const char *) k + ik*nbk1 + ikh*nbk2 + ib*nbk3 + id*sizeof(half));
+                sv[idx] = *(const half *) ((const char *) v + ik*nbv1 + ikh*nbv2 + ib*nbv3 + id*sizeof(half));
+            } else {
+                sk[idx] = __float2half(0.0f);
+                sv[idx] = __float2half(0.0f);
+            }
+        }
+        __syncthreads();
+        if (tid < WARP_SIZE) {
+            fab_mma_scores(sq, sk, qk, (int) d);
+            fab_mma_scores(sd, sv, dov, (int) d);
+        }
+        __syncthreads();
+        const int n = (int) min((int64_t) FA_BACK_MMA_TILE, nkv - kv0);
+        if (!two_pass) {
+            // Fold this tile into the running log-sum-exp and publish what the
+            // accumulators owe it. A row whose maximum has not moved owes 1; a
+            // row that has seen nothing yet owes 1 too, because its dQ is still
+            // zero and exp(-inf - m) would be a NaN rather than a scale.
+            if (tid < FA_BACK_MMA_TILE) {
+                row_rescale[tid] = 1.0f;
+                if (q0 + tid < nq) {
+                    float m = row_m[tid];
+                    float l = row_l[tid];
+                    const half * mask_row = has_mask ? (const half *) (mask + (q0 + tid)*nbm1 + ib*nbm3) : nullptr;
+                    for (int kr = 0; kr < n; ++kr) {
+                        const float score = fab_mma_score(qk[tid*FA_BACK_MMA_TILE + kr], mask_row,
+                                                          kv0 + kr, nbm0, has_mask, scale, softcap);
+                        if (score == -INFINITY) {
+                            continue;
+                        }
+                        const float mn = fmaxf(m, score);
+                        l = l*expf(m - mn) + expf(score - mn);
+                        m = mn;
+                    }
+                    if (m != row_m[tid] && row_m[tid] != -INFINITY) {
+                        row_rescale[tid] = expf(row_m[tid] - m);
+                    }
+                    row_m[tid] = m;
+                    row_l[tid] = l;
+                }
+            }
+            __syncthreads();
+        }
+        const int owned = (FA_BACK_MMA_TILE*(int) d + blockDim.x - 1)/blockDim.x;
+        for (int oi = 0; oi < owned; ++oi) {
+            const int idx = tid + oi*blockDim.x;
+            if (idx >= FA_BACK_MMA_TILE*d) { continue; }
+            const int qr = idx/d;
+            const int id = idx - qr*d;
+            if (q0 + qr >= nq) { continue; }
+            if (two_pass) {
+                if (row_l[qr] <= 0.0f) { continue; }
+            } else {
+                dq[oi] *= row_rescale[qr];
+            }
+            const half * mask_row = has_mask ? (const half *) (mask + (q0 + qr)*nbm1 + ib*nbm3) : nullptr;
+            for (int kr = 0; kr < n; ++kr) {
+                const float dot = qk[qr*FA_BACK_MMA_TILE + kr];
+                const float score = fab_mma_score(dot, mask_row, kv0 + kr, nbm0, has_mask, scale, softcap);
+                if (score == -INFINITY) { continue; }
+                // Two-sweep: p is the final softmax weight. Single sweep: it is
+                // still scaled by the running maximum, and row_l divides once
+                // below.
+                const float p = two_pass ? expf(score - row_m[qr])/row_l[qr]
+                                         : expf(score - row_m[qr]);
+                const float ds0 = p*(dov[qr*FA_BACK_MMA_TILE + kr] - row_delta[qr]) *
+                                  fab_mma_deriv(dot, scale, softcap);
+                dq[oi] += ds0*__half2float(sk[kr*d + id]);
+            }
+        }
+        __syncthreads();
+    }
+    if (!two_pass) {
+        FAB_MMA_WRITE_STATS();
+    }
+    const int owned = (FA_BACK_MMA_TILE*(int) d + blockDim.x - 1)/blockDim.x;
+    for (int oi = 0; oi < owned; ++oi) {
+        const int idx = tid + oi*blockDim.x;
+        if (idx >= FA_BACK_MMA_TILE*d) { continue; }
+        const int qr = idx/d;
+        const int id = idx - qr*d;
+        const int64_t iq = q0 + qr;
+        if (iq < nq) {
+            const float value = two_pass ? dq[oi]
+                : (row_l[qr] > 0.0f ? dq[oi]/row_l[qr] : 0.0f);
+            dst[((ib*nhead + ih)*nq + iq)*d + id] = value;
+        }
+    }
+#undef FAB_MMA_WRITE_STATS
+}
+
+template<int>
+static __global__ void flash_attn_back_mma_kv_kernel(
+        const char * __restrict__ q, const half * __restrict__ k,
+        const half * __restrict__ v, const char * __restrict__ mask,
+        const char * __restrict__ dO, float * __restrict__ dst, const fa_back_mma_args a) {
+    const int64_t d = a.d, nq = a.nq, nkv = a.nkv, nhead = a.nhead, nheadk = a.nheadk, ratio = a.ratio;
+    const size_t nbq0 = a.nbq0, nbq1 = a.nbq1, nbq2 = a.nbq2, nbq3 = a.nbq3;
+    const size_t nbk1 = a.nbk1, nbk2 = a.nbk2, nbk3 = a.nbk3;
+    const size_t nbv1 = a.nbv1, nbv2 = a.nbv2, nbv3 = a.nbv3;
+    const size_t nbm0 = a.nbm0, nbm1 = a.nbm1, nbm3 = a.nbm3;
+    const size_t nbd0 = a.nbd0, nbd1 = a.nbd1, nbd2 = a.nbd2, nbd3 = a.nbd3;
+    const size_t off_k = a.off_k, off_v = a.off_v, off_s = a.off_s;
+    const bool has_mask = a.has_mask, want_dk = a.want_dk, want_dv = a.want_dv;
+    const fa_back_window window = {a.window_idxs, a.window_nwin, a.window_stride, a.window_stream0};
+    const float scale = a.scale, softcap = a.softcap;
+    const int tid = threadIdx.x;
+    const int64_t j0 = int64_t(blockIdx.x)*FA_BACK_MMA_TILE;
+    const int64_t ikh = blockIdx.y;
+    const int64_t ib = blockIdx.z;
+
+    extern __shared__ char raw[];
+    half * sq = (half *) raw;
+    half * sd = sq + FA_BACK_MMA_TILE*d;
+    half * sk = sd + FA_BACK_MMA_TILE*d;
+    half * sv = sk + FA_BACK_MMA_TILE*d;
+    float * qk = (float *) (sv + FA_BACK_MMA_TILE*d);
+    float * dov = qk + FA_BACK_MMA_TILE*FA_BACK_MMA_TILE;
+
+    for (int idx = tid; idx < FA_BACK_MMA_TILE*d; idx += blockDim.x) {
+        const int kr = idx/d;
+        const int id = idx - kr*d;
+        const int64_t j = j0 + kr;
+        const int64_t ik = j < window.nwin ? fab_window_key(window, ib, j) : -1;
+        if (ik >= 0 && ik < nkv) {
+            sk[idx] = *(const half *) ((const char *) k + ik*nbk1 + ikh*nbk2 + ib*nbk3 + id*sizeof(half));
+            sv[idx] = *(const half *) ((const char *) v + ik*nbv1 + ikh*nbv2 + ib*nbv3 + id*sizeof(half));
+        } else {
+            sk[idx] = __float2half(0.0f);
+            sv[idx] = __float2half(0.0f);
+        }
+    }
+    __syncthreads();
+
+    float dk[FA_BACK_MMA_OWNED];
+    float dv[FA_BACK_MMA_OWNED];
+#pragma unroll
+    for (int i = 0; i < FA_BACK_MMA_OWNED; ++i) { dk[i] = 0.0f; dv[i] = 0.0f; }
+
+    const float * stats = (const float *) ((const char *) dst + off_s);
+    const int64_t nstats = gridDim.z*nhead*nq;
+    for (int64_t rhead = 0; rhead < ratio; ++rhead) {
+        const int64_t ih = ikh*ratio + rhead;
+        for (int64_t q0 = 0; q0 < nq; q0 += FA_BACK_MMA_TILE) {
+            for (int idx = tid; idx < FA_BACK_MMA_TILE*d; idx += blockDim.x) {
+                const int qr = idx/d;
+                const int id = idx - qr*d;
+                const int64_t iq = q0 + qr;
+                if (iq < nq) {
+                    const char * qr_ptr = q + iq*nbq1 + ih*nbq2 + ib*nbq3;
+                    const char * do_ptr = dO + ih*nbd1 + iq*nbd2 + ib*nbd3;
+                    sq[idx] = __float2half(*(const float *) (qr_ptr + id*nbq0));
+                    sd[idx] = __float2half(*(const float *) (do_ptr + id*nbd0));
+                } else {
+                    sq[idx] = __float2half(0.0f);
+                    sd[idx] = __float2half(0.0f);
+                }
+            }
+            __syncthreads();
+            if (tid < WARP_SIZE) {
+                fab_mma_scores(sq, sk, qk, (int) d);
+                fab_mma_scores(sd, sv, dov, (int) d);
+            }
+            __syncthreads();
+            const int owned = (FA_BACK_MMA_TILE*(int) d + blockDim.x - 1)/blockDim.x;
+            for (int oi = 0; oi < owned; ++oi) {
+                const int idx = tid + oi*blockDim.x;
+                if (idx >= FA_BACK_MMA_TILE*d) { continue; }
+                const int kr = idx/d;
+                const int id = idx - kr*d;
+                const int64_t j = j0 + kr;
+                if (j >= window.nwin) { continue; }
+                const int64_t ik = fab_window_key(window, ib, j);
+                if (ik < 0 || ik >= nkv) { continue; }
+                for (int qr = 0; qr < FA_BACK_MMA_TILE && q0 + qr < nq; ++qr) {
+                    const int64_t iq = q0 + qr;
+                    const half * mask_row = has_mask ? (const half *) (mask + iq*nbm1 + ib*nbm3) : nullptr;
+                    const float dot = qk[qr*FA_BACK_MMA_TILE + kr];
+                    const float score = fab_mma_score(dot, mask_row, ik, nbm0, has_mask, scale, softcap);
+                    const int64_t stat = (ib*nhead + ih)*nq + iq;
+                    const float p = score == -INFINITY ? 0.0f : expf(score - stats[stat]);
+                    const float ds0 = p*(dov[qr*FA_BACK_MMA_TILE + kr] - stats[nstats + stat]) *
+                                      fab_mma_deriv(dot, scale, softcap);
+                    dk[oi] += ds0*__half2float(sq[qr*d + id]);
+                    dv[oi] += p*__half2float(sd[qr*d + id]);
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    float * dK = (float *) ((char *) dst + off_k);
+    float * dV = (float *) ((char *) dst + off_v);
+    const int owned = (FA_BACK_MMA_TILE*(int) d + blockDim.x - 1)/blockDim.x;
+    for (int oi = 0; oi < owned; ++oi) {
+        const int idx = tid + oi*blockDim.x;
+        if (idx >= FA_BACK_MMA_TILE*d) { continue; }
+        const int kr = idx/d;
+        const int id = idx - kr*d;
+        const int64_t j = j0 + kr;
+        if (j < window.nwin) {
+            const int64_t base = ((ib*nheadk + ikh)*window.nwin + j)*d + id;
+            if (want_dk) { dK[base] = dk[oi]; }
+            if (want_dv) { dV[base] = dv[oi]; }
+        }
+    }
+}
+
+#elif !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
+// Host and pre-Turing compilation passes still need declarations for nvcc's
+// generated launch stubs. These bodies are unreachable because dispatch also
+// checks turing_mma_available().
+template<int>
+static __global__ void flash_attn_back_mma_q_kernel(
+        const char * __restrict__ q, const half * __restrict__ k,
+        const half * __restrict__ v, const char * __restrict__ mask,
+        const char * __restrict__ out, const char * __restrict__ dO,
+        float * __restrict__ dst, const fa_back_mma_args a) {
+    GGML_UNUSED_VARS(q, k, v, mask, out, dO, dst, a);
+    NO_DEVICE_CODE;
+}
+
+template<int>
+static __global__ void flash_attn_back_mma_kv_kernel(
+        const char * __restrict__ q, const half * __restrict__ k,
+        const half * __restrict__ v, const char * __restrict__ mask,
+        const char * __restrict__ dO, float * __restrict__ dst, const fa_back_mma_args a) {
+    GGML_UNUSED_VARS(q, k, v, mask, dO, dst, a);
+    NO_DEVICE_CODE;
+}
+
+#endif // NVIDIA WMMA
+
+template<int REGS>
 static __global__ void flash_attn_back_kernel(
         const char * __restrict__ q, const char * __restrict__ k,
         const char * __restrict__ v, const char * __restrict__ mask,
-        const char * __restrict__ dO, float * __restrict__ dst,
+        const char * __restrict__ out, const char * __restrict__ dO,
+        float * __restrict__ dst,
         const int64_t hsk, const int64_t hsv, const int64_t nq, const int64_t nkv,
         const int64_t nhead, const int64_t nheadk, const int64_t nbatch,
         const int64_t ratio,
@@ -33,9 +510,11 @@ static __global__ void flash_attn_back_kernel(
         const int64_t nbk0, const int64_t nbk1, const int64_t nbk2, const int64_t nbk3,
         const int64_t nbv0, const int64_t nbv1, const int64_t nbv2, const int64_t nbv3,
         const int64_t nbm0, const int64_t nbm1, const int64_t nbm3,
+        const int64_t nbo0, const int64_t nbo1, const int64_t nbo2, const int64_t nbo3,
         const int64_t nbd0, const int64_t nbd1, const int64_t nbd2, const int64_t nbd3,
-        const size_t off_k, const size_t off_v,
+        const size_t off_s,
         const bool kv_f16, const bool has_mask,
+        const bool want_dq,
         const float scale, const float softcap) {
     const int64_t row = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
     const int64_t n_rows = nq*nhead*nbatch;
@@ -48,27 +527,31 @@ static __global__ void flash_attn_back_kernel(
     const int64_t ikh = ih / ratio;
 
     const char * q_row  = q  + iq*nbq1 + ih*nbq2 + ib*nbq3;
+    const char * out_row = active ? out + ih*nbo1 + iq*nbo2 + ib*nbo3 : out;
     const char * dO_row = dO + ih*nbd1 + iq*nbd2 + ib*nbd3;
     const char * mask_row = has_mask ? (mask + iq*nbm1 + ib*nbm3) : nullptr;
 
     // dst packed layout: [ dQ | dK | dV | scalars ], all contiguous F32.
     float * dQ = dst;
-    float * dK = (float *) ((char *) dst + off_k);
-    float * dV = (float *) ((char *) dst + off_v);
+    float * stats = (float *) ((char *) dst + off_s);
     const int64_t qbase = ((ib*nhead + ih)*nq + iq)*hsk;
+    const int64_t stat_index = (ib*nhead + ih)*nq + iq;
+    const int64_t nstats = nbatch*nhead*nq;
 
-    float o_acc[FA_BACK_MAX_D];
-    float dq[FA_BACK_MAX_D];
-    for (int64_t d = 0; d < hsv; ++d) { o_acc[d] = 0.0f; }
+    float dq[MAX_D];
+    for (int r = 0; r < REGS; ++r) {
     for (int64_t d = 0; d < hsk; ++d) { dq[d] = 0.0f; }
 
-    // Pass 1: online softmax over K, accumulating the prob-weighted output O.
+    // Only the row normalization is recomputed. O is already an input of the
+    // backward node, so reconstructing it by streaming V a second time would be
+    // duplicate work. The local LSE pass is the compatibility fallback described
+    // here; it scans K only and preserves the existing graph ABI.
     float m = -INFINITY;
     float l = 0.0f;
     for (int64_t ik = 0; ik < nkv; ++ik) {
         const char * k_row = k + ik*nbk1 + ikh*nbk2 + ib*nbk3;
         float dot = 0.0f;
-        for (int64_t d = 0; d < hsk; ++d) {
+        for (int r = 0; r < REGS; ++r) {
             dot += (*(const float *) (q_row + d*nbq0)) * fab_load(k_row, d, nbk0, kv_f16);
         }
         float score = softcap != 0.0f ? softcap*tanhf(dot*scale/softcap) : dot*scale;
@@ -83,28 +566,40 @@ static __global__ void flash_attn_back_kernel(
         const float p = expf(score - m_new);
         l = l*corr + p;
         const char * v_row = v + ik*nbv1 + ikh*nbv2 + ib*nbv3;
-        for (int64_t d = 0; d < hsv; ++d) {
-            o_acc[d] = o_acc[d]*corr + p*fab_load(v_row, d, nbv0, kv_f16);
         }
         m = m_new;
     }
+    float delta = 0.0f;
+#pragma unroll
+    for (int r = 0; r < REGS; ++r) {
+        const int64_t d = lane + r*WARP_SIZE;
+        if (active && d < hsv) {
+            delta += dov[r] * *(const float *) (out_row + d*nbo0);
+        }
+    }
+    delta = warp_reduce_sum(delta);
+
     if (l <= 0.0f) {
         // Fully masked row: zero gradients for dQ; dK/dV get no contribution. No
-        for (int64_t d = 0; d < hsk; ++d) { dQ[qbase + d] = 0.0f; }
+        if (want_dq) {
+            for (int64_t d = 0; d < hsk; ++d) { dQ[qbase + d] = 0.0f; }
+            }
         return;
+        m = INFINITY;
+        delta = 0.0f;
     }
     const float inv_l = 1.0f/l;
-    float delta = 0.0f;
-    for (int64_t d = 0; d < hsv; ++d) {
-        o_acc[d] *= inv_l; // O[d]
-        delta += (*(const float *) (dO_row + d*nbd0)) * o_acc[d];
+    if (lane == 0 && iq < nq) {
+        stats[stat_index] = m + logf(l);
+        stats[nstats + stat_index] = delta;
     }
 
-    // Pass 2: gradients. prob[ik] = exp(score - m)/l (recomputed).
-    for (int64_t ik = 0; ik < nkv; ++ik) {
-        const char * k_row = k + ik*nbk1 + ikh*nbk2 + ib*nbk3;
+    // prob[ik] = exp(score - m)/l, recomputed rather than stored.
+    // `ds_out` is the softmax-input gradient; the two passes below share it.
+    auto score_grads = [&](int64_t ik, const char * k_row, const char * v_row,
+                           float & prob_out, float & ds_out) -> bool {
         float dot = 0.0f;
-        for (int64_t d = 0; d < hsk; ++d) {
+        for (int r = 0; r < REGS; ++r) {
             dot += (*(const float *) (q_row + d*nbq0)) * fab_load(k_row, d, nbk0, kv_f16);
         }
         float score = softcap != 0.0f ? softcap*tanhf(dot*scale/softcap) : dot*scale;
@@ -112,9 +607,9 @@ static __global__ void flash_attn_back_kernel(
             score += __half2float(*(const half *) (mask_row + ik*nbm0));
         }
         if (score == -INFINITY) {
-            continue;
+            return false;
         }
-        const float prob = expf(score - m)*inv_l;
+        const float p = expf(score - m)*inv_l;
         const char * v_row = v + ik*nbv1 + ikh*nbv2 + ib*nbv3;
         float dot_dv = 0.0f;
         for (int64_t d = 0; d < hsv; ++d) {
@@ -125,21 +620,165 @@ static __global__ void flash_attn_back_kernel(
             const float t = tanhf(dot*scale/softcap);
             deriv *= 1.0f - t*t;
         }
-        const float ds = prob*(dot_dv - delta)*deriv;
-        const int64_t kbase = ((ib*nheadk + ikh)*nkv + ik)*hsk;
-        const int64_t vbase = ((ib*nheadk + ikh)*nkv + ik)*hsv;
-        for (int64_t d = 0; d < hsk; ++d) {
-            const float qd = *(const float *) (q_row + d*nbq0);
-            dq[d] += ds*fab_load(k_row, d, nbk0, kv_f16);
-            atomicAdd(&dK[kbase + d], ds*qd);
+        prob_out = p;
+        ds_out   = p*(dot_dv - delta)*deriv;
+        return true;
+    };
+
+    // Pass 2a: dQ. Every key contributes, so this one still spans the cache --
+    // but it writes a row this warp owns exclusively, with no atomics.
+    if (want_dq) {
+        for (int64_t ik = 0; ik < nkv; ++ik) {
+            const char * k_row = k + ik*nbk1 + ikh*nbk2 + ib*nbk3;
+            const char * v_row = v + ik*nbv1 + ikh*nbv2 + ib*nbv3;
+            float prob;
+            float ds;
+        if (!scode_grads(ik, k_row, v_row, prob, ds)) {
+                continue;
         }
-        for (int64_t d = 0; d < hsv; ++d) {
-            atomicAdd(&dV[vbase + d], prob*(*(const float *) (dO_row + d*nbd0)));
+#pragma unroll
+            for (int r = 0; r < REGS; ++r) {
+                const int64_t d = lane + r*WARP_SIZE;
+                if (d < hsk) { dq[r] += ds*fab_load(k_row, d, nbk0, kv_f16); }
+        }
+        for (int r = 0; r < REGS; ++r) {
+            dQ[qbase + d] = dq[d];
         }
     }
-    for (int64_t d = 0; d < hsk; ++d) {
-        dQ[qbase + d] = dq[d];
+
+}
+
+// dK/dV ownership: one warp owns one dK/dV row. It visits grouped query heads and query rows
+// in lexical order, so no two blocks ever write the same address and repeated
+// executions are bit-identical. Vulkan already uses this ownership scheme; the
+// CUDA implementation intentionally mirrors it.
+template<int REGS>
+static __global__ void flash_attn_back_kv_kernel(
+        const char * __restrict__ q, const char * __restrict__ k,
+        const char * __restrict__ v, const char * __restrict__ mask,
+        const char * __restrict__ dO, float * __restrict__ dst,
+        const int64_t hsk, const int64_t hsv, const int64_t nq, const int64_t nkv,
+        const int64_t nhead, const int64_t nheadk, const int64_t nbatch,
+        const int64_t ratio,
+        const int64_t nbq0, const int64_t nbq1, const int64_t nbq2, const int64_t nbq3,
+        const int64_t nbk0, const int64_t nbk1, const int64_t nbk2, const int64_t nbk3,
+        const int64_t nbv0, const int64_t nbv1, const int64_t nbv2, const int64_t nbv3,
+        const int64_t nbm0, const int64_t nbm1, const int64_t nbm3,
+        const int64_t nbd0, const int64_t nbd1, const int64_t nbd2, const int64_t nbd3,
+        const size_t off_k, const size_t off_v, const size_t off_s,
+        const bool kv_f16, const bool has_mask,
+        const bool want_dk, const bool want_dv,
+        const fa_back_window window,
+        const float scale, const float softcap) {
+    const int lane = threadIdx.x;
+    const int64_t j   = blockIdx.x;
+    const int64_t ikh = blockIdx.y;
+    const int64_t ib  = blockIdx.z;
+    const int64_t ik  = fab_window_key(window, ib, j);
+    const bool in_cache = ik >= 0 && ik < nkv;
+
+    float dk[REGS];
+    float dv[REGS];
+        dk[r] = 0.0f;
+        dv[r] = 0.0f;
     }
+
+    if (in_cache) {
+        const char * k_row = k + ik*nbk1 + ikh*nbk2 + ib*nbk3;
+        const char * v_row = v + ik*nbv1 + ikh*nbv2 + ib*nbv3;
+        float kd[REGS];
+        float vd[REGS];
+#pragma unroll
+        for (int r = 0; r < REGS; ++r) {
+            const int64_t id = lane + r*WARP_SIZE;
+            kd[r] = id < hsk ? fab_load(k_row, id, nbk0, kv_f16) : 0.0f;
+            vd[r] = id < hsv ? fab_load(v_row, id, nbv0, kv_f16) : 0.0f;
+        }
+
+        const float * stats = (const float *) ((const char *) dst + off_s);
+        const int64_t nstats = nbatch*nhead*nq;
+        for (int64_t rhead = 0; rhead < ratio; ++rhead) {
+            const int64_t ih = ikh*ratio + rhead;
+            for (int64_t iq = 0; iq < nq; ++iq) {
+                const char * q_row = q + iq*nbq1 + ih*nbq2 + ib*nbq3;
+                const char * dO_row = dO + ih*nbd1 + iq*nbd2 + ib*nbd3;
+                const char * mask_row = has_mask ? mask + iq*nbm1 + ib*nbm3 : nullptr;
+
+                float dot_qk = 0.0f;
+                float dot_dv = 0.0f;
+#pragma unroll
+                for (int r = 0; r < REGS; ++r) {
+                    const int64_t id = lane + r*WARP_SIZE;
+                    if (id < hsk) {
+                        dot_qk += *(const float *) (q_row + id*nbq0) * kd[r];
+                    }
+                    if (id < hsv) {
+                        dot_dv += *(const float *) (dO_row + id*nbd0) * vd[r];
+                    }
+                }
+                dot_qk = warp_reduce_sum(dot_qk);
+                dot_dv = warp_reduce_sum(dot_dv);
+
+                float score = softcap != 0.0f
+                    ? softcap*tanhf(dot_qk*scale/softcap) : dot_qk*scale;
+                if (has_mask) {
+                    score += __half2float(*(const half *) (mask_row + ik*nbm0));
+                }
+                const int64_t stat_index = (ib*nhead + ih)*nq + iq;
+                const float lse = stats[stat_index];
+                const float delta = stats[nstats + stat_index];
+                const float prob = score == -INFINITY ? 0.0f : expf(score - lse);
+                float deriv = scale;
+                if (softcap != 0.0f) {
+                    const float t = tanhf(dot_qk*scale/softcap);
+                    deriv *= 1.0f - t*t;
+                }
+                const float ds = prob*(dot_dv - delta)*deriv;
+#pragma unroll
+                for (int r = 0; r < REGS; ++r) {
+                    const int64_t id = lane + r*WARP_SIZE;
+                    if (id < hsk) {
+                        dk[r] += ds * *(const float *) (q_row + id*nbq0);
+                    }
+                    if (id < hsv) {
+                        dv[r] += prob * *(const float *) (dO_row + id*nbd0);
+                    }
+                }
+            }
+        }
+    }
+
+    float * dK = (float *) ((char *) dst + off_k);
+    float * dV = (float *) ((char *) dst + off_v);
+    const int64_t kbase = ((ib*nheadk + ikh)*window.nwin + j)*hsk;
+    const int64_t vbase = ((ib*nheadk + ikh)*window.nwin + j)*hsv;
+#pragma unroll
+    for (int r = 0; r < REGS; ++r) {
+        const int64_t id = lane + r*WARP_SIZE;
+        if (want_dk && id < hsk) { dK[kbase + id] = dk[r]; }
+        if (want_dv && id < hsv) { dV[vbase + id] = dv[r]; }
+    }
+}
+
+// A number is only comparable to another number taken in the same
+// regime, and the MMA path's contract (F16 cache, HSK == HSV, a multiple of 16 up
+// to 256, NVIDIA Turing or newer) excludes shapes silently. Publish which kernel
+// ran and on what, rather than leave a measurement to guess -- the same reason
+// the GDN backward publishes gemm=f32 vs gemm=bf16-f32.
+static void fab_debug_regime(
+        int64_t hsk, int64_t hsv, int64_t nq, int64_t nkv, int64_t nhead, int64_t nheadk,
+        int64_t nwin, bool kv_f16, bool has_mask, bool want_dq, bool want_dk, bool want_dv,
+        const char * path, const char * schedule) {
+    if (!getenv("GGML_CUDA_FA_BACK_DEBUG")) {
+        return;
+    }
+    fprintf(stderr,
+            "fa_back: hsk=%lld hsv=%lld nq=%lld nkv=%lld nhead=%lld nheadk=%lld nwin=%lld "
+            "kv=%s mask=%d grads=%c%c%c path=%s %s\n",
+            (long long) hsk, (long long) hsv, (long long) nq, (long long) nkv,
+            (long long) nhead, (long long) nheadk, (long long) nwin,
+            kv_f16 ? "f16" : "f32", (int) has_mask,
+            want_dq ? 'q' : '-', want_dk ? 'k' : '-', want_dv ? 'v' : '-', path, schedule);
 }
 
 void ggml_cuda_flash_attn_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -147,10 +786,13 @@ void ggml_cuda_flash_attn_back(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const ggml_tensor * k = dst->src[1];
     const ggml_tensor * v = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * out = dst->src[4];
     const ggml_tensor * d = dst->src[5];
     const ggml_tensor * sinks = dst->src[6];
+    const ggml_tensor * kv_idxs = dst->src[9];
 
     GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(out->type == GGML_TYPE_F32);
     GGML_ASSERT(d->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
     GGML_ASSERT(k->type == v->type);
@@ -167,6 +809,8 @@ void ggml_cuda_flash_attn_back(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const int64_t hsv    = v->ne[0];
     GGML_ASSERT(hsk <= FA_BACK_MAX_D && hsv <= FA_BACK_MAX_D);
     GGML_ASSERT(nhead % nheadk == 0);
+    // hsk and hsv may differ (MLA); one bucket has to cover both.
+    const int64_t hs_max = MAX(hsk, hsv);
     const int64_t ratio = nhead / nheadk;
 
     float params[3];
@@ -177,30 +821,145 @@ void ggml_cuda_flash_attn_back(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const bool kv_f16 = k->type == GGML_TYPE_F16;
     const bool has_mask = mask != nullptr;
 
-    // Packed output offsets (must match ggml_flash_attn_ext_back).
-    const int64_t elem_q = ggml_nelements(q);
-    const int64_t elem_k = ggml_nelements(k);
-    const size_t off_k = GGML_PAD(elem_q*sizeof(float), GGML_MEM_ALIGN);
-    const size_t off_v = off_k + GGML_PAD(elem_k*sizeof(float), GGML_MEM_ALIGN);
+    const int32_t grad_mask = ggml_get_op_params_i32(dst, 3);
+    const bool want_dq = (grad_mask & GGML_FLASH_ATTN_BACK_GRAD_Q) != 0;
+    const bool want_dk = (grad_mask & GGML_FLASH_ATTN_BACK_GRAD_K) != 0;
+    const bool want_dv = (grad_mask & GGML_FLASH_ATTN_BACK_GRAD_V) != 0;
+
+    // Packed output offsets: derived from ggml so the layout lives in one place.
+    size_t off_k = 0;
+    size_t off_v = 0;
+    size_t off_s = 0;
+    ggml_flash_attn_back_offsets(dst, nullptr, &off_k, &off_v, &off_s);
+
+    fa_back_window window = {};
+    if (kv_idxs) {
+        GGML_ASSERT(kv_idxs->type == GGML_TYPE_I32);
+        GGML_ASSERT(ggml_is_contiguous(kv_idxs));
+        window.idxs    = (const int32_t *) kv_idxs->data;
+        window.nwin    = ggml_flash_attn_back_grad_k(dst)->ne[1];
+        window.stride  = ggml_get_op_params_i32(dst, 4);
+        window.stream0 = ggml_get_op_params_i32(dst, 5);
+        GGML_ASSERT(ggml_nelements(kv_idxs) == window.nwin*nbatch);
+    } else {
+        window.nwin = nkv;
+    }
 
     cudaStream_t stream = ctx.stream();
     float * dst_d = (float *) dst->data;
-    // dK/dV accumulate with atomics and the scalar tail is unused; zero all of it.
+    // Define alignment padding and segments omitted by grad_mask. The kernels
+    // themselves write every requested gradient/statistics element exactly once.
     CUDA_CHECK(cudaMemsetAsync(dst_d, 0, ggml_nbytes(dst), stream));
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const char * mma_env = getenv("GGML_CUDA_FA_BACK_MMA");
+    const bool mma_enabled = mma_env == nullptr || std::atoi(mma_env) != 0;
+    const bool use_mma = mma_enabled && kv_f16 && hsk == hsv && hsk >= 16 &&
+        hsk <= FA_BACK_MMA_MAX_D && hsk % 16 == 0 &&
+        k->nb[0] == sizeof(half) && v->nb[0] == sizeof(half) &&
+        GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc);
+    // The before/after of the folded log-sum-exp has to be measurable
+    // in one session, on one machine, without a rebuild -- same rule
+    // GGML_CUDA_FA_BACK_MMA already follows for the MMA path itself. The default
+    // is the two-sweep form: a default does not move before its gate.
+    const char * fused_env = getenv("GGML_CUDA_FA_BACK_FUSED_LSE");
+    const bool fused_lse = fused_env != nullptr && std::atoi(fused_env) != 0;
+    if (use_mma) {
+        const fa_back_mma_args mma = {
+            hsk, nq, nkv, nhead, nheadk, ratio,
+            q->nb[0], q->nb[1], q->nb[2], q->nb[3],
+            k->nb[1], k->nb[2], k->nb[3],
+            v->nb[1], v->nb[2], v->nb[3],
+            mask ? mask->nb[0] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[3] : 0,
+            out->nb[0], out->nb[1], out->nb[2], out->nb[3],
+            d->nb[0], d->nb[1], d->nb[2], d->nb[3],
+            off_k, off_v, off_s,
+            window.idxs, window.nwin, window.stride, window.stream0,
+            scale, softcap,
+            has_mask, want_dq, want_dk, want_dv,
+            fused_lse,
+        };
+        // 4 half tiles (Q/dO/K/V), 2 score tiles, and 4 per-row F32 arrays:
+        // row_m, row_l, row_delta and the folded LSE's row_rescale.
+        const size_t mma_smem = 4*(size_t) FA_BACK_MMA_TILE*hsk*sizeof(half) +
+            2*(size_t) FA_BACK_MMA_TILE*FA_BACK_MMA_TILE*sizeof(float) +
+            4*(size_t) FA_BACK_MMA_TILE*sizeof(float);
+        fab_debug_regime(hsk, hsv, nq, nkv, nhead, nheadk, window.nwin, kv_f16, has_mask,
+                         want_dq, want_dk, want_dv, "mma",
+                         (!fused_lse || !want_dq) ? "lse=two-pass" : "lse=fused");
+        const dim3 grid_q((unsigned) ((nq + FA_BACK_MMA_TILE - 1)/FA_BACK_MMA_TILE),
+                          (unsigned) nhead, (unsigned) nbatch);
+        flash_attn_back_mma_q_kernel<0><<<grid_q, FA_BACK_MMA_THREADS, mma_smem, stream>>>(
+            (const char *) q->data, (const half *) k->data, (const half *) v->data,
+            mask ? (const char *) mask->data : nullptr,
+            (const char *) out->data, (const char *) d->data, dst_d, mma);
+        if (want_dk || want_dv) {
+            const dim3 grid_kv((unsigned) ((window.nwin + FA_BACK_MMA_TILE - 1)/FA_BACK_MMA_TILE),
+                               (unsigned) nheadk, (unsigned) nbatch);
+            flash_attn_back_mma_kv_kernel<0><<<grid_kv, FA_BACK_MMA_THREADS, mma_smem, stream>>>(
+                (const char *) q->data, (const half *) k->data, (const half *) v->data,
+                mask ? (const char *) mask->data : nullptr,
+                (const char *) d->data, dst_d, mma);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+#endif
+
+    // A number is only comparable to another number taken in the same
+    // regime, and the MMA path's contract (F16 cache, HSK == HSV, a multiple of
+    // 16 up to 256, NVIDIA Turing or newer) excludes shapes silently. Publish it
+    // rather than leave a measurement to guess which kernel ran.
     const int64_t n_rows = nq*nhead*nbatch;
     const int block = 64;
     const int grid = (int) ((n_rows + block - 1)/block);
-    flash_attn_back_kernel<<<grid, block, 0, stream>>>(
-        (const char *) q->data, (const char *) k->data, (const char *) v->data,
-        mask ? (const char *) mask->data : nullptr,
-        (const char *) d->data, dst_d,
-        hsk, hsv, nq, nkv, nhead, nheadk, nbatch, ratio,
-        q->nb[0], q->nb[1], q->nb[2], q->nb[3],
-        k->nb[0], k->nb[1], k->nb[2], k->nb[3],
-        v->nb[0], v->nb[1], v->nb[2], v->nb[3],
-        mask ? mask->nb[0] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[3] : 0,
-        d->nb[0], d->nb[1], d->nb[2], d->nb[3],
-        off_k, off_v, kv_f16, has_mask, scale, softcap);
+
+    char schedule[32];
+    snprintf(schedule, sizeof(schedule), "tkv=%d", tkv);
+    fab_debug_regime(hsk, hsv, nq, nkv, nhead, nheadk, window.nwin, kv_f16, has_mask,
+                     want_dq, want_dk, want_dv, "scalar", schedule);
+
+    // Smallest bucket that covers the shape: head_dim only costs registers here,
+    // so a wide model works, but narrow models must not pay for it.
+#define FA_BACK_LAUNCH(REGS)                                                        \
+    flash_attn_back_kernel<REGS><<<grid, block, 0, stream>>>(                       \
+        (const char *) q->data, (const char *) k->data, (const char *) v->data,     \
+        mask ? (const char *) mask->data : nullptr,                                 \
+        (const char *) out->data, (const char *) d->data, dst_d,                    \
+        hsk, hsv, nq, nkv, nhead, nheadk, nbatch, ratio,                            \
+        q->nb[0], q->nb[1], q->nb[2], q->nb[3],                                     \
+        k->nb[0], k->nb[1], k->nb[2], k->nb[3],                                     \
+        v->nb[0], v->nb[1], v->nb[2], v->nb[3],                                     \
+        mask ? mask->nb[0] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[3] : 0,     \
+        out->nb[0], out->nb[1], out->nb[2], out->nb[3],                             \
+        d->nb[0], d->nb[1], d->nb[2], d->nb[3],                                     \
+        off_s, kv_f16, has_mask, want_dq, tkv, scale, softcap);                      \
+    if (want_dk || want_dv) {                                                       \
+        const dim3 grid_kv((unsigned) window.nwin, (unsigned) nheadk,                \
+                           (unsigned) nbatch);                                       \
+        flash_attn_back_kv_kernel<REGS><<<grid_kv, WARP_SIZE, 0, stream>>>(          \
+            (const char *) q->data, (const char *) k->data, (const char *) v->data, \
+            mask ? (const char *) mask->data : nullptr,                             \
+            (const char *) d->data, dst_d,                                          \
+            hsk, hsv, nq, nkv, nhead, nheadk, nbatch, ratio,                        \
+            q->nb[0], q->nb[1], q->nb[2], q->nb[3],                                 \
+            k->nb[0], k->nb[1], k->nb[2], k->nb[3],                                 \
+            v->nb[0], v->nb[1], v->nb[2], v->nb[3],                                 \
+            mask ? mask->nb[0] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[3] : 0, \
+            d->nb[0], d->nb[1], d->nb[2], d->nb[3],                                 \
+            off_k, off_v, off_s, kv_f16, has_mask, want_dk, want_dv, window,        \
+            scale, softcap);                                                        \
+    }
+
+    if (hs_max <= FA_BACK_REGS_SMALL*WARP_SIZE) {
+        FA_BACK_LAUNCH(FA_BACK_REGS_SMALL);
+    } else if (hs_max <= FA_BACK_REGS_WIDE*WARP_SIZE) {
+        FA_BACK_LAUNCH(FA_BACK_REGS_WIDE);
+    } else {
+        // hs_max <= FA_BACK_MAX_D by the assert above, so this is the XWIDE case.
+        FA_BACK_LAUNCH(FA_BACK_REGS_XWIDE);
+    }
+#undef FA_BACK_LAUNCH
     CUDA_CHECK(cudaGetLastError());
 }
