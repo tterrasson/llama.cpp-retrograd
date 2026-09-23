@@ -1975,11 +1975,21 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                    op->src[1]->nb[0] == ggml_type_size(op->src[1]->type) &&
                    ggml_are_same_shape(op->src[0], op->src[1]) &&
                    ggml_are_same_shape(op->src[0], op);
-        // retro delta: out-prod (weight-gradient GEMM). F32; src0 dim0 and dst
-        // dim0 must be unit-stride (matches the CPU op's asserts); src1 may carry
-        // arbitrary strides. Anything else falls back to CPU.
+        // retro delta: out-prod (weight-gradient GEMM). src0 is F32, Q8_0,
+        // or a K-quant
+        // (the activation-gradient dx = out_prod(W, dy) reads the quantized
+        // model weight directly); src0 dim0 and dst dim0 must be unit-stride
+        // (matches the CPU op's asserts); src1 may carry arbitrary strides.
+        // Anything else falls back to CPU.
         case GGML_OP_OUT_PROD:
-            return op->src[0]->type == GGML_TYPE_F32 &&
+            return (op->src[0]->type == GGML_TYPE_F32 ||
+                    op->src[0]->type == GGML_TYPE_Q5_0 ||
+                    op->src[0]->type == GGML_TYPE_Q8_0 ||
+                    op->src[0]->type == GGML_TYPE_Q2_K ||
+                    op->src[0]->type == GGML_TYPE_Q3_K ||
+                    op->src[0]->type == GGML_TYPE_Q4_K ||
+                    op->src[0]->type == GGML_TYPE_Q5_K ||
+                    op->src[0]->type == GGML_TYPE_Q6_K) &&
                    op->src[1]->type == GGML_TYPE_F32 &&
                    op->type         == GGML_TYPE_F32 &&
                    op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
