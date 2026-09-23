@@ -7093,7 +7093,14 @@ static void ggml_acc_or_set(
     if (cgraph->grads[isrc]) {
         cgraph->grads[isrc] = ggml_acc_impl(ctx, cgraph->grads[isrc], tensor, nb1, nb2, nb3, offset, cgraph->grad_accs[isrc]);
     } else {
-        struct ggml_tensor * a_zero = ggml_scale(ctx, src, 0.0f); // FIXME this is going to produce NaN if a contains inf/NaN
+        // Gradients are accumulated in F32 even when the viewed activation is
+        // stored in F16 (notably the differentiable training KV cache).
+        // ggml_acc only accepts F32 operands, so promote the zero initializer
+        // instead of inheriting the activation's storage type.
+        struct ggml_tensor * a_zero = src->type == GGML_TYPE_F32
+                ? ggml_scale(ctx, src, 0.0f)
+                : ggml_fill(ctx,
+                        ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, src->ne), 0.0f);
         cgraph->grads[isrc] = ggml_acc_impl(ctx, a_zero, tensor, nb1, nb2, nb3, offset, false);
     }
     ggml_format_name(cgraph->grads[isrc], "grad for %s", cgraph->visited_hash_set.keys[isrc]->name);
@@ -7130,6 +7137,79 @@ static void ggml_sub_or_set(
     }
     ggml_format_name(cgraph->grads[isrc], "grad for %s", src->name);
     ggml_build_forward_expand(cgraph, cgraph->grads[isrc]);
+}
+
+// retro delta: the offset and strides of a view are those of the memory under
+// its source. When the source is itself a strided view (a head split out of a
+// fused QKV projection, then viewed again by the attention), its gradient is
+// contiguous, and the view has to be restated in that layout: each stride and
+// the offset are decomposed over the source's own strides and recomposed over
+// the contiguous ones. Returns false when a stride does not fall on the
+// source's layout, which no graph builder produces today.
+static bool ggml_view_in_contiguous_src(
+        const struct ggml_tensor * view,
+        const struct ggml_tensor * src,
+        size_t                     offset,
+        size_t                   * nb_out,     // [3]: nb1, nb2, nb3
+        size_t                   * offset_out) {
+    size_t nbc[GGML_MAX_DIMS];
+    nbc[0] = ggml_type_size(src->type);
+    for (int j = 1; j < GGML_MAX_DIMS; ++j) {
+        nbc[j] = nbc[j - 1]*src->ne[j - 1];
+    }
+    if (src->nb[0] != nbc[0]) {
+        return false;
+    }
+
+    // one stride, expressed as a whole number of steps of the widest source
+    // dimension it does not exceed
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        if (view->ne[i] == 1) {
+            nb_out[i - 1] = nbc[GGML_MAX_DIMS - 1]*src->ne[GGML_MAX_DIMS - 1];
+            continue;
+        }
+        const size_t nb = view->nb[i];
+        bool found = false;
+        for (int j = GGML_MAX_DIMS - 1; j >= 0 && !found; --j) {
+            if (src->ne[j] > 1 && src->nb[j] <= nb && nb % src->nb[j] == 0 &&
+                    (int64_t) (nb / src->nb[j]) <= src->ne[j]) {
+                nb_out[i - 1] = (nb / src->nb[j])*nbc[j];
+                found = true;
+            }
+        }
+        if (!found) {
+            return false;
+        }
+    }
+
+    // the offset, one source index per dimension, widest first
+    int order[GGML_MAX_DIMS] = { 0, 1, 2, 3 };
+    for (int a = 0; a < GGML_MAX_DIMS; ++a) {
+        for (int b = a + 1; b < GGML_MAX_DIMS; ++b) {
+            if (src->nb[order[b]] > src->nb[order[a]]) {
+                const int t = order[a]; order[a] = order[b]; order[b] = t;
+            }
+        }
+    }
+    size_t rest = offset;
+    size_t out  = 0;
+    for (int k = 0; k < GGML_MAX_DIMS; ++k) {
+        const int j = order[k];
+        if (src->ne[j] <= 1) {
+            continue;
+        }
+        const size_t idx = rest / src->nb[j];
+        if ((int64_t) idx >= src->ne[j]) {
+            return false;
+        }
+        rest -= idx*src->nb[j];
+        out  += idx*nbc[j];
+    }
+    if (rest != 0) {
+        return false;
+    }
+    *offset_out = out;
+    return true;
 }
 
 static void ggml_compute_backward(
@@ -7423,9 +7503,24 @@ static void ggml_compute_backward(
                 size_t nb2 = tensor->nb[2];
                 size_t nb3 = tensor->nb[3];
 
-                if (cgraph->grads[isrc0] && src0->type != cgraph->grads[isrc0]->type) {
+                // retro delta: a view of a strided view, see ggml_view_in_contiguous_src
+                if (!ggml_is_contiguous(src0)) {
+                    size_t nb[3];
+                    size_t offset_c;
+                    GGML_ASSERT(ggml_view_in_contiguous_src(tensor, src0, offset, nb, &offset_c) &&
+                            "backward of a view whose strides do not follow its strided source");
+                    nb1 = nb[0];
+                    nb2 = nb[1];
+                    nb3 = nb[2];
+                    offset = offset_c;
+                }
+
+                const struct ggml_tensor * grad_layout = cgraph->grads[isrc0]
+                        ? cgraph->grads[isrc0]
+                        : grad;
+                if (src0->type != grad_layout->type) {
                     // gradient is typically F32, but src0 could be other type
-                    size_t ng = ggml_element_size(cgraph->grads[isrc0]);
+                    size_t ng = ggml_element_size(grad_layout);
                     size_t n0 = ggml_element_size(src0);
                     GGML_ASSERT(offset % n0 == 0);
                     GGML_ASSERT(nb1 % n0 == 0);
@@ -8084,6 +8179,146 @@ void ggml_build_backward_expand(
     }
 
     free(grads_needed);
+}
+
+// Clone a forward node for activation recomputation. Parameters, leaves, and
+// explicit checkpoints are shared with the original forward graph; every
+// other operation is cloned once and memoized in `replacements`.
+static struct ggml_tensor * ggml_recompute_graph_node(
+        struct ggml_context * ctx,
+        struct ggml_cgraph  * graph,
+        struct hash_map     * replacements,
+        struct ggml_tensor  * node,
+        void (*on_recompute)(struct ggml_tensor *, struct ggml_tensor *, void *),
+        void * userdata) {
+    if (node == NULL) {
+        return NULL;
+    }
+    if (node->flags & GGML_TENSOR_FLAG_PARAM) {
+        return node;
+    }
+    // SET_ROWS writes differentiable K/V values into persistent cache storage.
+    // Replaying that mutation is unnecessary for its gradient and, across
+    // accumulated micro-batches, can perturb the cache state consumed by the
+    // following graph. Treat the cache write result as an implicit checkpoint;
+    // the backward rule still recomputes and differentiates its value source.
+    if (node->op == GGML_OP_SET_ROWS) {
+        return node;
+    }
+    if (!ggml_hash_contains(&graph->visited_hash_set, node)) {
+        return node;
+    }
+
+    bool has_parent = node->view_src != NULL;
+    for (int k = 0; k < GGML_MAX_SRC && !has_parent; ++k) {
+        has_parent = node->src[k] != NULL;
+    }
+    if (!has_parent) {
+        return node;
+    }
+
+    const size_t i = ggml_hash_find(&replacements->set, node);
+    GGML_ASSERT(i != GGML_HASHSET_FULL);
+    if (ggml_bitset_get(replacements->set.used, i)) {
+        GGML_ASSERT(replacements->set.keys[i] == node);
+        return replacements->vals[i];
+    }
+
+    struct ggml_tensor * clone = ggml_dup_tensor(ctx, node);
+    ggml_bitset_set(replacements->set.used, i);
+    replacements->set.keys[i] = node;
+    replacements->vals[i] = clone;
+
+    clone->op = node->op;
+    clone->flags = node->flags & ~(GGML_TENSOR_FLAG_INPUT |
+            GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_PARAM |
+            GGML_TENSOR_FLAG_LOSS);
+    clone->extra = node->extra;
+    clone->data = NULL;
+    clone->buffer = NULL;
+    clone->view_offs = node->view_offs;
+    for (int k = 0; k < GGML_MAX_DIMS; ++k) {
+        clone->nb[k] = node->nb[k];
+    }
+    for (int k = 0; k < GGML_MAX_SRC; ++k) {
+        clone->src[k] = ggml_recompute_graph_node(
+                ctx, graph, replacements, node->src[k], on_recompute, userdata);
+    }
+    clone->view_src = ggml_recompute_graph_node(
+            ctx, graph, replacements, node->view_src, on_recompute, userdata);
+    memcpy(clone->op_params, node->op_params, sizeof(node->op_params));
+    ggml_format_name(clone, "%s (recompute)", ggml_get_name(node));
+    if (on_recompute) {
+        on_recompute(node, clone, userdata);
+    }
+    return clone;
+}
+
+struct ggml_cgraph * ggml_build_backward_gradient_checkpointing(
+        struct ggml_context * ctx,
+        struct ggml_cgraph  * gf,
+        struct ggml_tensor ** grad_accs,
+        struct ggml_tensor ** checkpoints,
+        int                   n_checkpoints,
+        void (*on_recompute)(struct ggml_tensor *, struct ggml_tensor *, void *),
+        void * userdata) {
+    GGML_ASSERT(n_checkpoints > 0);
+    GGML_ASSERT(checkpoints != NULL);
+
+    // Build the ordinary backward graph first. Its gradient tensors are then
+    // reused while their activation inputs are rewritten to recomputed clones.
+    struct ggml_cgraph * gb_tmp = ggml_graph_dup(ctx, gf, /*force_grads =*/ true);
+    ggml_build_backward_expand(ctx, gb_tmp, grad_accs);
+
+    struct hash_map * replacements = ggml_new_hash_map(
+            (size_t) gf->n_nodes + (size_t) gf->n_leafs + (size_t) n_checkpoints);
+    for (int i = 0; i < n_checkpoints; ++i) {
+        GGML_ASSERT(ggml_hash_contains(&gf->visited_hash_set, checkpoints[i]));
+        const size_t k = ggml_hash_find(&replacements->set, checkpoints[i]);
+        GGML_ASSERT(k != GGML_HASHSET_FULL);
+        if (!ggml_bitset_get(replacements->set.used, k)) {
+            ggml_bitset_set(replacements->set.used, k);
+            replacements->set.keys[k] = checkpoints[i];
+            replacements->vals[k] = checkpoints[i];
+        }
+    }
+
+    // The result contains the original forward, the ordinary backward nodes,
+    // and at most one recompute clone per original forward node.
+    const size_t checkpoint_graph_size = (size_t) gb_tmp->size + (size_t) gf->n_nodes;
+    struct ggml_cgraph * gb = ggml_new_graph_custom(
+            ctx, checkpoint_graph_size, /*grads =*/ true);
+    ggml_graph_cpy(gf, gb);
+
+    const int n_nodes_f = gf->n_nodes;
+    for (int i = n_nodes_f; i < gb_tmp->n_nodes; ++i) {
+        struct ggml_tensor * node = gb_tmp->nodes[i];
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            node->src[k] = ggml_recompute_graph_node(
+                    ctx, gf, replacements, node->src[k], on_recompute, userdata);
+        }
+        if (node->view_src) {
+            node->view_src = ggml_recompute_graph_node(
+                    ctx, gf, replacements, node->view_src, on_recompute, userdata);
+        }
+        ggml_build_forward_expand(gb, node);
+    }
+
+    // Gradients live in the graph-side hash table in current ggml. Preserve
+    // the ordinary backward graph's mapping for every original forward node.
+    for (int i = 0; i < n_nodes_f; ++i) {
+        struct ggml_tensor * node = gf->nodes[i];
+        const size_t isrc = ggml_hash_find(&gb_tmp->visited_hash_set, node);
+        const size_t idst = ggml_hash_find(&gb->visited_hash_set, node);
+        GGML_ASSERT(isrc != GGML_HASHSET_FULL && idst != GGML_HASHSET_FULL);
+        GGML_ASSERT(ggml_bitset_get(gb_tmp->visited_hash_set.used, isrc));
+        GGML_ASSERT(ggml_bitset_get(gb->visited_hash_set.used, idst));
+        gb->grads[idst] = gb_tmp->grads[isrc];
+        gb->grad_accs[idst] = gb_tmp->grad_accs[isrc];
+    }
+
+    ggml_hash_map_free(replacements);
+    return gb;
 }
 
 // retro delta: sources whose gradients have no effect on output gradients,

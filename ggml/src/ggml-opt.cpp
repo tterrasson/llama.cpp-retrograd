@@ -12,6 +12,7 @@
 #include <cstring>
 #include <map>
 #include <random>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -62,6 +63,15 @@ struct ggml_opt_context {
     std::vector<struct ggml_tensor *> grad_accs;
     std::vector<struct ggml_tensor *> grad_m;
     std::vector<struct ggml_tensor *> grad_v;
+    // Forward tensors retained across the backward pass. Empty preserves the
+    // ordinary graph exactly; dynamic callers refresh this list per build.
+    std::vector<struct ggml_tensor *> gradient_checkpoints;
+    // retro delta: the profile of the last backward graph that actually retained
+    // checkpoints. Stamped at build time rather than computed on demand, because
+    // the list above is cleared by every ggml_opt_prepare_alloc — a forward-only
+    // build between a training step and the read would otherwise erase the
+    // measurement rather than report the last one.
+    struct ggml_opt_checkpoint_profile checkpoint_profile = {};
     // retro delta: compacted, name-keyed view of the momenta above. This is
     // the pairing both the optimizer step and checkpointing use; grad_m/grad_v
     // stay as the allocation-time storage, indexed by forward-graph node
@@ -82,6 +92,13 @@ struct ggml_opt_context {
 
     enum ggml_opt_optimizer_type optimizer = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
 };
+
+// retro delta: defined below, next to the rest of the checkpoint accounting;
+// declared here because ggml_opt_build (above it) stamps the profile.
+static bool ggml_opt_measure_checkpoint_profile(
+        ggml_opt_context_t   opt_ctx,
+        struct ggml_cgraph * graph,
+        struct ggml_opt_checkpoint_profile * out_profile);
 
 struct ggml_opt_result {
     int64_t              ndata    = 0;
@@ -334,6 +351,17 @@ static ggml_cgraph * dup_graph(ggml_context * ctx, ggml_cgraph * src) {
     return dst;
 }
 
+static void ggml_opt_copy_recompute_backend(
+        ggml_tensor * original,
+        ggml_tensor * clone,
+        void * userdata) {
+    ggml_backend_sched_t sched = static_cast<ggml_backend_sched_t>(userdata);
+    ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, original);
+    if (backend) {
+        ggml_backend_sched_set_tensor_backend(sched, clone, backend);
+    }
+}
+
 static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     GGML_ASSERT(opt_ctx->ctx_compute && "no compute context set, either use static graphs or set one with ggml_opt_prepare_alloc");
     GGML_ASSERT((!opt_ctx->static_graphs || opt_ctx->inputs->data) && "when using static graphs the inputs must be allocated statically");
@@ -504,8 +532,31 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     }
 
     // gb_grad == graph backward gradients, forward pass, then backward pass to calculate gradients.
-    opt_ctx->gb_grad = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gf, /*force_grads =*/ true);
-    ggml_build_backward_expand(opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->grad_accs.data());
+    if (opt_ctx->gradient_checkpoints.empty()) {
+        opt_ctx->gb_grad = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gf, /*force_grads =*/ true);
+        ggml_build_backward_expand(opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->grad_accs.data());
+    } else {
+        opt_ctx->gb_grad = ggml_build_backward_gradient_checkpointing(
+                opt_ctx->ctx_compute,
+                opt_ctx->gf,
+                opt_ctx->grad_accs.data(),
+                opt_ctx->gradient_checkpoints.data(),
+                (int) opt_ctx->gradient_checkpoints.size(),
+                ggml_opt_copy_recompute_backend,
+                opt_ctx->backend_sched);
+        // retro delta: measure what this build retains while the graph and its
+        // checkpoint list are both still in hand. One
+        // walk per backward build, which is the same cadence as the build itself.
+        //
+        // Measured on gb_grad rather than gb_opt: the optimizer step appended on
+        // top reads gradients and momenta, never a checkpoint, so it would only
+        // lengthen the graph the spans are fractions of and make every lifetime
+        // look shorter than it is.
+        struct ggml_opt_checkpoint_profile profile = {};
+        if (ggml_opt_measure_checkpoint_profile(opt_ctx, opt_ctx->gb_grad, &profile)) {
+            opt_ctx->checkpoint_profile = profile;
+        }
+    }
 
     if (opt_ctx->buf_static) {
         if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_GRAD) {
@@ -911,6 +962,177 @@ void ggml_opt_prepare_alloc(
     opt_ctx->gf          = gf;
     opt_ctx->inputs      = inputs;
     opt_ctx->outputs     = outputs;
+    opt_ctx->gradient_checkpoints.clear();
+}
+
+void ggml_opt_set_gradient_checkpoints(
+        ggml_opt_context_t    opt_ctx,
+        struct ggml_tensor ** checkpoints,
+        int                   n_checkpoints) {
+    GGML_ASSERT(!opt_ctx->static_graphs);
+    GGML_ASSERT(n_checkpoints >= 0);
+    GGML_ASSERT(n_checkpoints == 0 || checkpoints != nullptr);
+    opt_ctx->gradient_checkpoints.clear();
+    if (n_checkpoints > 0) {
+        opt_ctx->gradient_checkpoints.assign(checkpoints, checkpoints + n_checkpoints);
+    }
+}
+
+// retro delta: see ggml_opt_checkpoint_profile.
+//
+// A checkpoint is not one tensor once it is narrowed: the forward builds it in
+// F32, a `store` cast holds it 16-bit across the backward, and a `fetch` cast
+// widens it again for the first recompute that reads it. Accounting only the
+// F32 tensor would report double the bytes actually retained, and accounting
+// only the store would lose the forward-side hold. So the walk follows the
+// chain: a node is part of a checkpoint's chain if it *is* the checkpoint, or
+// it is a copy whose source is already in the chain. That is exactly the two
+// casts and nothing else — a recompute clone reads the fetch, it is not a copy
+// of it.
+//
+// Each chain member contributes its own interval [produced, last read] and its
+// own byte count, so the concurrency sweep below is over what is really held at
+// each point rather than over an idealized "the checkpoint exists".
+static bool ggml_opt_checkpoint_chain_member(
+        const struct ggml_tensor * node,
+        const std::set<const struct ggml_tensor *> & chain) {
+    if (node->op != GGML_OP_CPY && node->op != GGML_OP_CONT && node->op != GGML_OP_DUP) {
+        return false;
+    }
+    return node->src[0] && chain.count(node->src[0]) > 0;
+}
+
+static bool ggml_opt_measure_checkpoint_profile(
+        ggml_opt_context_t   opt_ctx,
+        struct ggml_cgraph * graph,
+        struct ggml_opt_checkpoint_profile * out_profile) {
+    GGML_ASSERT(out_profile);
+    memset(out_profile, 0, sizeof(*out_profile));
+    if (opt_ctx->gradient_checkpoints.empty() || !graph) {
+        return false;
+    }
+    const int n_nodes = ggml_graph_n_nodes(graph);
+    if (n_nodes <= 0) {
+        return false;
+    }
+
+    // Position of every node, so a source can be located without rescanning.
+    std::map<const struct ggml_tensor *, int> position;
+    for (int i = 0; i < n_nodes; ++i) {
+        position.emplace(ggml_graph_node(graph, i), i);
+    }
+
+    // One interval per retained tensor: (first node index, last node index, bytes).
+    struct held_interval { int first; int last; size_t bytes; };
+    std::vector<held_interval> intervals;
+    // Per checkpoint, the span of its whole chain and the bytes of the member
+    // held longest — the copy an offload would actually move.
+    std::vector<int>    chain_first(opt_ctx->gradient_checkpoints.size(), n_nodes);
+    std::vector<int>    chain_last(opt_ctx->gradient_checkpoints.size(), 0);
+    std::vector<size_t> chain_bytes(opt_ctx->gradient_checkpoints.size(), 0);
+
+    for (size_t c = 0; c < opt_ctx->gradient_checkpoints.size(); ++c) {
+        struct ggml_tensor * checkpoint = opt_ctx->gradient_checkpoints[c];
+        const auto found = position.find(checkpoint);
+        if (found == position.end()) {
+            // A checkpoint absent from this graph retains nothing in it. Skipped
+            // rather than counted as zero, so n_checkpoints below stays the count
+            // of what was measured.
+            continue;
+        }
+        std::set<const struct ggml_tensor *> chain;
+        chain.insert(checkpoint);
+        std::map<const struct ggml_tensor *, held_interval> members;
+        members.emplace(checkpoint, held_interval{ found->second, found->second, ggml_nbytes(checkpoint) });
+        // One forward sweep: the chain only grows forward (a copy comes after
+        // what it copies), so members are discovered before they are read.
+        for (int i = found->second + 1; i < n_nodes; ++i) {
+            struct ggml_tensor * node = ggml_graph_node(graph, i);
+            if (ggml_opt_checkpoint_chain_member(node, chain)) {
+                chain.insert(node);
+                members.emplace(node, held_interval{ i, i, ggml_nbytes(node) });
+                // The copy is the last reader of what it copies.
+                members[node->src[0]].last = i;
+                continue;
+            }
+            for (int src = 0; src < GGML_MAX_SRC; ++src) {
+                if (node->src[src] && chain.count(node->src[src])) {
+                    members[node->src[src]].last = i;
+                }
+            }
+        }
+        size_t longest_bytes = 0;
+        int    longest_span  = -1;
+        for (const auto & member : members) {
+            intervals.push_back(member.second);
+            chain_first[c] = std::min(chain_first[c], member.second.first);
+            chain_last[c]  = std::max(chain_last[c],  member.second.last);
+            const int span = member.second.last - member.second.first;
+            if (span > longest_span) {
+                longest_span  = span;
+                longest_bytes = member.second.bytes;
+            }
+        }
+        chain_bytes[c] = longest_bytes;
+        out_profile->n_checkpoints++;
+        out_profile->retained_bytes += longest_bytes;
+        const int64_t span = chain_last[c] - chain_first[c];
+        out_profile->total_span_nodes += span;
+        out_profile->max_span_nodes = std::max(out_profile->max_span_nodes, span);
+        if (2*span >= n_nodes) {
+            out_profile->n_long_lived++;
+            out_profile->long_lived_bytes += longest_bytes;
+        }
+    }
+    if (out_profile->n_checkpoints == 0) {
+        return false;
+    }
+    out_profile->n_nodes = n_nodes;
+
+    // Concurrency by sweeping the interval endpoints rather than the nodes: the
+    // curve only changes where an interval opens or closes, and there are two
+    // endpoints per retained tensor against tens of thousands of nodes.
+    // Signed deltas, so an interval's open and close cancel exactly. The cast of
+    // a tensor's byte count to int64_t cannot lose anything: ggml_nbytes is
+    // bounded by the tensor's allocation, and no allocation approaches 2^63
+    // (a narrowing with a proof written beside it).
+    struct sweep_event { int node; int64_t d_count; int64_t d_bytes; };
+    std::vector<sweep_event> events;
+    events.reserve(2*intervals.size());
+    for (const held_interval & interval : intervals) {
+        const int64_t bytes = (int64_t) interval.bytes;
+        events.push_back({ interval.first,     +1, +bytes });
+        events.push_back({ interval.last + 1,  -1, -bytes });
+    }
+    std::sort(events.begin(), events.end(),
+            [](const sweep_event & a, const sweep_event & b) { return a.node < b.node; });
+    int64_t live_count = 0;
+    int64_t live_bytes = 0;
+    for (size_t i = 0; i < events.size(); ++i) {
+        live_count += events[i].d_count;
+        live_bytes += events[i].d_bytes;
+        // Only compare once every event at this node has been applied, otherwise
+        // a close-then-open pair at the same index reports a phantom peak.
+        if (i + 1 < events.size() && events[i + 1].node == events[i].node) {
+            continue;
+        }
+        // live_bytes is a partial sum of matched +bytes/-bytes pairs and every
+        // open precedes its close, so it is never negative here.
+        if ((size_t) live_bytes > out_profile->live_peak_bytes) {
+            out_profile->live_peak_bytes = (size_t) live_bytes;
+            out_profile->live_peak_count = live_count;
+            out_profile->live_peak_node  = events[i].node;
+        }
+    }
+    return true;
+}
+
+bool ggml_opt_get_checkpoint_profile(
+        ggml_opt_context_t opt_ctx,
+        struct ggml_opt_checkpoint_profile * out_profile) {
+    GGML_ASSERT(out_profile);
+    *out_profile = opt_ctx->checkpoint_profile;
+    return out_profile->n_checkpoints > 0;
 }
 
 void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {

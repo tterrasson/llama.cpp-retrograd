@@ -3489,6 +3489,53 @@ struct test_cont : public test_case {
     }
 };
 
+// retro delta: GGML_OP_VIEW of a strided view, the attention layout: the
+// heads of one projection cut out of a fused QKV row, then split into
+// streams. The gradient of the outer view is laid out in the contiguous
+// gradient of the fused tensor, whose strides are not those of the inner view.
+struct test_view_of_strided_view : public test_case {
+    const int64_t d;      // head size
+    const int64_t nh;     // heads per projection
+    const int64_t nt;     // tokens
+    const int64_t ns;     // streams the tokens are split into
+    const int64_t part;   // which of the three projections: 0 Q, 1 K, 2 V
+    const int64_t skip;   // heads the outer view skips
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "VIEW";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR6(d, nh, nt, ns, part, skip);
+    }
+
+    test_view_of_strided_view(int64_t d = 8, int64_t nh = 3, int64_t nt = 6, int64_t ns = 2,
+            int64_t part = 1, int64_t skip = 0)
+        : d(d), nh(nh), nt(nt), ns(ns), part(part), skip(skip) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        GGML_ASSERT(nt % ns == 0 && skip < nh && part < 3);
+
+        ggml_tensor * qkv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3*d*nh, nt);
+        ggml_set_param(qkv);
+        ggml_set_name(qkv, "qkv");
+
+        const size_t es = ggml_element_size(qkv);
+        ggml_tensor * heads = ggml_view_3d(ctx, qkv, d, nh, nt, d*es, qkv->nb[1], part*d*nh*es);
+        ggml_set_name(heads, "heads");
+
+        ggml_tensor * streams = ggml_view_4d(ctx, heads, d, nh - skip, nt/ns, ns,
+                heads->nb[1], heads->nb[2], heads->nb[2]*(nt/ns), skip*heads->nb[1]);
+        ggml_set_name(streams, "streams");
+
+        ggml_tensor * out = ggml_cont(ctx, ggml_permute(ctx, streams, 0, 2, 1, 3));
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_ADD
 // GGML_OP_SUB
 // GGML_OP_MUL
@@ -10863,6 +10910,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // source strides over 16 MB (24-bit DMA descriptor limit)
     test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {512, 8193, 2, 1}, false, {2, 1, 0, 3}));
     test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {256, 16385, 2, 1}, false, {0, 2, 1, 3}));
+
+    // retro delta: the backward of a view of a strided view
+    for (int64_t part : { 0, 1, 2 }) {
+        for (int64_t ns : { 1, 2 }) {
+            for (int64_t skip : { 0, 1 }) {
+                test_cases.emplace_back(new test_view_of_strided_view(8, 3, 6, ns, part, skip));
+            }
+        }
+    }
 
     auto add_test_bin_bcast = [&](ggml_type type, std::array<int64_t, 4> ne, std::array<int, 4> nr, bool perm1 = false, bool src_overlap = false) {
         for (auto op : {ggml_add, ggml_sub, ggml_mul, ggml_div}) {
