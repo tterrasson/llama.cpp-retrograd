@@ -2885,6 +2885,18 @@ extern "C" {
         struct ggml_cgraph  *  cgraph,
         struct ggml_tensor  ** grad_accs);
 
+    // retro delta: preflight query for ggml_build_backward_expand. Simulates the
+    // gradient propagation from `root` (the differentiated output, e.g. logits)
+    // down to the parameters and collects the nodes whose op has no gradient
+    // rule in ggml_compute_backward, i.e. the nodes that would make
+    // ggml_build_backward_expand abort. Writes up to n_out_max nodes into
+    // out_nodes and returns the total number of offending nodes.
+    GGML_API int ggml_graph_missing_backward_ops(
+        struct ggml_cgraph  *  cgraph,
+        struct ggml_tensor  *  root,
+        struct ggml_tensor  ** out_nodes,
+        int                    n_out_max);
+
     // graph allocation in a context
     GGML_API struct ggml_cgraph * ggml_new_graph       (struct ggml_context * ctx); // size = GGML_DEFAULT_GRAPH_SIZE, grads = false
     GGML_API struct ggml_cgraph * ggml_new_graph_custom(struct ggml_context * ctx, size_t size, bool grads);
