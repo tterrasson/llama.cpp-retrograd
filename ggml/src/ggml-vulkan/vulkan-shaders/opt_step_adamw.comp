@@ -7,11 +7,49 @@
 
 layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
 
-layout (binding = 0) buffer X {A_TYPE x[];};
-layout (binding = 1) readonly buffer G {A_TYPE grad[];};
-layout (binding = 2) buffer GM {A_TYPE gradm[];};
-layout (binding = 3) buffer GV {A_TYPE gradv[];};
-layout (binding = 4) readonly buffer P {float params[7];};
+layout (binding = 0) buffer X {X_TYPE x[];};
+layout (binding = 1) readonly buffer G {float grad[];};
+layout (binding = 2) buffer GM {float gradm[];};
+layout (binding = 3) buffer GV {float gradv[];};
+layout (binding = 4) readonly buffer P {float params[9];};
+
+#ifdef STOCHASTIC_ROUNDING
+// retro delta: mirrors ggml_sr_uniform / ggml_stochastic_round_f16 in
+// ggml-impl.h bit for bit -- an exact CPU-vs-GPU equality test covers both.
+float retro_sr_uniform(uint seed, uint index) {
+    uint h = seed ^ (index * 0x9E3779B9u);
+    h ^= h >> 16; h *= 0x7FEB352Du;
+    h ^= h >> 15; h *= 0x846CA68Bu;
+    h ^= h >> 16;
+    return float(h >> 8) * (1.0f / 16777216.0f);
+}
+
+uint retro_f16_neighbour(uint bits, bool up) {
+    const uint sign = bits & 0x8000u;
+    const uint mag  = bits & 0x7FFFu;
+    if (mag == 0u) {
+        return up ? 0x0001u : 0x8001u;
+    }
+    const bool grow = up ? (sign == 0u) : (sign != 0u);
+    return sign | (grow ? mag + 1u : mag - 1u);
+}
+
+// packHalf2x16/unpackHalf2x16 are the round-to-nearest F32<->F16 pair, and give
+// access to the raw F16 bits without needing 16-bit arithmetic support.
+float retro_stochastic_round_f16(float x, float u) {
+    const uint  nearest   = packHalf2x16(vec2(x, 0.0f)) & 0xFFFFu;
+    const float nearest_f = unpackHalf2x16(nearest).x;
+    const float residual  = x - nearest_f;
+    if (residual == 0.0f) {
+        return nearest_f;
+    }
+    const uint  other   = retro_f16_neighbour(nearest, residual > 0.0f);
+    const float other_f = unpackHalf2x16(other).x;
+    const float span    = other_f - nearest_f;
+    const float p = (span != 0.0f && !isinf(span)) ? residual / span : 0.0f;
+    return u < p ? other_f : nearest_f;
+}
+#endif
 
 void main() {
     const uint i = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
@@ -28,7 +66,7 @@ void main() {
     const float beta1h = params[5];
     const float beta2h = params[6];
 
-    const float gi = grad[i];
+    const float gi = grad[i]*params[8];
     const float gmi = gradm[i]*beta1 +    gi*(1.0f - beta1);
     const float gvi = gradv[i]*beta2 + gi*gi*(1.0f - beta2);
 
@@ -38,5 +76,10 @@ void main() {
     const float mh =      gmi*beta1h;
     const float vh = sqrt(gvi*beta2h) + eps;
 
-    x[i] = x[i]*(1.0f - alpha*wd) - alpha*mh/vh;
+    const float updated = float(x[i])*(1.0f - alpha*wd) - alpha*mh/vh;
+#ifdef STOCHASTIC_ROUNDING
+    x[i] = X_TYPE(retro_stochastic_round_f16(updated, retro_sr_uniform(uint(params[7]), i)));
+#else
+    x[i] = X_TYPE(updated);
+#endif
 }

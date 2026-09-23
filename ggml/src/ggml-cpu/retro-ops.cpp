@@ -310,3 +310,52 @@ void ggml_compute_forward_ssm_scan_back(
 
 // ---- F16 AdamW with stochastic rounding ----
 
+void ggml_compute_forward_opt_step_adamw_f16(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    ggml_tensor * w_tensor       = dst->src[0];
+    const ggml_tensor * g_tensor = dst->src[1];
+    ggml_tensor * m_tensor       = dst->src[2];
+    ggml_tensor * v_tensor       = dst->src[3];
+    const ggml_tensor * pars     = dst->src[4];
+
+    GGML_ASSERT(w_tensor->type == GGML_TYPE_F16);
+    GGML_ASSERT(g_tensor->type == GGML_TYPE_F32);
+    GGML_ASSERT(m_tensor->type == GGML_TYPE_F32);
+    GGML_ASSERT(v_tensor->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(w_tensor));
+    GGML_ASSERT(ggml_is_contiguous(g_tensor));
+    GGML_ASSERT(ggml_is_contiguous(m_tensor));
+    GGML_ASSERT(ggml_is_contiguous(v_tensor));
+    GGML_ASSERT(ggml_nelements(pars) == 9);
+
+    const int64_t n = ggml_nelements(w_tensor);
+    const int64_t chunk = (n + params->nth - 1) / params->nth;
+    const int64_t begin = chunk * params->ith;
+    const int64_t end = MIN(begin + chunk, n);
+    const float * p = ggml_get_data_f32(pars);
+    const float alpha = p[0];
+    const float beta1 = p[1];
+    const float beta2 = p[2];
+    const float eps = p[3];
+    const float keep = 1.0f - alpha * p[4];
+    const float beta1h = p[5];
+    const float beta2h = p[6];
+    const uint32_t seed = (uint32_t) p[7];
+    const float gscale = p[8];
+
+    ggml_fp16_t * w = static_cast<ggml_fp16_t *>(w_tensor->data);
+    const float * g = static_cast<const float *>(g_tensor->data);
+    float * m = static_cast<float *>(m_tensor->data);
+    float * v = static_cast<float *>(v_tensor->data);
+    for (int64_t i = begin; i < end; ++i) {
+        const float gi = g[i] * gscale;
+        m[i] = m[i] * beta1 + gi * (1.0f - beta1);
+        v[i] = v[i] * beta2 + gi * gi * (1.0f - beta2);
+        const float mh = m[i] * beta1h;
+        const float vh = sqrtf(v[i] * beta2h) + eps;
+        const float updated = ggml_fp16_to_fp32(w[i]) * keep - alpha * mh / vh;
+        w[i] = ggml_fp32_to_fp16(
+                ggml_stochastic_round_f16(updated, ggml_sr_uniform(seed, (uint32_t) i)));
+    }
+}
