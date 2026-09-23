@@ -76,6 +76,8 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-rir/ggml-rir.h" // retro delta: RIR policy and contract
+#include "ggml-cuda/rir/ggml-cuda-rir.h" // retro delta: RIR dispatch
 #include "ggml.h"
 
 #include <algorithm>
@@ -2116,6 +2118,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_ADD:
         case GGML_OP_ADD1: // TODO: more efficient implementation
+            // retro delta: the elementwise band under measurement.
+            // `observe` until the lane publishes a
+            // ratio, so this returns false today and the native kernel below
+            // runs — the site exists to *count*, which is what an observed pair
+            // is registered for. Reached only when `ggml_cuda_try_fuse` found
+            // nothing, so a fused chain never presents its nodes here.
+            if (dst->op == GGML_OP_ADD && ggml_cuda_rir_try(&ctx, dst)) {
+                break;
+            }
             ggml_cuda_op_add(ctx, dst);
             break;
         case GGML_OP_ADD_ID:
@@ -2128,12 +2139,34 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_acc(ctx, dst);
             break;
         case GGML_OP_MUL:
+            // retro delta: the elementwise band under measurement.
+            // `observe` until the lane publishes a
+            // ratio, so this returns false today and the native kernel below
+            // runs — the site exists to *count*, which is what an observed pair
+            // is registered for. Reached only when `ggml_cuda_try_fuse` found
+            // nothing, so a fused chain never presents its nodes here.
+            if (ggml_cuda_rir_try(&ctx, dst)) {
+                break;
+            }
             ggml_cuda_op_mul(ctx, dst);
             break;
         case GGML_OP_DIV:
             ggml_cuda_op_div(ctx, dst);
             break;
         case GGML_OP_UNARY:
+            // retro delta: the elementwise band under measurement.
+            // `observe` until the lane publishes a
+            // ratio, so this returns false today and the native kernel below
+            // runs — the site exists to *count*, which is what an observed pair
+            // is registered for. Reached only when `ggml_cuda_try_fuse` found
+            // nothing, so a fused chain never presents its nodes here.
+            //
+            // One site for the family, not one per member: the registry's
+            // `ggml_op_variant` is what selects the member's kernel, so this
+            // `if` is the same line the two other backends carry.
+            if (ggml_cuda_rir_try(&ctx, dst)) {
+                break;
+            }
             switch (ggml_get_unary_op(dst)) {
                 case GGML_UNARY_OP_ABS:
                     ggml_cuda_op_abs(ctx, dst);
@@ -2241,8 +2274,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_L2_NORM:
             ggml_cuda_op_l2_norm(ctx, dst);
             break;
+        // retro delta: no native kernel. Reached only
+        // when `ggml_cuda_try_fuse` found nothing, so the site is after the
+        // fusion test by construction — which changes nothing here,
+        // `L2_NORM_BACK` being in none of the fused patterns.
         case GGML_OP_L2_NORM_BACK:
-            ggml_cuda_op_l2_norm_back(ctx, dst);
+            ggml_cuda_rir_only(&ctx, dst);
             break;
         case GGML_OP_CONCAT:
             ggml_cuda_op_concat(ctx, dst);
@@ -2272,6 +2309,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_rms_norm(ctx, dst);
             break;
         case GGML_OP_RMS_NORM_BACK:
+            // retro delta: same chain. This pair
+            // publishes two lowerings arbitrated by `ncols`, and which one
+            // runs is the registry's answer, not this switch's.
+            if (ggml_cuda_rir_try(&ctx, dst)) {
+                break;
+            }
             ggml_cuda_op_rms_norm_back(ctx, dst);
             break;
         case GGML_OP_MUL_MAT:
@@ -2284,6 +2327,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_out_prod(ctx, dst);
             break;
         case GGML_OP_SCALE:
+            // retro delta: the elementwise band under measurement.
+            // `observe` until the lane publishes a
+            // ratio, so this returns false today and the native kernel below
+            // runs — the site exists to *count*, which is what an observed pair
+            // is registered for. Reached only when `ggml_cuda_try_fuse` found
+            // nothing, so a fused chain never presents its nodes here.
+            if (ggml_cuda_rir_try(&ctx, dst)) {
+                break;
+            }
             ggml_cuda_op_scale(ctx, dst);
             break;
         case GGML_OP_SQR:
@@ -4490,6 +4542,18 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
+    // retro delta: the RIR census and the `require` preflight, both at the top of
+    // graph_compute where the whole graph is in hand.
+    // The census is off unless RETRO_RIR_CENSUS asked for it; the preflight is a
+    // no-op outside `require`, and under it a graph carrying one ineligible
+    // targeted node fails here rather than silently running a native kernel.
+    if (!ggml_cuda_rir_graph_begin(cuda_ctx, cgraph)) {
+        char msg[256];
+        ggml_rir_violation_format(msg, sizeof(msg));
+        GGML_LOG_ERROR("%s: ggml-rir require: %s\n", __func__, msg);
+        return GGML_STATUS_FAILED;
+    }
+
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
@@ -5553,10 +5617,19 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_RMS_NORM:
         case GGML_OP_L2_NORM:
             return ggml_is_contiguous_rows(op->src[0]);
+        // retro delta: the union of the two domains. The
+        // native kernel remains for this pair — RIR is registered on it in
+        // `observe` and the measurement refused the promotion — so the
+        // answer ORs ggml's own condition with the portable half of the RIR
+        // contract.
         case GGML_OP_RMS_NORM_BACK:
+            return ggml_is_contiguous(op->src[0]) || ggml_rir_supports_op(RIR_BACKEND_CUDA, op);
+        // retro delta: no native kernel. The RIR contract
+        // **is** the domain of this op on CUDA, so it answers alone: a node
+        // it declines leaves this backend for the CPU instead of reaching a
+        // kernel that does not exist.
         case GGML_OP_L2_NORM_BACK:
-            return ggml_is_contiguous(op->src[0]);
-            break;
+            return ggml_rir_supports_op(RIR_BACKEND_CUDA, op);
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
         case GGML_OP_VIEW:

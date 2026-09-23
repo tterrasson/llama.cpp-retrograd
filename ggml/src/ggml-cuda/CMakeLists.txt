@@ -112,6 +112,14 @@ if (CUDAToolkit_FOUND)
     file(GLOB   SRCS "template-instances/mmf*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
 
+    # retro delta: the RIR-generated CUDA kernels and the one translation unit
+    # that tabulates their launch stubs. One unit per
+    # artifact, on the model of template-instances/ above: a kernel added to the
+    # registry lands here without a line being written, and nvcc recompiles it
+    # alone rather than the 20 000 lines of a backend source.
+    file(GLOB   SRCS "rir/*.cu")
+    list(APPEND GGML_SOURCES_CUDA ${SRCS})
+
     ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR} SRCS)
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
 
