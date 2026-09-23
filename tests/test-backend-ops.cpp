@@ -10966,6 +10966,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, { 201*1204, 1, 1, 1 }));
     test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, { 312*1205, 1, 1, 1 }));
     test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, { 20481, 4, 1, 1 }));
+    // retro delta: more than 128 rows of at least 256 columns - the regime the
+    // RIR strided scan claims. No case above has both.
+    test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, { 512, 16, 5, 4 }));
 
     test_cases.emplace_back(new test_xielu());
     test_cases.emplace_back(new test_xielu(GGML_TYPE_F16));
