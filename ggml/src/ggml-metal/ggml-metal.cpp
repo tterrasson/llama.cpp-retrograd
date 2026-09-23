@@ -244,6 +244,14 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
             {
                 res += ggml_metal_op_gated_delta_net_back_extra_tmp(tensor);
             } break;
+        case GGML_OP_CROSS_ENTROPY_LOSS: // retro delta
+            {
+                res += ggml_metal_op_cross_entropy_loss_extra_tmp(tensor);
+            } break;
+        case GGML_OP_FUSED_SPARSE_CE: // retro delta
+            {
+                res += ggml_metal_op_fused_sparse_ce_extra_tmp(tensor);
+            } break;
         case GGML_OP_CUMSUM:
         case GGML_OP_ARGSORT:
             {
