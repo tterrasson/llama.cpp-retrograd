@@ -717,6 +717,27 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t nc, ncs, nr, n_t, n_s;
 };
 
+struct vk_op_ssm_conv_back_push_constants {
+    uint32_t d_conv, ncs, d_inner, n_s, n_t;
+    uint32_t nb00, nb01, nb02;
+    uint32_t nb10, nb11;
+    uint32_t nb20, nb21, nb22;
+    uint32_t n_sx;
+};
+
+struct vk_op_ssm_scan_back_push_constants {
+    uint32_t d_state, head_dim, n_head, n_group, n_seq_tokens, n_seqs, n_A0;
+    uint32_t off_dt, off_A, off_B, off_C, off_s;
+    uint32_t nb00, nb01, nb02, nb03;
+    uint32_t nb10, nb11, nb12, nb13;
+    uint32_t nb20, nb21, nb22;
+    uint32_t nb30, nb31;
+    uint32_t nb40, nb41, nb42, nb43;
+    uint32_t nb50, nb51, nb52, nb53;
+    uint32_t nb60;
+    uint32_t tc, chunk_lo, chunk_hi;
+};
+
 struct vk_op_conv2d_push_constants {
     uint32_t Cout;
     uint32_t Cin;

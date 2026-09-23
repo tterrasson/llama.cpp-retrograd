@@ -1099,9 +1099,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "SSM_CONV_BACK",
+    "SSM_SCAN_BACK",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1214,9 +1217,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "ssm_conv_back(x)",
+    "ssm_scan_back(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5753,6 +5759,80 @@ struct ggml_tensor * ggml_ssm_scan(
     return result;
 }
 
+// ggml_ssm_conv_back
+
+struct ggml_tensor * ggml_ssm_conv_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * sx,
+        struct ggml_tensor  * c,
+        struct ggml_tensor  * dy) {
+    GGML_ASSERT(ggml_is_3d(sx));
+    GGML_ASSERT(ggml_is_matrix(c));
+
+    const int64_t d_conv  = c->ne[0];
+    const int64_t d_inner = c->ne[1];
+    const int64_t n_t     = sx->ne[0] - d_conv + 1; // tokens per sequence
+    const int64_t n_s     = sx->ne[2];
+
+    GGML_ASSERT(sx->ne[1] == d_inner);
+    GGML_ASSERT(dy->type == GGML_TYPE_F32);
+    // dy has the shape of the ssm_conv output: {d_inner, n_t, n_s}
+    GGML_ASSERT(ggml_nelements(dy) == d_inner*n_t*n_s);
+
+    // packed output: [ grad_sx (nelements(sx)) | grad_c (nelements(c)) ]
+    struct ggml_tensor * result =
+        ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ggml_nelements(sx) + ggml_nelements(c));
+
+    result->op     = GGML_OP_SSM_CONV_BACK;
+    result->src[0] = sx;
+    result->src[1] = c;
+    result->src[2] = dy;
+
+    return result;
+}
+
+// ggml_ssm_scan_back
+
+struct ggml_tensor * ggml_ssm_scan_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * s,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * dt,
+        struct ggml_tensor  * A,
+        struct ggml_tensor  * B,
+        struct ggml_tensor  * C,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * ds) {
+    GGML_ASSERT(ds->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(ds));
+    // ds must match the ssm_scan output size (y ++ final states)
+    GGML_ASSERT(ggml_nelements(ds) == ggml_nelements(x) + s->ne[0]*s->ne[1]*s->ne[2]*ids->ne[0]);
+
+    // packed output holding a gradient for each differentiable input:
+    // [ grad_x | grad_dt | grad_A | grad_B | grad_C | grad_s ]
+    const int64_t n_x  = ggml_nelements(x);
+    const int64_t n_dt = ggml_nelements(dt);
+    const int64_t n_A  = ggml_nelements(A);
+    const int64_t n_B  = ggml_nelements(B);
+    const int64_t n_C  = ggml_nelements(C);
+    const int64_t n_s  = ggml_nelements(s);
+
+    struct ggml_tensor * result =
+        ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_x + n_dt + n_A + n_B + n_C + n_s);
+
+    result->op     = GGML_OP_SSM_SCAN_BACK;
+    result->src[0] = s;
+    result->src[1] = x;
+    result->src[2] = dt;
+    result->src[3] = A;
+    result->src[4] = B;
+    result->src[5] = C;
+    result->src[6] = ids;
+    result->src[7] = ds;
+
+    return result;
+}
+
 // ggml_win_part
 
 struct ggml_tensor * ggml_win_part(
@@ -6706,6 +6786,12 @@ static void ggml_acc_or_set(
         const  size_t         offset) {
     struct ggml_tensor * src = cgraph->visited_hash_set.keys[isrc];
     GGML_ASSERT(src);
+    // ggml_acc reads the accumulated block (src1) contiguously; a non-contiguous
+    // gradient (e.g. coming from a transpose feeding a view) must be made
+    // contiguous first.
+    if (!ggml_is_contiguous(tensor)) {
+        tensor = ggml_cont(ctx, tensor);
+    }
     if (cgraph->grads[isrc]) {
         cgraph->grads[isrc] = ggml_acc_impl(ctx, cgraph->grads[isrc], tensor, nb1, nb2, nb3, offset, cgraph->grad_accs[isrc]);
     } else {
@@ -7247,6 +7333,82 @@ static void ggml_compute_backward(
                         __func__, ggml_unary_op_name(ggml_get_unary_op(tensor)));
                     GGML_ABORT("fatal error");
                 } //break;
+            }
+        } break;
+        case GGML_OP_CONCAT: {
+            const int dim = ggml_get_op_params_i32(tensor, 0);
+            GGML_ASSERT(dim >= 0 && dim < GGML_MAX_DIMS);
+            // the gradient of a concatenation is the corresponding slice of the output gradient
+            if (src0_needs_grads) {
+                struct ggml_tensor * g0 = ggml_view_4d(ctx, grad,
+                    src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                    grad->nb[1], grad->nb[2], grad->nb[3], 0);
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_cont(ctx, g0));
+            }
+            if (src1_needs_grads) {
+                struct ggml_tensor * g1 = ggml_view_4d(ctx, grad,
+                    src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+                    grad->nb[1], grad->nb[2], grad->nb[3], src0->ne[dim]*grad->nb[dim]);
+                ggml_add_or_set(ctx, cgraph, isrc1, ggml_cont(ctx, g1));
+            }
+        } break;
+        case GGML_OP_SSM_CONV: {
+            if (src0_needs_grads || src1_needs_grads) {
+                struct ggml_tensor * dback = ggml_ssm_conv_back(ctx, src0, src1, grad);
+                if (src0_needs_grads) {
+                    struct ggml_tensor * gsx = ggml_view_1d(ctx, dback, ggml_nelements(src0), 0);
+                    ggml_add_or_set(ctx, cgraph, isrc0, ggml_reshape(ctx, gsx, src0));
+                }
+                if (src1_needs_grads) {
+                    struct ggml_tensor * gc = ggml_view_1d(ctx, dback, ggml_nelements(src1),
+                        ggml_nelements(src0)*sizeof(float));
+                    ggml_add_or_set(ctx, cgraph, isrc1, ggml_reshape(ctx, gc, src1));
+                }
+            }
+        } break;
+        case GGML_OP_SSM_SCAN: {
+            struct ggml_tensor * s   = tensor->src[0];
+            struct ggml_tensor * x   = tensor->src[1];
+            struct ggml_tensor * dt  = tensor->src[2];
+            struct ggml_tensor * A   = tensor->src[3];
+            struct ggml_tensor * B   = tensor->src[4];
+            struct ggml_tensor * C   = tensor->src[5];
+            struct ggml_tensor * ids = tensor->src[6];
+
+            const size_t isrc3 = ggml_hash_find(hash_set, A);
+            const size_t isrc4 = ggml_hash_find(hash_set, B);
+            const size_t isrc5 = ggml_hash_find(hash_set, C);
+            const bool A_needs_grads = A && isrc3 != GGML_HASHSET_FULL && ggml_bitset_get(hash_set->used, isrc3) && grads_needed[isrc3];
+            const bool B_needs_grads = B && isrc4 != GGML_HASHSET_FULL && ggml_bitset_get(hash_set->used, isrc4) && grads_needed[isrc4];
+            const bool C_needs_grads = C && isrc5 != GGML_HASHSET_FULL && ggml_bitset_get(hash_set->used, isrc5) && grads_needed[isrc5];
+
+            if (src0_needs_grads || src1_needs_grads || src2_needs_grads || A_needs_grads || B_needs_grads || C_needs_grads) {
+                struct ggml_tensor * db = ggml_ssm_scan_back(ctx, s, x, dt, A, B, C, ids, grad);
+                // packed order: [ grad_x | grad_dt | grad_A | grad_B | grad_C | grad_s ]
+                size_t off = 0;
+                struct ggml_tensor * gx = ggml_view_1d(ctx, db, ggml_nelements(x), off);
+                if (src1_needs_grads) { ggml_add_or_set(ctx, cgraph, isrc1, ggml_reshape(ctx, gx, x)); }
+                off += ggml_nelements(x)*sizeof(float);
+
+                struct ggml_tensor * gdt = ggml_view_1d(ctx, db, ggml_nelements(dt), off);
+                if (src2_needs_grads) { ggml_add_or_set(ctx, cgraph, isrc2, ggml_reshape(ctx, gdt, dt)); }
+                off += ggml_nelements(dt)*sizeof(float);
+
+                struct ggml_tensor * gA = ggml_view_1d(ctx, db, ggml_nelements(A), off);
+                if (A_needs_grads) { ggml_add_or_set(ctx, cgraph, isrc3, ggml_reshape(ctx, gA, A)); }
+                off += ggml_nelements(A)*sizeof(float);
+
+                struct ggml_tensor * gB = ggml_view_1d(ctx, db, ggml_nelements(B), off);
+                if (B_needs_grads) { ggml_add_or_set(ctx, cgraph, isrc4, ggml_reshape(ctx, gB, B)); }
+                off += ggml_nelements(B)*sizeof(float);
+
+                struct ggml_tensor * gC = ggml_view_1d(ctx, db, ggml_nelements(C), off);
+                if (C_needs_grads) { ggml_add_or_set(ctx, cgraph, isrc5, ggml_reshape(ctx, gC, C)); }
+                off += ggml_nelements(C)*sizeof(float);
+
+                struct ggml_tensor * gs = ggml_view_1d(ctx, db, ggml_nelements(s), off);
+                if (src0_needs_grads) { ggml_add_or_set(ctx, cgraph, isrc0, ggml_reshape(ctx, gs, s)); }
+                off += ggml_nelements(s)*sizeof(float);
             }
         } break;
         case GGML_OP_CROSS_ENTROPY_LOSS: {
