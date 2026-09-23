@@ -1,0 +1,64 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// Backward of ssm_conv (a depthwise causal 1D conv). One thread per element of
+// the packed output [ grad_sx (ncs*d_inner*n_s) | grad_c (d_conv*d_inner) ];
+// every element is an independent reduction, so no cross-thread accumulation.
+//   grad_sx[j,ch,s] = Sum_{valid k} dy[ch, j-k, s] * c[k, ch]
+//   grad_c[k,ch]    = Sum_{t,s}     dy[ch, t,   s] * sx[k+t, ch, s]
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint d_conv; uint ncs; uint d_inner; uint n_s; uint n_t;
+    uint nb00; uint nb01; uint nb02;   // sx  strides (element units)
+    uint nb10; uint nb11;              // c   strides
+    uint nb20; uint nb21; uint nb22;   // dy  strides
+    uint n_sx;                         // ncs * d_inner * n_s
+} p;
+
+layout(binding = 0) readonly  buffer Sx {float data_sx[];};
+layout(binding = 1) readonly  buffer C  {float data_c[];};
+layout(binding = 2) readonly  buffer Dy {float data_dy[];};
+layout(binding = 3) writeonly buffer D  {float data_d[];};
+
+void main() {
+    const uint gid = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+    const uint total = p.n_sx + p.d_conv * p.d_inner;
+    if (gid >= total) {
+        return;
+    }
+
+    if (gid < p.n_sx) {
+        uint r = gid;
+        const uint j  = r % p.ncs; r /= p.ncs;
+        const uint ch = r % p.d_inner;
+        const uint s  = r / p.d_inner;
+
+        const uint kmin = j >= p.n_t ? j - (p.n_t - 1u) : 0u;
+        const uint kmax = min(j, p.d_conv - 1u);
+        float acc = 0.0f;
+        for (uint k = kmin; k <= kmax; ++k) {
+            const uint t = j - k;
+            const float dyv = data_dy[ch * p.nb20 + t * p.nb21 + s * p.nb22];
+            const float cv  = data_c[k * p.nb10 + ch * p.nb11];
+            acc += dyv * cv;
+        }
+        data_d[gid] = acc;
+        return;
+    }
+
+    uint r = gid - p.n_sx;
+    const uint k  = r % p.d_conv;
+    const uint ch = r / p.d_conv;
+    float acc = 0.0f;
+    for (uint s = 0; s < p.n_s; ++s) {
+        for (uint t = 0; t < p.n_t; ++t) {
+            const float sxv = data_sx[(k + t) * p.nb00 + ch * p.nb01 + s * p.nb02];
+            const float dyv = data_dy[ch * p.nb20 + t * p.nb21 + s * p.nb22];
+            acc += dyv * sxv;
+        }
+    }
+    data_d[gid] = acc;
+}
