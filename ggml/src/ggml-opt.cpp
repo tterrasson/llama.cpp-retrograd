@@ -622,6 +622,27 @@ struct ggml_tensor * ggml_opt_loss(ggml_opt_context_t opt_ctx) {
     return opt_ctx->loss;
 }
 
+void ggml_opt_set_loss_active_rows(ggml_opt_context_t opt_ctx, int32_t n_active_rows) {
+    opt_ctx->loss->op_params[0] = n_active_rows;
+    opt_ctx->loss->op_params[1] = 1;
+    for (int i = 0; i < opt_ctx->gb_grad->n_nodes; ++i) {
+        ggml_tensor * node = opt_ctx->gb_grad->nodes[i];
+        if (node->op == GGML_OP_CROSS_ENTROPY_LOSS || node->op == GGML_OP_CROSS_ENTROPY_LOSS_BACK) {
+            node->op_params[0] = n_active_rows;
+            node->op_params[1] = 1;
+        }
+    }
+    if (opt_ctx->gb_opt) {
+        for (int i = 0; i < opt_ctx->gb_opt->n_nodes; ++i) {
+            ggml_tensor * node = opt_ctx->gb_opt->nodes[i];
+            if (node->op == GGML_OP_CROSS_ENTROPY_LOSS || node->op == GGML_OP_CROSS_ENTROPY_LOSS_BACK) {
+                node->op_params[0] = n_active_rows;
+                node->op_params[1] = 1;
+            }
+        }
+    }
+}
+
 struct ggml_tensor * ggml_opt_pred(ggml_opt_context_t opt_ctx) {
     return opt_ctx->pred;
 }
