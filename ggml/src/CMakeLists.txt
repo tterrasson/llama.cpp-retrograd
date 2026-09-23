@@ -206,6 +206,11 @@ add_library(ggml-base
             ggml-threading.h
             ggml-quants.c
             ggml-quants.h
+            ggml-rir/rir_registry.h
+            ggml-rir/rir_registry.cpp
+            ggml-rir/rir_kernel_params.h
+            ggml-rir/ggml-rir.h
+            ggml-rir/ggml-rir.cpp
             gguf.cpp)
 
 set_target_properties(ggml-base PROPERTIES
