@@ -376,6 +376,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_gated_delta_net(ctx, idx);
             } break;
+        case GGML_OP_GATED_DELTA_NET_BACK: // retro delta
+            {
+                n_fuse = ggml_metal_op_gated_delta_net_back(ctx, idx);
+            } break;
         case GGML_OP_SOLVE_TRI:
             {
                 n_fuse = ggml_metal_op_solve_tri(ctx, idx);
@@ -523,6 +527,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
         case GGML_OP_RMS_NORM_BACK: // retro delta
             {
                 n_fuse = ggml_metal_op_rms_norm_back(ctx, idx);
+            } break;
+        case GGML_OP_L2_NORM_BACK: // retro delta
+            {
+                n_fuse = ggml_metal_op_l2_norm_back(ctx, idx);
             } break;
         case GGML_OP_OUT_PROD: // retro delta
             {
@@ -5918,6 +5926,49 @@ int ggml_metal_op_rms_norm_back(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// retro delta: L2-norm backward. One threadgroup per row; mirrors
+// ggml_metal_op_rms_norm_back's dispatch.
+int ggml_metal_op_l2_norm_back(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
+    GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
+    GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
+
+    float eps;
+    memcpy(&eps, op->op_params, sizeof(float));
+
+    auto pipeline = ggml_metal_library_get_pipeline_l2_norm_back(lib, op);
+
+    ggml_metal_kargs_l2_norm_back args = {
+        /*.ne00 =*/ ne00,
+        /*.eps  =*/ eps,
+        /*.nb01 =*/ nb01, /*.nb02 =*/ nb02, /*.nb03 =*/ nb03,
+        /*.nb11 =*/ nb11, /*.nb12 =*/ nb12, /*.nb13 =*/ nb13,
+        /*.nb1  =*/ nb1,  /*.nb2  =*/ nb2,  /*.nb3  =*/ nb3,
+    };
+
+    int nth = 32;
+    while (nth < ne00 && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
+        nth *= 2;
+    }
+    nth = std::min(nth, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
+
+    return 1;
+}
+
 // retro delta: repeat backward -- reduce a broadcast input's gradient back onto
 // its own shape. Same argument layout as the forward repeat, so it reuses that
 // op's kargs struct: the two are exact duals, src0 and dst simply swap roles.
@@ -6160,6 +6211,140 @@ int ggml_metal_op_ssm_scan_back(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ids), 7);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ds),  8);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),  9);
+    ggml_metal_encoder_dispatch_threadgroups(enc, n, 1, 1, nth, 1, 1);
+
+    return 1;
+}
+
+// retro delta: analytic backward for GATED_DELTA_NET (Qwen3-Next / KDA),
+// mirroring the CPU reference (ggml-cpu/ops.cpp) and the CUDA/Vulkan ports.
+// Single dispatch over a (column block, (head, sequence) unit) grid: each
+// threadgroup recomputes its own columns of the S_prev trajectory into scratch
+// appended after the packed destination, then reverse-scans them. Outputs that
+// several threadgroups reach - grad_q/grad_k under GQA broadcast, grad_g and
+// grad_beta across column blocks - use device atomics (see the kernel), so the
+// destination is zero-filled first. The scratch stays per unit: column blocks
+// take disjoint slices of it, so splitting does not enlarge it.
+size_t ggml_metal_op_gated_delta_net_back_extra_tmp(const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_GATED_DELTA_NET_BACK);
+
+    const ggml_tensor * v = op->src[2];
+    const int64_t S_v      = v->ne[0];
+    const int64_t H        = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+    const int64_t SS = S_v*S_v;
+
+    const int64_t per_thread = n_tokens*SS + 4*SS + 5*S_v;
+    return sizeof(float)*per_thread*H*n_seqs;
+}
+
+// How many of the state's S_v columns one threadgroup owns. The grid carries
+// ceil(S_v/GDN_BACK_COLS) column blocks per (head, sequence) unit, because the
+// unit axis alone (H*n_seqs threadgroups) is far below occupancy for a
+// n_tokens-step dependent chain.
+//
+// Four is measured, not derived. On Apple M5 at Qwen3.5's shape (S_v=128,
+// H=16, 512 tokens), tests/metal_ops.rs gated_delta_net_back_metal_timing
+// reads, per launch:
+//
+//     columns per block  128     64     32     16      8      4      2
+//     one sequence      80.6   67.6   66.1   51.2   47.0   45.3   53.5  ms
+//     four sequences       -  244.6  244.0  199.9  186.7  184.5  215.7  ms
+//
+// The two rows have the same optimum although their grids differ by 4x, hence
+// a block width rather than a target threadgroup count. Wider than four:
+// threadgroup size dominates - it crosses a dozen barriers per token. Narrower:
+// the per-token vectors indexed by the row axis (k, q and the gate) are re-read
+// in full by every block, and at two columns they cost more than the extra
+// parallelism buys. The one-sequence row is the binding shape in training,
+// since micro-batches of one sequence are the norm.
+static constexpr int64_t GDN_BACK_COLS = 4;
+
+int ggml_metal_op_gated_delta_net_back(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * src_q     = op->src[0];
+    const ggml_tensor * src_k     = op->src[1];
+    const ggml_tensor * src_v     = op->src[2];
+    const ggml_tensor * src_g     = op->src[3];
+    const ggml_tensor * src_beta  = op->src[4];
+
+    const int32_t S_v      = (int32_t) src_v->ne[0];
+    const int32_t H        = (int32_t) src_v->ne[1];
+    const int32_t n_tokens = (int32_t) src_v->ne[2];
+    const int32_t n_seqs   = (int32_t) src_v->ne[3];
+    const int32_t K        = ggml_get_op_params_i32(op, 0);
+    const int32_t kda      = (src_g->ne[0] == S_v) ? 1 : 0;
+
+    const int32_t neq1 = (int32_t) src_q->ne[1];
+    const int32_t nek1 = (int32_t) src_k->ne[1];
+    const int32_t rq3  = (int32_t) (n_seqs / src_q->ne[3]);
+    const int32_t rk3  = (int32_t) (n_seqs / src_k->ne[3]);
+
+    const float scale = 1.0f / sqrtf((float) S_v);
+
+    const int64_t ncols        = std::min<int64_t>(S_v, GDN_BACK_COLS);
+    const int64_t n_col_blocks = (S_v + ncols - 1)/ncols;
+
+    ggml_metal_kargs_gated_delta_net_back args = {
+        /*.S_v      =*/ S_v,
+        /*.H        =*/ H,
+        /*.n_tokens =*/ n_tokens,
+        /*.n_seqs   =*/ n_seqs,
+        /*.K        =*/ K,
+        /*.neq1     =*/ neq1,
+        /*.nek1     =*/ nek1,
+        /*.rq3      =*/ rq3,
+        /*.rk3      =*/ rk3,
+        /*.sq1 =*/ (int32_t) (src_q->nb[1]/sizeof(float)),
+        /*.sq2 =*/ (int32_t) (src_q->nb[2]/sizeof(float)),
+        /*.sq3 =*/ (int32_t) (src_q->nb[3]/sizeof(float)),
+        /*.sk1 =*/ (int32_t) (src_k->nb[1]/sizeof(float)),
+        /*.sk2 =*/ (int32_t) (src_k->nb[2]/sizeof(float)),
+        /*.sk3 =*/ (int32_t) (src_k->nb[3]/sizeof(float)),
+        /*.sv1 =*/ (int32_t) (src_v->nb[1]/sizeof(float)),
+        /*.sv2 =*/ (int32_t) (src_v->nb[2]/sizeof(float)),
+        /*.sv3 =*/ (int32_t) (src_v->nb[3]/sizeof(float)),
+        /*.sb1 =*/ (int32_t) (src_beta->nb[1]/sizeof(float)),
+        /*.sb2 =*/ (int32_t) (src_beta->nb[2]/sizeof(float)),
+        /*.sb3 =*/ (int32_t) (src_beta->nb[3]/sizeof(float)),
+        /*.kda      =*/ kda,
+        /*.ncols    =*/ (int32_t) ncols,
+        /*.scale    =*/ scale,
+    };
+
+    ggml_metal_op_retro_fill_zero(ctx, op);
+
+    ggml_metal_buffer_id bid_dst     = ggml_metal_get_buffer_id(op);
+    ggml_metal_buffer_id bid_scratch = bid_dst;
+    bid_scratch.offs += ggml_nbytes(op);
+
+    auto pipeline = ggml_metal_library_get_pipeline_gated_delta_net_back(lib, op);
+    // One SIMD group per column of the block: that is how the reductions over
+    // the contiguous row axis are written. A pipeline that cannot host that
+    // many threads gets fewer groups than columns, which the kernel's loops
+    // already stride for.
+    const int nth = (int) std::min<int64_t>(
+            ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), 32*ncols);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1); // q
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2); // k
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2]), 3); // v
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[3]), 4); // g
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[4]), 5); // beta
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[5]), 6); // state
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[6]), 7); // grad
+    ggml_metal_encoder_set_buffer  (enc, bid_dst,                              8);
+    ggml_metal_encoder_set_buffer  (enc, bid_scratch,                          9);
+
+    const int64_t total = (int64_t) H*n_seqs;
+    const int64_t n = (total + nth - 1)/nth;
     ggml_metal_encoder_dispatch_threadgroups(enc, n, 1, 1, nth, 1, 1);
 
     return 1;

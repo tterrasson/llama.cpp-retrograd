@@ -716,6 +716,21 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t K;
 };
 
+// retro delta: analytic backward for GATED_DELTA_NET (gated_delta_net_back.comp).
+struct vk_op_gated_delta_net_back_push_constants {
+    uint32_t S_v, H, n_tokens, n_seqs, K;
+    uint32_t neq1, nek1, rq3, rk3;
+    uint32_t sq1, sq2, sq3;
+    uint32_t sk1, sk2, sk3;
+    uint32_t sv1, sv2, sv3;
+    uint32_t sb1, sb2, sb3;
+    uint32_t kda;
+    float scale;
+    // Used only by the chunkwise variant. Zeroes are valid for the sequential
+    // pipeline and keep both variants on one descriptor/push-constant ABI.
+    uint32_t C, n_chunks, per_unit;
+};
+
 struct vk_op_ssm_scan_push_constants {
     uint32_t nb02, nb03, nb12, nb13;
     uint32_t nb21, nb22, nb31;

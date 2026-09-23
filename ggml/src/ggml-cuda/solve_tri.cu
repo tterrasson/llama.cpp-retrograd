@@ -41,6 +41,7 @@ static void solve_tri_f32_cublas(ggml_backend_cuda_context & ctx,
                                  size_t                      s13,
                                  size_t                      s2,
                                  size_t                      s3,
+                                 bool                        lower,
                                  cudaStream_t                stream) {
     const float   alpha         = 1.0f;
     const int64_t total_batches = ne02 * ne03;
@@ -67,7 +68,12 @@ static void solve_tri_f32_cublas(ggml_backend_cuda_context & ctx,
 
     // Yes, this is necessary, without this we get RMSE errors
     CUBLAS_CHECK(cublasSetMathMode(ctx.cublas_handle(), CUBLAS_DEFAULT_MATH));
-    CUBLAS_CHECK(cublasStrsmBatched(ctx.cublas_handle(), CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_N,
+    // cuBLAS is column-major, so our row-major A buffer reads as A^T to it:
+    // a ggml-lower A (A^T upper) needs FILL_MODE_UPPER here; a ggml-upper A
+    // (A^T lower, the GATED_DELTA_NET backward's transposed solve) flips to
+    // FILL_MODE_LOWER.
+    const cublasFillMode_t fill_mode = lower ? CUBLAS_FILL_MODE_UPPER : CUBLAS_FILL_MODE_LOWER;
+    CUBLAS_CHECK(cublasStrsmBatched(ctx.cublas_handle(), CUBLAS_SIDE_RIGHT, fill_mode, CUBLAS_OP_N,
                                     CUBLAS_DIAG_NON_UNIT, k, n, &alpha, A_ptrs_dev, n, X_ptrs_dev, k, total_batches));
 
     // revert to standard mode from common.cuh
@@ -259,7 +265,14 @@ void ggml_cuda_op_solve_tri(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const int64_t ne02 = src0->ne[2];
     const int64_t ne03 = src0->ne[3];
 
-    if (n <= MAX_N_FAST && k <= MAX_K_FAST) {
+    // retro delta: op_params[0] selects lower (upstream default, forward
+    // substitution) vs upper (back substitution, used by the GATED_DELTA_NET
+    // backward pass's A^T solve). The warp-parallel fast kernel below only
+    // implements forward substitution, so the upper case always takes the
+    // cuBLAS path, which handles both via the FILL_MODE flip.
+    const bool lower = ggml_get_op_params_i32(dst, 0) != 0;
+
+    if (lower && n <= MAX_N_FAST && k <= MAX_K_FAST) {
         solve_tri_f32_cuda((const float *) src0->data, (const float *) src1->data, (float *) dst->data, n, k,
                            src0->ne[2], src0->ne[3], src0->nb[2] / sizeof(float), src0->nb[3] / sizeof(float),
                            src1->nb[2] / sizeof(float), src1->nb[3] / sizeof(float), dst->nb[2] / sizeof(float),
@@ -268,6 +281,6 @@ void ggml_cuda_op_solve_tri(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         solve_tri_f32_cublas(ctx, (const float *) src0->data, (const float *) src1->data, (float *) dst->data, n, k,
                              ne02, ne03, src0->nb[2] / sizeof(float), src0->nb[3] / sizeof(float),
                              src1->nb[2] / sizeof(float), src1->nb[3] / sizeof(float), dst->nb[2] / sizeof(float),
-                             dst->nb[3] / sizeof(float), ctx.stream());
+                             dst->nb[3] / sizeof(float), lower, ctx.stream());
     }
 }

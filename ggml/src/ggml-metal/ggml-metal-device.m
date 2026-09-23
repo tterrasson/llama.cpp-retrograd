@@ -1949,6 +1949,15 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return true;
         case GGML_OP_GATED_DELTA_NET:
             return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
+        case GGML_OP_GATED_DELTA_NET_BACK:
+            // retro delta: reference kernel (kernel_gated_delta_net_back_f32),
+            // contiguous F32 inputs (see ggml_gated_delta_net_back's asserts).
+            for (int i = 0; i < 7; i++) {
+                if (op->src[i] == NULL || op->src[i]->type != GGML_TYPE_F32) {
+                    return false;
+                }
+            }
+            return op->type == GGML_TYPE_F32;
         case GGML_OP_SOLVE_TRI:
             return has_simdgroup_reduction && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_MUL_MAT:
@@ -2075,6 +2084,17 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         // retro delta: the two backward reductions with no native Metal kernel.
         // same shape; needs simdgroup reductions. Else falls back to CPU.
         case GGML_OP_RMS_NORM_BACK:
+            return has_simdgroup_reduction &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->type         == GGML_TYPE_F32 &&
+                   op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
+                   op->src[1]->nb[0] == ggml_type_size(op->src[1]->type) &&
+                   ggml_are_same_shape(op->src[0], op->src[1]) &&
+                   ggml_are_same_shape(op->src[0], op);
+        // retro delta: L2-norm backward (Qwen3.5 gated delta net k/q
+        // normalization). Same layout contract as RMS-norm backward.
+        case GGML_OP_L2_NORM_BACK:
             return has_simdgroup_reduction &&
                    op->src[0]->type == GGML_TYPE_F32 &&
                    op->src[1]->type == GGML_TYPE_F32 &&

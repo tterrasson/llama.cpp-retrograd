@@ -1019,6 +1019,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "RMS_NORM_BACK",
     "GROUP_NORM",
     "L2_NORM",
+    "L2_NORM_BACK",
 
     "MUL_MAT",
     "MUL_MAT_ID",
@@ -1103,11 +1104,13 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SSM_CONV_BACK",
     "SSM_SCAN_BACK",
 
+    "GATED_DELTA_NET_BACK",
+
     "FUSED_SPARSE_CE",
     "FUSED_SPARSE_CE_BACK",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1140,6 +1143,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "rms_norm_back(x)",
     "group_norm(x)",
     "l2_norm(x)",
+    "l2_norm_back(x)",
 
     "X*Y",
     "X[i]*Y",
@@ -1224,11 +1228,13 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "ssm_conv_back(x)",
     "ssm_scan_back(x)",
 
+    "gated_delta_net_back(q, k, v, g, beta, s, grad)",
+
     "fused_sparse_ce(h,w)",
     "fused_sparse_ce_back(h,w)",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3287,6 +3293,23 @@ struct ggml_tensor * ggml_l2_norm_inplace(
         struct ggml_tensor  * a,
         float                 eps) {
     return ggml_l2_norm_impl(ctx, a, eps, true);
+}
+
+// retro delta: analytic backward for ggml_l2_norm
+struct ggml_tensor * ggml_l2_norm_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        float                 eps) {
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+
+    ggml_set_op_params(result, &eps, sizeof(eps));
+
+    result->op     = GGML_OP_L2_NORM_BACK;
+    result->src[0] = a;
+    result->src[1] = b;
+
+    return result;
 }
 
 // ggml_prec
@@ -6623,9 +6646,14 @@ struct ggml_tensor * ggml_solve_tri(
     GGML_ASSERT(ggml_is_contiguous(a));
     GGML_ASSERT(ggml_is_contiguous(b));
 
-    GGML_ASSERT(lower && left && !uni); // TODO: support other variants
+    GGML_ASSERT(left && !uni); // TODO: support other variants
+    // retro delta: lower==false (back-substitution against an upper triangular
+    // `a`) is used by the GATED_DELTA_NET backward pass to solve A^T against a
+    // gradient. See ggml_compute_backward's GGML_OP_SOLVE_TRI case.
 
     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, b->ne[0], b->ne[1], b->ne[2], b->ne[3]);
+
+    ggml_set_op_params_i32(result, 0, lower ? 1 : 0);
 
     result->op     = GGML_OP_SOLVE_TRI;
     result->src[0] = a;
@@ -6687,6 +6715,65 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+
+    return result;
+}
+
+// ggml_gated_delta_net_back
+
+struct ggml_tensor * ggml_gated_delta_net_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * grad,
+        int64_t               K) {
+    return ggml_gated_delta_net_back_chunked(ctx, q, k, v, g, beta, state, grad, K, 0);
+}
+
+struct ggml_tensor * ggml_gated_delta_net_back_chunked(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * grad,
+        int64_t               K,
+        int32_t               chunk) {
+    GGML_ASSERT(grad->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(grad));
+    GGML_ASSERT(K >= 1);
+    // grad must match the gated_delta_net output size (attn scores ++ K state snapshots)
+    GGML_ASSERT(ggml_nelements(grad) == ggml_nelements(v) + K*state->ne[0]*state->ne[1]*state->ne[2]*state->ne[3]);
+
+    // packed output holding a gradient for each differentiable input:
+    // [ grad_q | grad_k | grad_v | grad_g | grad_beta | grad_state ]
+    const int64_t n_q    = ggml_nelements(q);
+    const int64_t n_k    = ggml_nelements(k);
+    const int64_t n_v    = ggml_nelements(v);
+    const int64_t n_g    = ggml_nelements(g);
+    const int64_t n_beta = ggml_nelements(beta);
+    const int64_t n_s    = ggml_nelements(state);
+
+    struct ggml_tensor * result =
+        ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_q + n_k + n_v + n_g + n_beta + n_s);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) K);
+    ggml_set_op_params_i32(result, 1, chunk);
+
+    result->op     = GGML_OP_GATED_DELTA_NET_BACK;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = state;
+    result->src[6] = grad;
 
     return result;
 }
@@ -6992,10 +7079,11 @@ static void ggml_acc_or_set(
         // stored in F16 (notably the differentiable training KV cache).
         // ggml_acc only accepts F32 operands, so promote the zero initializer
         // instead of inheriting the activation's storage type.
-        struct ggml_tensor * a_zero = src->type == GGML_TYPE_F32
-                ? ggml_scale(ctx, src, 0.0f)
-                : ggml_fill(ctx,
-                        ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, src->ne), 0.0f);
+        // retro delta: views in the unfused delta-net graph can have non-padded
+        // strides, which SCALE rejects. A gradient initializer only needs the
+        // shape, not the activation's data or layout (nor any NaNs it contains).
+        struct ggml_tensor * a_zero = ggml_fill(ctx,
+                ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, src->ne), 0.0f);
         cgraph->grads[isrc] = ggml_acc_impl(ctx, a_zero, tensor, nb1, nb2, nb3, offset, false);
     }
     ggml_format_name(cgraph->grads[isrc], "grad for %s", cgraph->visited_hash_set.keys[isrc]->name);
@@ -7113,7 +7201,14 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc0, grad);
             }
             if (src1_needs_grads) {
-                ggml_sub_or_set(ctx, cgraph, isrc1, grad);
+                // retro delta: SUB broadcasts its right operand just like ADD.
+                // Delta-net's chunk decay subtracts one gate from a full chunk;
+                // its gradient must sum those uses back to the operand's shape.
+                struct ggml_tensor * tmp = grad;
+                if (!ggml_are_same_shape(src0, src1)) {
+                    tmp = ggml_repeat_back(ctx, tmp, src1);
+                }
+                ggml_sub_or_set(ctx, cgraph, isrc1, tmp);
             }
         } break;
         case GGML_OP_MUL: {
@@ -7200,6 +7295,15 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_rms_norm_back(ctx, grad, src0, eps));
             }
         } break;
+        // retro delta: analytic backward for GGML_OP_L2_NORM (Qwen3.5 gated
+        // delta net k/q normalization).
+        case GGML_OP_L2_NORM: {
+            if (src0_needs_grads) {
+                float eps;
+                memcpy(&eps, tensor->op_params, sizeof(float));
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_l2_norm_back(ctx, grad, src0, eps));
+            }
+        } break;
         case GGML_OP_MUL_MAT: {
             // https://cs231n.github.io/optimization-2/#staged
             // # forward pass
@@ -7257,7 +7361,10 @@ static void ggml_compute_backward(
             if (src0_needs_grads) {
                 float s;
                 memcpy(&s, tensor->op_params, sizeof(float));
-                ggml_add_or_set(ctx, cgraph, isrc0, ggml_scale_impl(ctx, grad, s, 0.0, false));
+                // retro delta: a downstream PERMUTE can return a strided
+                // gradient even though SCALE's forward input was contiguous.
+                struct ggml_tensor * grad_padded = ggml_is_padded_1d(grad) ? grad : ggml_cont(ctx, grad);
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_scale_impl(ctx, grad_padded, s, 0.0, false));
             }
         } break;
         case GGML_OP_SET: {
@@ -7608,6 +7715,15 @@ static void ggml_compute_backward(
                         ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad, ggml_sigmoid(ctx, src0)));
                     }
                 } break;
+                case GGML_UNARY_OP_SIGMOID: {
+                    if (src0_needs_grads) {
+                        // d/dx sigmoid(x) = sigmoid(x)*(1-sigmoid(x)); reuse the
+                        // forward result instead of evaluating sigmoid again.
+                        struct ggml_tensor * one_minus = ggml_scale_bias(ctx, tensor, -1.0f, 1.0f);
+                        ggml_add_or_set(ctx, cgraph, isrc0,
+                                ggml_mul(ctx, grad, ggml_mul(ctx, tensor, one_minus)));
+                    }
+                } break;
                 default: {
                     fprintf(stderr, "%s: unsupported unary op for backward pass: %s\n",
                         __func__, ggml_unary_op_name(ggml_get_unary_op(tensor)));
@@ -7630,6 +7746,118 @@ static void ggml_compute_backward(
                     src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
                     grad->nb[1], grad->nb[2], grad->nb[3], src0->ne[dim]*grad->nb[dim]);
                 ggml_add_or_set(ctx, cgraph, isrc1, ggml_cont(ctx, g1));
+            }
+        } break;
+        case GGML_OP_PAD: {
+            // retro delta: ggml_pad only ever zero-pads on the trailing side of
+            // each dim (ggml_pad_ext's lp* args are always 0 from the public
+            // ggml_pad wrapper, but read them anyway for correctness with
+            // ggml_pad_ext callers). The gradient of a zero pad is the
+            // corresponding crop of the output gradient; the padded region
+            // contributes nothing.
+            if (src0_needs_grads) {
+                const bool circular = ggml_get_op_params_i32(tensor, 8) != 0;
+                GGML_ASSERT(!circular && "backward pass for circular padding is not implemented");
+                const int32_t lp0 = ggml_get_op_params_i32(tensor, 0);
+                const int32_t lp1 = ggml_get_op_params_i32(tensor, 2);
+                const int32_t lp2 = ggml_get_op_params_i32(tensor, 4);
+                const int32_t lp3 = ggml_get_op_params_i32(tensor, 6);
+                struct ggml_tensor * cropped = ggml_view_4d(ctx, grad,
+                    src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                    grad->nb[1], grad->nb[2], grad->nb[3],
+                    lp0*grad->nb[0] + lp1*grad->nb[1] + lp2*grad->nb[2] + lp3*grad->nb[3]);
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_cont(ctx, cropped));
+            }
+        } break;
+        case GGML_OP_TRI: {
+            // retro delta: tri zeroes everything outside a fixed (value-
+            // independent) mask, so it's linear in src0 and its own backward
+            // is the same mask applied to the incoming gradient.
+            if (src0_needs_grads) {
+                const enum ggml_tri_type ttype = (enum ggml_tri_type) ggml_get_op_params_i32(tensor, 0);
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_tri(ctx, grad, ttype));
+            }
+        } break;
+        case GGML_OP_FILL: {
+            // retro delta: output is the constant op param, independent of
+            // src0's values (src0 only supplies shape/dtype) — no gradient
+            // flows back through it. Kept in sync with the ignore_src marking
+            // in ggml_build_backward_expand / ggml_backward_ignored_srcs.
+        } break;
+        case GGML_OP_CUMSUM: {
+            // retro delta: cumsum is a linear op (dst[i] = sum_{j<=i} src[j]);
+            // its VJP is the reverse cumsum of the incoming gradient:
+            //   rev_cumsum(g)[i] = sum_{j>=i} g[j] = sum(g) - (cumsum(g)[i] - g[i])
+            // composed entirely from ops that already have CPU/CUDA kernels
+            // (cumsum is reused forward here, not differentiated).
+            if (src0_needs_grads) {
+                struct ggml_tensor * excl  = ggml_sub(ctx, ggml_cumsum(ctx, grad), grad);
+                struct ggml_tensor * total = ggml_sum_rows(ctx, grad);
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_sub(ctx, total, excl));
+            }
+        } break;
+        case GGML_OP_SOLVE_TRI: {
+            // retro delta: tensor = X solves A X = B (A n x n lower triangular,
+            // non-unit diagonal; see ggml_solve_tri). Standard triangular-solve
+            // adjoint:
+            //   dB = A^-T Ḡ         (solved via the op's upper/back-substitution
+            //                        branch, passing A^T as the coefficient)
+            //   dA = -dB @ X^T, masked to the lower triangle A actually reads
+            if (src0_needs_grads || src1_needs_grads) {
+                struct ggml_tensor * a_t = ggml_cont(ctx, ggml_transpose(ctx, src0));
+                struct ggml_tensor * dB  = ggml_solve_tri(ctx, a_t, grad, /*left=*/true, /*lower=*/false, /*uni=*/false);
+                if (src1_needs_grads) {
+                    ggml_add_or_set(ctx, cgraph, isrc1, dB);
+                }
+                if (src0_needs_grads) {
+                    struct ggml_tensor * m  = ggml_mul_mat(ctx, dB, tensor);
+                    struct ggml_tensor * dA = ggml_neg(ctx, ggml_cont(ctx, ggml_transpose(ctx, m)));
+                    ggml_add_or_set(ctx, cgraph, isrc0, ggml_tri(ctx, dA, GGML_TRI_TYPE_LOWER_DIAG));
+                }
+            }
+        } break;
+        case GGML_OP_GATED_DELTA_NET: {
+            // retro delta: analytic backward, see ggml_gated_delta_net_back /
+            // ggml_compute_forward_gated_delta_net_back_f32.
+            struct ggml_tensor * g_gate = tensor->src[3];
+            struct ggml_tensor * beta   = tensor->src[4];
+            struct ggml_tensor * state  = tensor->src[5];
+
+            const size_t isrc3 = ggml_hash_find(hash_set, g_gate);
+            const size_t isrc4 = ggml_hash_find(hash_set, beta);
+            const size_t isrc5 = ggml_hash_find(hash_set, state);
+            const bool g_needs_grads     = g_gate && isrc3 != GGML_HASHSET_FULL && ggml_bitset_get(hash_set->used, isrc3) && grads_needed[isrc3];
+            const bool beta_needs_grads  = beta   && isrc4 != GGML_HASHSET_FULL && ggml_bitset_get(hash_set->used, isrc4) && grads_needed[isrc4];
+            const bool state_needs_grads = state  && isrc5 != GGML_HASHSET_FULL && ggml_bitset_get(hash_set->used, isrc5) && grads_needed[isrc5];
+
+            if (src0_needs_grads || src1_needs_grads || src2_needs_grads || g_needs_grads || beta_needs_grads || state_needs_grads) {
+                const int32_t K = ggml_get_op_params_i32(tensor, 0);
+                struct ggml_tensor * db = ggml_gated_delta_net_back(ctx, src0, src1, src2, g_gate, beta, state, grad, K);
+                // packed order: [ grad_q | grad_k | grad_v | grad_g | grad_beta | grad_state ]
+                size_t off = 0;
+                struct ggml_tensor * gq = ggml_view_1d(ctx, db, ggml_nelements(src0), off);
+                if (src0_needs_grads) { ggml_add_or_set(ctx, cgraph, isrc0, ggml_reshape(ctx, gq, src0)); }
+                off += ggml_nelements(src0)*sizeof(float);
+
+                struct ggml_tensor * gk = ggml_view_1d(ctx, db, ggml_nelements(src1), off);
+                if (src1_needs_grads) { ggml_add_or_set(ctx, cgraph, isrc1, ggml_reshape(ctx, gk, src1)); }
+                off += ggml_nelements(src1)*sizeof(float);
+
+                struct ggml_tensor * gv = ggml_view_1d(ctx, db, ggml_nelements(src2), off);
+                if (src2_needs_grads) { ggml_add_or_set(ctx, cgraph, isrc2, ggml_reshape(ctx, gv, src2)); }
+                off += ggml_nelements(src2)*sizeof(float);
+
+                struct ggml_tensor * gg = ggml_view_1d(ctx, db, ggml_nelements(g_gate), off);
+                if (g_needs_grads) { ggml_add_or_set(ctx, cgraph, isrc3, ggml_reshape(ctx, gg, g_gate)); }
+                off += ggml_nelements(g_gate)*sizeof(float);
+
+                struct ggml_tensor * gbeta = ggml_view_1d(ctx, db, ggml_nelements(beta), off);
+                if (beta_needs_grads) { ggml_add_or_set(ctx, cgraph, isrc4, ggml_reshape(ctx, gbeta, beta)); }
+                off += ggml_nelements(beta)*sizeof(float);
+
+                struct ggml_tensor * gstate = ggml_view_1d(ctx, db, ggml_nelements(state), off);
+                if (state_needs_grads) { ggml_add_or_set(ctx, cgraph, isrc5, ggml_reshape(ctx, gstate, state)); }
+                off += ggml_nelements(state)*sizeof(float);
             }
         } break;
         case GGML_OP_SSM_CONV: {
@@ -7916,6 +8144,7 @@ void ggml_build_backward_expand(
             // gradients in node->src[0] for one reason or another have no effect on output gradients
             case GGML_OP_IM2COL:      // only used for its shape
             case GGML_OP_IM2COL_BACK: // same as IM2COL
+            case GGML_OP_FILL:        // retro delta: only used for shape/dtype, output is a constant
                 ignore_src[0] = true;
                 break;
             case GGML_OP_UNARY: {
@@ -8138,6 +8367,7 @@ static void ggml_backward_ignored_srcs(const struct ggml_tensor * node, bool ign
     switch (node->op) {
         case GGML_OP_IM2COL:
         case GGML_OP_IM2COL_BACK:
+        case GGML_OP_FILL:
             ignore_src[0] = true;
             break;
         case GGML_OP_UNARY: {
@@ -8193,6 +8423,7 @@ static bool ggml_backward_op_implemented(const struct ggml_tensor * node) {
         case GGML_OP_REPEAT:
         case GGML_OP_REPEAT_BACK:
         case GGML_OP_RMS_NORM:
+        case GGML_OP_L2_NORM:
         case GGML_OP_MUL_MAT:
         case GGML_OP_SCALE:
         case GGML_OP_SET:
@@ -8215,6 +8446,12 @@ static bool ggml_backward_op_implemented(const struct ggml_tensor * node) {
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
         case GGML_OP_CROSS_ENTROPY_LOSS:
+        case GGML_OP_PAD:
+        case GGML_OP_TRI:
+        case GGML_OP_FILL:
+        case GGML_OP_CUMSUM:
+        case GGML_OP_SOLVE_TRI:
+        case GGML_OP_GATED_DELTA_NET:
             return true;
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(node)) {
@@ -8229,6 +8466,7 @@ static bool ggml_backward_op_implemented(const struct ggml_tensor * node) {
                 case GGML_UNARY_OP_EXP:
                 case GGML_UNARY_OP_EXPM1:
                 case GGML_UNARY_OP_SOFTPLUS:
+                case GGML_UNARY_OP_SIGMOID:
                     return true;
                 default:
                     return false;
