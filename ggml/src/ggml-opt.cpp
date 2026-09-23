@@ -364,23 +364,6 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     }
     GGML_ASSERT(opt_ctx->build_type <= opt_ctx->build_type_alloc);
 
-    {
-        // The cpu context is allocated statically if using static graphs, dynamically otherwise.
-        // It is used for:
-        //   - optimizer parameters (1 shared for all optimizer invocations)
-        const size_t size_meta = 1 * ggml_tensor_overhead();
-        struct ggml_init_params params = {
-            /*.mem_size   =*/ size_meta,
-            /*.mem_buffer =*/ nullptr,
-            /*.no_alloc   =*/ true,
-        };
-        ggml_free(opt_ctx->ctx_cpu);
-        opt_ctx->ctx_cpu = ggml_init(params);
-
-        ggml_backend_buffer_free(opt_ctx->buf_cpu);
-        opt_ctx->buf_cpu = nullptr;
-    }
-
     struct ggml_context * ctx_results = opt_ctx->static_graphs ? opt_ctx->ctx_static : opt_ctx->ctx_compute;
 
     switch (opt_ctx->loss_type) {
@@ -503,11 +486,22 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     // gb_opt == graph backward optimize, forward pass, then backward pass to calculate gradients, then optimizer step.
     opt_ctx->gb_opt = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gb_grad, /*force_grads =*/ true);
 
-    opt_ctx->opt_step_params = ggml_new_tensor_1d(opt_ctx->ctx_cpu, GGML_TYPE_F32, need_momenta ? 7 : 2);
+    if (!opt_ctx->ctx_cpu) {
+        const size_t size_meta = ggml_tensor_overhead();
+        struct ggml_init_params params = {
+            /*.mem_size   =*/ size_meta,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        opt_ctx->ctx_cpu = ggml_init(params);
+        opt_ctx->opt_step_params = ggml_new_tensor_1d(opt_ctx->ctx_cpu, GGML_TYPE_F32, need_momenta ? 7 : 2);
+        ggml_set_input(opt_ctx->opt_step_params);
+        const char * optimizer_name = ggml_opt_optimizer_name(opt_ctx->optimizer);
+        ggml_format_name(opt_ctx->opt_step_params, "%s_params", optimizer_name);
+        opt_ctx->buf_cpu = ggml_backend_alloc_ctx_tensors_from_buft(opt_ctx->ctx_cpu, ggml_backend_cpu_buffer_type());
+    }
     ggml_tensor * adamw_params = opt_ctx->opt_step_params;
-    ggml_set_input(adamw_params);
     const char * optimizer_name = ggml_opt_optimizer_name(opt_ctx->optimizer);
-    ggml_format_name(adamw_params, "%s_params", optimizer_name);
     for (int i = opt_ctx->gf->n_nodes-1; i >= 0; --i) {
         struct ggml_tensor * node = opt_ctx->gb_opt->nodes[i];
         struct ggml_tensor * grad = ggml_graph_get_grad(opt_ctx->gb_opt, node);
@@ -542,8 +536,6 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             opt_ctx->ctx_static, ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0));
         ggml_graph_reset(opt_ctx->gb_opt);
     }
-
-    opt_ctx->buf_cpu = ggml_backend_alloc_ctx_tensors_from_buft(opt_ctx->ctx_cpu, ggml_backend_cpu_buffer_type());
 }
 
 ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
