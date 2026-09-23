@@ -1263,10 +1263,15 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     return result;
 }
 
-ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, ggml_tensor * k_set) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * k = layers[ikv].k;
+
+    if (k_set) {
+        // Same buffer, same layout -- only the graph edge changes.
+        k = ggml_reshape_3d(ctx, k_set, k->ne[0], k->ne[1], k->ne[2]);
+    }
 
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_k_gqa = k->ne[0];
@@ -1283,10 +1288,16 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
 }
 
-ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, ggml_tensor * v_set) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * v = layers[ikv].v;
+
+    if (v_set) {
+        // cpy_v reshapes the destination, so restore the cache layout the view
+        // arithmetic below expects. Same buffer, only the graph edge changes.
+        v = ggml_reshape_3d(ctx, v_set, v->ne[0], v->ne[1], v->ne[2]);
+    }
 
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_v_gqa = v->ne[0];
@@ -1409,7 +1420,9 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
 ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
     const uint32_t n_tokens = ubatch.n_tokens;
 
-    ggml_tensor * k_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
+    // retro delta: row indices, so they comfortably fit I32 -- which is what
+    // ggml_get_rows() needs to build the gradient of the ggml_set_rows() below.
+    ggml_tensor * k_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
 
     ggml_set_input(k_idxs);
     ggml_set_name(k_idxs, "attn_inp_k_idxs");
@@ -1423,7 +1436,9 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
     ggml_tensor * v_idxs;
 
     if (!v_trans) {
-        v_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
+        // retro delta: see build_input_k_idxs. The transposed layout keeps I64:
+        // its indices address single elements and can exceed 2^31.
+        v_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
     } else {
         v_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens*hparams.n_embd_v_gqa_max());
     }
@@ -1480,13 +1495,14 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
     GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-    int64_t * data = (int64_t *) dst->data;
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    int32_t * data = (int32_t *) dst->data;
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const int64_t offs = sinfo.strm[s]*get_size();
 
         for (uint32_t i = 0; i < sinfo.size(); ++i) {
-            data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
+            data[s*sinfo.size() + i] = (int32_t) (offs + sinfo.idxs[s][i]);
         }
     }
 }
@@ -1496,17 +1512,24 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
     GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-    int64_t * data = (int64_t *) dst->data;
 
     if (!v_trans) {
+        GGML_ASSERT(dst->type == GGML_TYPE_I32);
+        int32_t * data = (int32_t *) dst->data;
+
         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
             const int64_t offs = sinfo.strm[s]*get_size();
 
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
-                data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
+                data[s*sinfo.size() + i] = (int32_t) (offs + sinfo.idxs[s][i]);
             }
         }
-    } else {
+        return;
+    }
+
+    {
+        GGML_ASSERT(dst->type == GGML_TYPE_I64);
+        int64_t * data = (int64_t *) dst->data;
         // note: the V cache is transposed when not using flash attention
         const int64_t kv_size = get_size();
 
@@ -2752,12 +2775,12 @@ ggml_type llama_kv_cache_context::type_v() const {
     return kv->type_v();
 }
 
-ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
-    return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
+ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il, ggml_tensor * k_set) const {
+    return kv->get_k(ctx, il, n_kv, sinfos[i_cur], k_set);
 }
 
-ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
-    return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il, ggml_tensor * v_set) const {
+    return kv->get_v(ctx, il, n_kv, sinfos[i_cur], v_set);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {

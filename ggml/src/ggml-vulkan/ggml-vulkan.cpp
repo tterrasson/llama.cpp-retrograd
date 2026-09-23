@@ -3754,6 +3754,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+    // The F16 variant declares a float16_t storage buffer, so it needs
+    // VK_KHR_16bit_storage. Creating it unconditionally would fail here on a
+    // device without it and take the whole (F32) Vulkan backend down with it.
+    if (device->fp16) {
+        ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f16, "opt_step_adamw_f16", opt_step_adamw_f16_len, opt_step_adamw_f16_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+    }
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_sgd_f32, "opt_step_sgd_f32", opt_step_sgd_f32_len, opt_step_sgd_f32_data, "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -9183,6 +9189,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_opt_step_adamw_f32;
         }
+        if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
+            return ctx->device->pipeline_opt_step_adamw_f16;
+        }
         return nullptr;
     case GGML_OP_OPT_STEP_SGD:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -10495,14 +10504,14 @@ void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const s
     });
 }
 
-static void ggml_vk_op_f32_opt_step_adamw(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const vk_op_push_constants&& pc) {
+static void ggml_vk_opt_step_adamw_impl(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const vk_op_push_constants&& pc) {
     const ggml_tensor * x = dst->src[0];
     const ggml_tensor * g = dst->src[1];
     const ggml_tensor * gm = dst->src[2];
     const ggml_tensor * gv = dst->src[3];
     const ggml_tensor * p = dst->src[4];
 
-    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16);
     GGML_ASSERT(g->type == GGML_TYPE_F32);
     GGML_ASSERT(gm->type == GGML_TYPE_F32);
     GGML_ASSERT(gv->type == GGML_TYPE_F32);
@@ -10516,9 +10525,9 @@ static void ggml_vk_op_f32_opt_step_adamw(ggml_backend_vk_context * ctx, vk_cont
     GGML_ASSERT(ggml_are_same_shape(x, g));
     GGML_ASSERT(ggml_are_same_shape(x, gm));
     GGML_ASSERT(ggml_are_same_shape(x, gv));
-    GGML_ASSERT(ggml_nelements(p) == 7);
+    GGML_ASSERT(ggml_nelements(p) == 9);
 
-    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, g, gm, gv, dst, GGML_OP_OPT_STEP_ADAMW);
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, x, gm, gv, dst, GGML_OP_OPT_STEP_ADAMW);
     GGML_ASSERT(pipeline != nullptr);
 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
@@ -10539,7 +10548,7 @@ static void ggml_vk_op_f32_opt_step_adamw(ggml_backend_vk_context * ctx, vk_cont
 void ggml_vk_opt_step_adamw(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     const size_t n = ggml_nelements(dst->src[0]);
 
-    ggml_vk_op_f32_opt_step_adamw(
+    ggml_vk_opt_step_adamw_impl(
         ctx, subctx, dst,
         { (uint32_t)n, 0, 0.0f, 0.0f, 0.0f, 0.0f }
     );
@@ -15855,6 +15864,16 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                    op->type == op->src[0]->type;
         case GGML_OP_OPT_STEP_ADAMW:
+            return ggml_is_contiguous(op->src[0])
+                    && (op->src[0]->type == GGML_TYPE_F32
+                            || (op->src[0]->type == GGML_TYPE_F16 && device->fp16))
+                    && op->src[1]->type == GGML_TYPE_F32
+                    && op->src[2]->type == GGML_TYPE_F32
+                    && op->src[3]->type == GGML_TYPE_F32
+                    && op->src[4]->type == GGML_TYPE_F32
+                    && ggml_is_contiguous(op->src[1])
+                    && ggml_is_contiguous(op->src[2])
+                    && ggml_is_contiguous(op->src[3]);
         case GGML_OP_OPT_STEP_SGD:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_OUT_PROD:

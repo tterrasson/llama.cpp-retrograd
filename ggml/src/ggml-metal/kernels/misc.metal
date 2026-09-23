@@ -247,7 +247,7 @@ kernel void kernel_opt_step_adamw_f32(
     const float beta1h = pars[5];
     const float beta2h = pars[6];
 
-    const float gi = g[gid];
+    const float gi = g[gid] * pars[8]; // retro delta: gradient accumulation scale
     const float gmi = g_m[gid] * beta1 +      gi * (1.0f - beta1);
     const float gvi = g_v[gid] * beta2 + gi * gi * (1.0f - beta2);
 

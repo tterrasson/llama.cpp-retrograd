@@ -2341,6 +2341,12 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
+    // retro delta: a differentiable cache keeps V in its natural layout. The
+    // transposed layout stores V through a scattered, per-element
+    // ggml_set_rows(), whose gradient would be a gather of as many single-element
+    // rows; the row-wise layout keeps both the store and its gradient row-wise.
+    const bool v_trans = !cparams.flash_attn && !cparams.kv_differentiable;
+
     switch (arch) {
         // Models that need specific instantiation should be handled in the
         // switch statement
@@ -2371,7 +2377,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         *this,
                         params.type_k,
                         params.type_v,
-                        !cparams.flash_attn,
+                        v_trans,
                         cparams.offload_kqv,
                         cparams.kv_unified,
                         cparams.n_ctx_seq,
@@ -2662,7 +2668,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
-                            /* attn_v_trans      */ !cparams.flash_attn,
+                            /* attn_v_trans      */ v_trans,
                             /* attn_swa_full     */ params.swa_full,
                             /* attn_kv_size      */ cparams.n_ctx_seq,
                             /* attn_n_ubatch     */ cparams.n_ubatch,
@@ -2702,7 +2708,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
-                            /* attn_v_trans      */ !cparams.flash_attn,
+                            /* attn_v_trans      */ v_trans,
                             /* attn_kv_size      */ cparams.n_ctx_seq,
                             /* attn_n_pad        */ 1,
                             /* attn_n_swa        */ hparams.n_swa,
@@ -2768,7 +2774,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     *this,
                                     params.type_k,
                                     params.type_v,
-                                    !cparams.flash_attn,
+                                    v_trans,
                                     cparams.offload_kqv,
                                     params.swa_full,
                                     cparams.kv_unified,
@@ -2785,7 +2791,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     *this,
                                     params.type_k,
                                     params.type_v,
-                                    !cparams.flash_attn,
+                                    v_trans,
                                     cparams.offload_kqv,
                                     params.swa_full,
                                     cparams.kv_unified,
@@ -2806,7 +2812,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 hparams,
                                 params.type_k,
                                 params.type_v,
-                                !cparams.flash_attn,
+                                v_trans,
                                 cparams.offload_kqv,
                                 cparams.kv_unified,
                                 cparams.n_ctx_seq,

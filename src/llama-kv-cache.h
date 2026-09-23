@@ -186,8 +186,13 @@ public:
     uint32_t get_n_kv(const slot_info & sinfo) const;
 
     // get views of the current state of the cache
-    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
-    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    // retro delta: `k_set`/`v_set` are the ggml_set_rows() nodes returned by
+    // cpy_k/cpy_v for this graph. Passing them rebases the returned view onto
+    // the store instead of onto the raw cache buffer, which is what gives the
+    // backward pass an edge to follow back to k_cur/v_cur. They alias the same
+    // memory, so this costs nothing; nullptr keeps the plain aliasing view.
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, ggml_tensor * k_set = nullptr) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, ggml_tensor * v_set = nullptr) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
@@ -395,8 +400,8 @@ public:
     ggml_type type_v() const;
 
     // get views of the current state of the cache
-    ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
-    ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, ggml_tensor * k_set = nullptr) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, ggml_tensor * v_set = nullptr) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory

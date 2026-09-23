@@ -11931,7 +11931,7 @@ static void ggml_compute_forward_opt_step_adamw_f32(
     GGML_ASSERT(ggml_are_same_shape(src0, src0_grad));
     GGML_ASSERT(ggml_are_same_shape(src0, src0_grad_m));
     GGML_ASSERT(ggml_are_same_shape(src0, src0_grad_v));
-    GGML_ASSERT(ggml_nelements(adamw_params) == 7);
+    GGML_ASSERT(ggml_nelements(adamw_params) == 9);
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -11957,6 +11957,9 @@ static void ggml_compute_forward_opt_step_adamw_f32(
     const float wd     = adamw_params_ptr[4];
     const float beta1h = adamw_params_ptr[5];
     const float beta2h = adamw_params_ptr[6];
+    // adamw_params_ptr[7] seeds stochastic rounding, which only the F16
+    // parameter path needs: an F32 parameter stores its update exactly.
+    const float gscale = adamw_params_ptr[8];
     const float keep   = 1.f - alpha * wd;
     for (int ir = ir0; ir < ir1; ++ir) {
         const int64_t i03 = ir/(ne02*ne01);
@@ -11971,8 +11974,9 @@ static void ggml_compute_forward_opt_step_adamw_f32(
         float       * v = (float       *) ((char       *) src0_grad_v->data + offset);
 
         for (int i00 = 0; i00 < ne00; ++i00) {
-            m[i00] = m[i00]*beta1 +        g[i00]*(1.0f - beta1);
-            v[i00] = v[i00]*beta2 + g[i00]*g[i00]*(1.0f - beta2);
+            const float gi = g[i00] * gscale;
+            m[i00] = m[i00]*beta1 +  gi*(1.0f - beta1);
+            v[i00] = v[i00]*beta2 + gi*gi*(1.0f - beta2);
 
             const float mh =       m[i00]*beta1h;
             const float vh = sqrtf(v[i00]*beta2h) + eps;
@@ -11995,6 +11999,10 @@ void ggml_compute_forward_opt_step_adamw(
         case GGML_TYPE_F32:
             {
                 ggml_compute_forward_opt_step_adamw_f32(params, dst);
+            } break;
+        case GGML_TYPE_F16:
+            {
+                ggml_compute_forward_opt_step_adamw_f16(params, dst);
             } break;
         default:
             {
