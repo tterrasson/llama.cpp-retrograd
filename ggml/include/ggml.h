@@ -601,6 +601,9 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_SSM_CONV_BACK,
+        GGML_OP_SSM_SCAN_BACK,
+
         GGML_OP_COUNT,
     };
 
@@ -2536,6 +2539,28 @@ extern "C" {
             struct ggml_tensor  * C,
             struct ggml_tensor  * ids,
             int64_t               K);
+
+    // backward pass for ggml_ssm_conv
+    // returns a packed 1d tensor: [ grad_sx (shape of sx) | grad_c (shape of c) ]
+    GGML_API struct ggml_tensor * ggml_ssm_conv_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * sx,   // forward src0 (conv input)
+            struct ggml_tensor  * c,    // forward src1 (conv weight)
+            struct ggml_tensor  * dy);  // gradient of the ssm_conv output
+
+    // backward pass for ggml_ssm_scan
+    // returns a packed 1d tensor with the gradients of each differentiable input,
+    // in the order: [ grad_x | grad_dt | grad_A | grad_B | grad_C | grad_s ]
+    GGML_API struct ggml_tensor * ggml_ssm_scan_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * s,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * dt,
+            struct ggml_tensor  * A,
+            struct ggml_tensor  * B,
+            struct ggml_tensor  * C,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * ds);  // gradient of the ssm_scan output (y ++ final states)
 
     // partition into non-overlapping windows with padding if needed
     // example:
