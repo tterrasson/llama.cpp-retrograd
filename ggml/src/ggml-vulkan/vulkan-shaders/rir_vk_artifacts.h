@@ -12,6 +12,7 @@
     X(l2_norm_back) \
     X(cumsum) \
     X(cumsum_blocked) \
+    X(cumsum_strided) \
     X(cumsum_tiled) \
     X(mul_mat_vec_q8_0) \
     X(mul_mat_vec_q8_0_cols4) \
