@@ -1036,6 +1036,12 @@ struct vk_device_struct {
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_adamw_f16;
     vk_pipeline pipeline_opt_step_sgd_f32;
+    // retro delta: Gefen. The variant selects the pipeline instead of
+    // travelling in the push constants.
+    vk_pipeline pipeline_opt_step_gefen_stats_shared_v;
+    vk_pipeline pipeline_opt_step_gefen_stats_quantized_m;
+    vk_pipeline pipeline_opt_step_gefen_shared_v;
+    vk_pipeline pipeline_opt_step_gefen_quantized_m;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f16_f32[CONV_SHAPE_COUNT];
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv_transpose_2d_f32[CONV_SHAPE_COUNT];

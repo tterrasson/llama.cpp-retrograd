@@ -1098,6 +1098,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "CROSS_ENTROPY_LOSS_BACK",
     "OPT_STEP_ADAMW",
     "OPT_STEP_SGD",
+    "OPT_STEP_GEFEN_STATS",
+    "OPT_STEP_GEFEN",
 
     "GLU",
 
@@ -1112,7 +1114,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "CONV_RS_GATHER",
 };
 
-static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
+static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT != 110");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1224,6 +1226,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "cross_entropy_loss_back(x,y)",
     "adamw(x)",
     "sgd(x)",
+    "gefen_stats(x)",
+    "gefen(x)",
 
     "glu(x)",
 
@@ -1238,7 +1242,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "conv_rs_gather(x)",
 };
 
-static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
+static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT != 110");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6622,6 +6626,129 @@ struct ggml_tensor * ggml_opt_step_sgd(
     result->src[0] = a;
     result->src[1] = grad;
     result->src[2] = params;
+
+    return result;
+}
+
+// opt_step_gefen
+
+// The state a Gefen variant keeps, checked once so both phases agree on which
+// sources are required and which must be absent.
+static int64_t ggml_opt_step_gefen_check(
+        struct ggml_tensor * grad,
+        struct ggml_tensor * moment,
+        struct ggml_tensor * scales,
+        struct ggml_tensor * v,
+        struct ggml_tensor * codebook,
+        struct ggml_tensor * params,
+        int                  variant,
+        int                  block_size) {
+    GGML_ASSERT(block_size > 0);
+    GGML_ASSERT(grad->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(grad));
+    GGML_ASSERT(ggml_are_same_shape(grad, moment));
+    GGML_ASSERT(ggml_is_contiguous(moment));
+    GGML_ASSERT(v->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(v));
+    GGML_ASSERT(params->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_nelements(params) == 8);
+
+    const int64_t n_elements = ggml_nelements(grad);
+    const int64_t n_blocks   = n_elements/block_size + (n_elements % block_size != 0);
+    GGML_ASSERT(ggml_nelements(v) == n_blocks);
+
+    switch ((enum ggml_opt_gefen_variant) variant) {
+        case GGML_OPT_GEFEN_VARIANT_SHARED_V:
+            // An unquantized first moment needs neither a scale nor a codebook,
+            // and passing one would mean two readings of the same state.
+            GGML_ASSERT(moment->type == GGML_TYPE_F32);
+            GGML_ASSERT(!scales && !codebook);
+            break;
+        case GGML_OPT_GEFEN_VARIANT_QUANTIZED_M:
+            GGML_ASSERT(moment->type == GGML_TYPE_I8);
+            GGML_ASSERT(scales && codebook);
+            GGML_ASSERT(scales->type == GGML_TYPE_F32);
+            GGML_ASSERT(ggml_is_contiguous(scales));
+            GGML_ASSERT(ggml_nelements(scales) == n_blocks);
+            GGML_ASSERT(codebook->type == GGML_TYPE_F32);
+            GGML_ASSERT(ggml_is_contiguous(codebook));
+            GGML_ASSERT(ggml_nelements(codebook) >= 2);
+            break;
+        default:
+            GGML_ABORT("unknown gefen variant");
+    }
+    return n_blocks;
+}
+
+struct ggml_tensor * ggml_opt_step_gefen_stats(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * grad,
+        struct ggml_tensor  * moment,
+        struct ggml_tensor  * scales,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * codebook,
+        struct ggml_tensor  * params,
+        int                   variant,
+        int                   block_size) {
+    const int64_t n_blocks = ggml_opt_step_gefen_check(
+            grad, moment, scales, v, codebook, params, variant, block_size);
+
+    // [scale, second moment] per block, in that order, so one block's pair is
+    // two adjacent floats whatever reads it.
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, n_blocks);
+
+    ggml_set_op_params_i32(result, 0, variant);
+    ggml_set_op_params_i32(result, 1, block_size);
+
+    result->op     = GGML_OP_OPT_STEP_GEFEN_STATS;
+    result->src[0] = grad;
+    result->src[1] = moment;
+    result->src[2] = scales;
+    result->src[3] = v;
+    result->src[4] = codebook;
+    result->src[5] = params;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_opt_step_gefen(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * grad,
+        struct ggml_tensor  * moment,
+        struct ggml_tensor  * scales,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * stats,
+        struct ggml_tensor  * codebook,
+        struct ggml_tensor  * params,
+        int                   variant,
+        int                   block_size) {
+    const int64_t n_blocks = ggml_opt_step_gefen_check(
+            grad, moment, scales, v, codebook, params, variant, block_size);
+
+    GGML_ASSERT(a->flags & GGML_TENSOR_FLAG_PARAM);
+    GGML_ASSERT(ggml_are_same_shape(a, grad));
+    // F32 weights first: a quantized first moment and a stochastically rounded
+    // writeback are two approximations, and they are measured separately.
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(stats->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(stats));
+    GGML_ASSERT(ggml_nelements(stats) == 2*n_blocks);
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, a);
+
+    ggml_set_op_params_i32(result, 0, variant);
+    ggml_set_op_params_i32(result, 1, block_size);
+
+    result->op     = GGML_OP_OPT_STEP_GEFEN;
+    result->src[0] = a;
+    result->src[1] = grad;
+    result->src[2] = moment;
+    result->src[3] = scales;
+    result->src[4] = v;
+    result->src[5] = stats;
+    result->src[6] = codebook;
+    result->src[7] = params;
 
     return result;
 }

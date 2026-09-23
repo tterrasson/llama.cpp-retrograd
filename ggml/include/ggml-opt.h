@@ -108,9 +108,42 @@ extern "C" {
     enum ggml_opt_optimizer_type {
         GGML_OPT_OPTIMIZER_TYPE_ADAMW,
         GGML_OPT_OPTIMIZER_TYPE_SGD,
+        // retro delta: orthogonalized momentum on eligible matrices. Built out
+        // of ordinary graph ops rather than a kernel of its own.
+        GGML_OPT_OPTIMIZER_TYPE_MUON,
+        // retro delta: fixed-block second moments, optionally with a quantized
+        // first moment. The variant is part of the layout, not of the name.
+        GGML_OPT_OPTIMIZER_TYPE_GEFEN,
 
         GGML_OPT_OPTIMIZER_TYPE_COUNT
     };
+
+
+    // The frozen v1 constants: five Newton-Schulz iterations, 1024-element
+    // quantization blocks and a 256-entry uniform codebook. Declared here
+    // because the allocator, the update graph and the default layout are three
+    // readers of one number.
+    #define GGML_OPT_MUON_NS_STEPS          5
+    #define GGML_OPT_GEFEN_BLOCK_SIZE       1024
+    #define GGML_OPT_GEFEN_CODEBOOK_LEVELS  256
+
+    // retro delta: an optimizer's *structural* parameters, the ones that decide
+    // a slot's shape or a graph's topology instead of scaling an update. They
+    // are fixed when the context is created, because a schedule cannot move the
+    // number of elements a block holds or the number of nodes a step builds.
+    struct ggml_opt_optimizer_layout {
+        struct {
+            int32_t ns_steps; // Newton-Schulz iterations; <= 0 selects five
+            bool    nesterov;
+        } muon;
+        struct {
+            enum ggml_opt_gefen_variant variant;
+            int64_t                     block_size; // <= 0 selects 1024
+        } gefen;
+    };
+
+    // The layout every optimizer's frozen v1 declares.
+    GGML_API struct ggml_opt_optimizer_layout ggml_opt_default_optimizer_layout(void);
 
     // retro delta: the executable half of an optimizer's descriptor.
     //
@@ -148,10 +181,17 @@ extern "C" {
     // The per-parameter and per-owner slot tables of one optimizer. An empty
     // table is a valid answer and is not "no optimizer": SGD keeps no
     // per-parameter state and still has an iteration counter and an RNG.
+    // A NULL layout reads the defaults; an optimizer whose slot shapes depend
+    // on its layout (Gefen) answers for the layout it is given and not for the
+    // one the last context happened to use.
     GGML_API const struct ggml_opt_slot_def * ggml_opt_optimizer_slots(
-            enum ggml_opt_optimizer_type optimizer, int64_t * n_slots);
+            enum ggml_opt_optimizer_type             optimizer,
+            const struct ggml_opt_optimizer_layout * layout,
+            int64_t                                * n_slots);
     GGML_API const struct ggml_opt_slot_def * ggml_opt_optimizer_shared_slots(
-            enum ggml_opt_optimizer_type optimizer, int64_t * n_slots);
+            enum ggml_opt_optimizer_type             optimizer,
+            const struct ggml_opt_optimizer_layout * layout,
+            int64_t                                * n_slots);
 
     // How many hyperparameters one optimizer's update step reads, excluding
     // the shared gradient-clipping scale appended to them.
@@ -192,6 +232,22 @@ extern "C" {
             float alpha; // learning rate
             float wd;    // weight decay
         } sgd;
+        // retro delta: an orthogonalized update and an AdamW one are not in the
+        // same units, so the fallback AdamW rate a Muon run uses is declared
+        // rather than borrowed - the caller scales both by one schedule.
+        struct {
+            float alpha;      // learning rate
+            float momentum;   // EMA coefficient of the first moment
+            float wd;         // decoupled weight decay
+            float ns_epsilon; // added to the Frobenius norm before normalizing
+        } muon;
+        struct {
+            float alpha; // learning rate
+            float beta1; // first moment, quantized under the quantized_m variant
+            float beta2; // per-block second moment
+            float eps;   // epsilon for numerical stability
+            float wd;    // weight decay
+        } gefen;
     };
 
     // callback to calculate optimizer parameters prior to a backward pass
@@ -233,6 +289,11 @@ extern "C" {
         // update step from that optimizer's own graph.
         ggml_opt_get_param_optimizer get_param_optimizer;
         void *                       get_param_optimizer_ud;
+
+        // retro delta: the structural half of the optimizers this run may
+        // build a step for. Read when the slots are allocated and when the
+        // update graph is built, never afterwards.
+        struct ggml_opt_optimizer_layout layout;
     };
 
     // get parameters for an optimization context with defaults set where possible
@@ -328,6 +389,14 @@ extern "C" {
     GGML_API enum ggml_opt_optimizer_type ggml_opt_context_optimizer_type(ggml_opt_context_t); //TODO consistent naming scheme
 
     GGML_API const char * ggml_opt_optimizer_name(enum ggml_opt_optimizer_type);
+
+    // retro delta: upper bound on the graph nodes one parameter's update
+    // appends, including its share of the clipping norm. Muon's update is
+    // tens of nodes per matrix, not one, so callers must size graphs with
+    // this number rather than assuming one node per parameter.
+    GGML_API int64_t ggml_opt_step_graph_nodes(
+            enum ggml_opt_optimizer_type             optimizer,
+            const struct ggml_opt_optimizer_layout * layout);
 
     // ====== Optimization Result ======
 

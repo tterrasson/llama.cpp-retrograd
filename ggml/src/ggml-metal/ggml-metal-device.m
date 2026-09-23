@@ -2108,6 +2108,51 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     && ggml_is_contiguous(op->src[3]);
         case GGML_OP_OPT_STEP_SGD:
             return has_simdgroup_reduction;
+        // retro delta: fixed-block Gefen. The two phases are admitted together
+        // on purpose: a device that ran the pure one and not the mutating one
+        // would be scheduled as a split, and the update would land on a copy of
+        // the state rather than on the device-resident slot.
+        case GGML_OP_OPT_STEP_GEFEN_STATS:
+        case GGML_OP_OPT_STEP_GEFEN:
+            {
+                const bool is_stats = op->op == GGML_OP_OPT_STEP_GEFEN_STATS;
+                const int  base     = is_stats ? 0 : 1;
+
+                const struct ggml_tensor * grad     = op->src[base + 0];
+                const struct ggml_tensor * moment   = op->src[base + 1];
+                const struct ggml_tensor * scales   = op->src[base + 2];
+                const struct ggml_tensor * v        = op->src[base + 3];
+                const struct ggml_tensor * codebook = op->src[is_stats ? 4 : 6];
+
+                const int32_t variant = ggml_get_op_params_i32(op, 0);
+
+                if (!has_simdgroup_reduction) {
+                    return false;
+                }
+                // The weight is written in place and indexed linearly.
+                if (!is_stats && (op->src[0]->type != GGML_TYPE_F32 || !ggml_is_contiguous(op->src[0]))) {
+                    return false;
+                }
+                if (grad->type != GGML_TYPE_F32 || !ggml_is_contiguous(grad)) {
+                    return false;
+                }
+                if (v->type != GGML_TYPE_F32 || !ggml_is_contiguous(v)) {
+                    return false;
+                }
+                if (!ggml_is_contiguous(moment)) {
+                    return false;
+                }
+                switch (variant) {
+                    case GGML_OPT_GEFEN_VARIANT_SHARED_V:
+                        return moment->type == GGML_TYPE_F32 && !scales && !codebook;
+                    case GGML_OPT_GEFEN_VARIANT_QUANTIZED_M:
+                        return moment->type == GGML_TYPE_I8
+                                && scales   && scales->type   == GGML_TYPE_F32 && ggml_is_contiguous(scales)
+                                && codebook && codebook->type == GGML_TYPE_F32 && ggml_is_contiguous(codebook);
+                    default:
+                        return false;
+                }
+            }
         // retro delta: the two backward reductions with no native Metal kernel.
         // same shape; needs simdgroup reductions. Else falls back to CPU.
         case GGML_OP_RMS_NORM_BACK:

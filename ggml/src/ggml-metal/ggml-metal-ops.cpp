@@ -528,6 +528,15 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_opt_step_sgd(ctx, idx);
             } break;
+        // retro delta: fixed-block Gefen, phase A then phase B.
+        case GGML_OP_OPT_STEP_GEFEN_STATS:
+            {
+                n_fuse = ggml_metal_op_opt_step_gefen_stats(ctx, idx);
+            } break;
+        case GGML_OP_OPT_STEP_GEFEN:
+            {
+                n_fuse = ggml_metal_op_opt_step_gefen(ctx, idx);
+            } break;
         case GGML_OP_RMS_NORM_BACK: // retro delta
             {
                 n_fuse = ggml_metal_op_rms_norm_back(ctx, idx);
@@ -5878,6 +5887,103 @@ int ggml_metal_op_opt_step_sgd(ggml_metal_op_t ctx, int idx) {
     const int64_t n = (np + nth - 1) / nth;
 
     ggml_metal_encoder_dispatch_threadgroups(enc, n, 1, 1, nth, 1, 1);
+
+    return 1;
+}
+
+// retro delta: fixed-block Gefen, both phases. One threadgroup per
+// quantization block: the block is the unit of ownership, so the scale a block
+// is quantized against never changes under an element that has not been read.
+//
+// The two optional sources (scales, codebook) are absent under shared_v. Their
+// binding slots are filled with the gradient's buffer rather than a nil one:
+// the shared_v kernels never dereference them, and a nil binding is what the
+// Metal validation layer objects to.
+static ggml_metal_kargs_opt_step_gefen ggml_metal_gefen_args(
+        const ggml_tensor * op, const ggml_tensor * grad, const ggml_tensor * codebook) {
+    ggml_metal_kargs_opt_step_gefen args = {
+        /*.np        =*/ ggml_nelements(grad),
+        /*.bs        =*/ ggml_get_op_params_i32(op, 1),
+        /*.levels    =*/ codebook ? (int32_t) ggml_nelements(codebook) : 0,
+        /*.zero_code =*/ GGML_GEFEN_ZERO_BLOCK_INDEX,
+    };
+
+    return args;
+}
+
+// Threads per block, capped by the pipeline's own limit. A block is at least as
+// wide as a simdgroup so the threadgroup reductions have something to reduce.
+static int ggml_metal_gefen_nth(ggml_metal_pipeline_with_params pipeline, int64_t block_size) {
+    const int max_nth = ggml_metal_pipeline_max_theads_per_threadgroup(pipeline);
+
+    return (int) std::min<int64_t>(max_nth, std::max<int64_t>(32, block_size));
+}
+
+int ggml_metal_op_opt_step_gefen_stats(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    ggml_tensor * grad     = op->src[0];
+    ggml_tensor * scales   = op->src[2];
+    ggml_tensor * v        = op->src[3];
+    ggml_tensor * codebook = op->src[4];
+
+    auto pipeline = ggml_metal_library_get_pipeline_opt_step_gefen_stats(lib, op);
+
+    const ggml_metal_kargs_opt_step_gefen args = ggml_metal_gefen_args(op, grad, codebook);
+
+    int ida = 0;
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, (void *) &args, sizeof(args), ida++);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(grad),                     ida++);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]),               ida++);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(scales   ? scales   : grad), ida++);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(v),                        ida++);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(codebook ? codebook : grad), ida++);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[5]),               ida++);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),                       ida++);
+
+    const int nth = ggml_metal_gefen_nth(pipeline, args.bs);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, ggml_nelements(v), 1, 1, nth, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_opt_step_gefen(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    ggml_tensor * grad     = op->src[1];
+    ggml_tensor * scales   = op->src[3];
+    ggml_tensor * v        = op->src[4];
+    ggml_tensor * codebook = op->src[6];
+
+    auto pipeline = ggml_metal_library_get_pipeline_opt_step_gefen(lib, op);
+
+    const ggml_metal_kargs_opt_step_gefen args = ggml_metal_gefen_args(op, grad, codebook);
+
+    int ida = 0;
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, (void *) &args, sizeof(args), ida++);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]),               ida++);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(grad),                     ida++);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2]),               ida++);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(scales   ? scales   : grad), ida++);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(v),                        ida++);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[5]),               ida++);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(codebook ? codebook : grad), ida++);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[7]),               ida++);
+
+    const int nth = ggml_metal_gefen_nth(pipeline, args.bs);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, ggml_nelements(v), 1, 1, nth, 1, 1);
 
     return 1;
 }

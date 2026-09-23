@@ -38,6 +38,7 @@
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
+#include "ggml-cuda/opt-step-gefen.cuh" // retro delta
 #include "ggml-cuda/opt-step-sgd.cuh"
 #include "ggml-cuda/out-prod.cuh"
 #include "ggml-cuda/pad.cuh"
@@ -2443,6 +2444,13 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_OPT_STEP_SGD:
             ggml_cuda_opt_step_sgd(ctx, dst);
+            break;
+        // retro delta: Gefen, phase A then phase B.
+        case GGML_OP_OPT_STEP_GEFEN_STATS:
+            ggml_cuda_opt_step_gefen_stats(ctx, dst);
+            break;
+        case GGML_OP_OPT_STEP_GEFEN:
+            ggml_cuda_opt_step_gefen(ctx, dst);
             break;
         case GGML_OP_SOLVE_TRI:
             ggml_cuda_op_solve_tri(ctx, dst);
@@ -5806,6 +5814,44 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                    op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_F32 &&
                    op->src[3]->type == GGML_TYPE_F32;
+        // retro delta: Gefen. The two phases are admitted together so a device
+        // never runs one without the other, which would split the update onto
+        // a copy of the state.
+        case GGML_OP_OPT_STEP_GEFEN_STATS:
+        case GGML_OP_OPT_STEP_GEFEN: {
+            const bool is_stats = op->op == GGML_OP_OPT_STEP_GEFEN_STATS;
+            const int  base     = is_stats ? 0 : 1;
+
+            const ggml_tensor * grad     = op->src[base + 0];
+            const ggml_tensor * moment   = op->src[base + 1];
+            const ggml_tensor * scales   = op->src[base + 2];
+            const ggml_tensor * v        = op->src[base + 3];
+            const ggml_tensor * codebook = op->src[is_stats ? 4 : 6];
+
+            // The weight is written in place and indexed linearly.
+            if (!is_stats && (op->src[0]->type != GGML_TYPE_F32 || !ggml_is_contiguous(op->src[0]))) {
+                return false;
+            }
+            if (grad->type != GGML_TYPE_F32 || !ggml_is_contiguous(grad)) {
+                return false;
+            }
+            if (v->type != GGML_TYPE_F32 || !ggml_is_contiguous(v)) {
+                return false;
+            }
+            if (!ggml_is_contiguous(moment)) {
+                return false;
+            }
+            switch (ggml_get_op_params_i32(op, 0)) {
+                case GGML_OPT_GEFEN_VARIANT_SHARED_V:
+                    return moment->type == GGML_TYPE_F32 && !scales && !codebook;
+                case GGML_OPT_GEFEN_VARIANT_QUANTIZED_M:
+                    return moment->type == GGML_TYPE_I8
+                            && scales   && scales->type   == GGML_TYPE_F32 && ggml_is_contiguous(scales)
+                            && codebook && codebook->type == GGML_TYPE_F32 && ggml_is_contiguous(codebook);
+                default:
+                    return false;
+            }
+        }
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
 

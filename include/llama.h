@@ -1817,6 +1817,12 @@ extern "C" {
         // GGML_TYPE_F32 keeps the bit-exact default. Ignored without
         // gradient_checkpointing.
         enum ggml_type checkpoint_type;
+
+        // retro delta: the structural half of the optimizer descriptor - the
+        // Newton-Schulz iteration count, the Gefen variant and its block size.
+        // Passed through to ggml_opt_init verbatim, because the allocator and
+        // the update graph are the two readers and both live below here.
+        struct ggml_opt_optimizer_layout optimizer_layout;
     };
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
@@ -1944,6 +1950,11 @@ extern "C" {
         LLAMA_OPT_PREFLIGHT_MISSING_GRAD    = 0, // op has no gradient rule in ggml (dev is NULL)
         LLAMA_OPT_PREFLIGHT_DEVICE_FORWARD  = 1, // device cannot run this forward op
         LLAMA_OPT_PREFLIGHT_DEVICE_BACKWARD = 2, // device cannot run this backward/optimizer op
+        // retro delta: the parameter is marked and the built backward graph
+        // carries no gradient for it (dev is NULL). Unlike MISSING_GRAD, which
+        // is an op with no rule at all, this asks about the result: a rule can
+        // exist but decline one operand, and only this reason catches that.
+        LLAMA_OPT_PREFLIGHT_UNREACHED_PARAM = 3
     };
 
     typedef void (*llama_opt_preflight_cb)(

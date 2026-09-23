@@ -3862,6 +3862,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_sgd_f32, "opt_step_sgd_f32", opt_step_sgd_f32_len, opt_step_sgd_f32_data, "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
+    // retro delta: Gefen. One workgroup per quantization block, so the
+    // dispatch counts blocks, not elements.
+    ggml_vk_create_pipeline(device, device->pipeline_opt_step_gefen_stats_shared_v,    "opt_step_gefen_stats_shared_v",    opt_step_gefen_stats_shared_v_len,    opt_step_gefen_stats_shared_v_data,    "main", 7, sizeof(vk_op_gefen_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_opt_step_gefen_stats_quantized_m, "opt_step_gefen_stats_quantized_m", opt_step_gefen_stats_quantized_m_len, opt_step_gefen_stats_quantized_m_data, "main", 7, sizeof(vk_op_gefen_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_opt_step_gefen_shared_v,          "opt_step_gefen_shared_v",          opt_step_gefen_shared_v_len,          opt_step_gefen_shared_v_data,          "main", 8, sizeof(vk_op_gefen_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_opt_step_gefen_quantized_m,       "opt_step_gefen_quantized_m",       opt_step_gefen_quantized_m_len,       opt_step_gefen_quantized_m_data,       "main", 8, sizeof(vk_op_gefen_push_constants), {1, 1, 1}, {}, 1);
+
     // conv2d, conv_transpose_2d, conv3d
     for (uint32_t s = 0; s < CONV_SHAPE_COUNT; ++s) {
         // smaller WG for the small-tile fallback gives more concurrent WGs per SM
@@ -9469,6 +9476,15 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_opt_step_sgd_f32;
         }
         return nullptr;
+    // retro delta: Gefen. The variant selects the pipeline.
+    case GGML_OP_OPT_STEP_GEFEN_STATS:
+        return ggml_get_op_params_i32(dst, 0) == GGML_OPT_GEFEN_VARIANT_QUANTIZED_M
+                ? ctx->device->pipeline_opt_step_gefen_stats_quantized_m
+                : ctx->device->pipeline_opt_step_gefen_stats_shared_v;
+    case GGML_OP_OPT_STEP_GEFEN:
+        return ggml_get_op_params_i32(dst, 0) == GGML_OPT_GEFEN_VARIANT_QUANTIZED_M
+                ? ctx->device->pipeline_opt_step_gefen_quantized_m
+                : ctx->device->pipeline_opt_step_gefen_shared_v;
     case GGML_OP_LEAKY_RELU:
         if (src0->type == dst->type &&
             (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16)) {
@@ -11109,6 +11125,84 @@ void ggml_vk_opt_step_adamw(ggml_backend_vk_context * ctx, vk_context& subctx, g
         ctx, subctx, dst,
         { (uint32_t)n, 0, 0.0f, 0.0f, 0.0f, 0.0f }
     );
+}
+
+// retro delta: Gefen, both phases. One workgroup per quantization block, so
+// the whole block is read against the old scale before any element is rewritten.
+//
+// Under shared_v the scales and codebook sources are absent; their binding
+// slots are filled with the gradient's buffer, which the shared_v shaders never
+// declare.
+static vk_op_gefen_push_constants ggml_vk_gefen_push_constants(
+        const ggml_tensor * op, const ggml_tensor * grad, const ggml_tensor * codebook) {
+    return {
+        /*.np        =*/ (uint32_t) ggml_nelements(grad),
+        /*.bs        =*/ (uint32_t) ggml_get_op_params_i32(op, 1),
+        /*.levels    =*/ codebook ? (uint32_t) ggml_nelements(codebook) : 0u,
+        /*.zero_code =*/ (uint32_t) GGML_GEFEN_ZERO_BLOCK_INDEX,
+    };
+}
+
+void ggml_vk_opt_step_gefen_stats(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * grad     = dst->src[0];
+    const ggml_tensor * moment   = dst->src[1];
+    const ggml_tensor * scales   = dst->src[2];
+    const ggml_tensor * v        = dst->src[3];
+    const ggml_tensor * codebook = dst->src[4];
+    const ggml_tensor * pars     = dst->src[5];
+
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, grad, moment, v, dst, GGML_OP_OPT_STEP_GEFEN_STATS);
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer grad_buf = ggml_vk_tensor_subbuffer(ctx, grad);
+    vk_subbuffer dst_buf  = ggml_vk_tensor_subbuffer(ctx, dst);
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {
+            grad_buf,
+            ggml_vk_tensor_subbuffer(ctx, moment),
+            scales ? ggml_vk_tensor_subbuffer(ctx, scales) : grad_buf,
+            ggml_vk_tensor_subbuffer(ctx, v),
+            codebook ? ggml_vk_tensor_subbuffer(ctx, codebook) : grad_buf,
+            ggml_vk_tensor_subbuffer(ctx, pars),
+            dst_buf,
+        },
+        ggml_vk_gefen_push_constants(dst, grad, codebook),
+        { (uint32_t) ggml_nelements(v), 1, 1 });
+}
+
+void ggml_vk_opt_step_gefen(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * w        = dst->src[0];
+    const ggml_tensor * grad     = dst->src[1];
+    const ggml_tensor * moment   = dst->src[2];
+    const ggml_tensor * scales   = dst->src[3];
+    const ggml_tensor * v        = dst->src[4];
+    const ggml_tensor * stats    = dst->src[5];
+    const ggml_tensor * codebook = dst->src[6];
+    const ggml_tensor * pars     = dst->src[7];
+
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, w, moment, v, dst, GGML_OP_OPT_STEP_GEFEN);
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer grad_buf = ggml_vk_tensor_subbuffer(ctx, grad);
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {
+            ggml_vk_tensor_subbuffer(ctx, w),
+            grad_buf,
+            ggml_vk_tensor_subbuffer(ctx, moment),
+            scales ? ggml_vk_tensor_subbuffer(ctx, scales) : grad_buf,
+            ggml_vk_tensor_subbuffer(ctx, v),
+            ggml_vk_tensor_subbuffer(ctx, stats),
+            codebook ? ggml_vk_tensor_subbuffer(ctx, codebook) : grad_buf,
+            ggml_vk_tensor_subbuffer(ctx, pars),
+        },
+        ggml_vk_gefen_push_constants(dst, grad, codebook),
+        { (uint32_t) ggml_nelements(v), 1, 1 });
 }
 
 void ggml_vk_opt_step_sgd(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, ggml_tensor * dst) {
@@ -13479,6 +13573,17 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
     case GGML_OP_OPT_STEP_SGD:
         ggml_vk_opt_step_sgd(ctx, compute_ctx, src0, src1, src2, node);
+
+        break;
+
+    // retro delta: Gefen, phase A then phase B.
+    case GGML_OP_OPT_STEP_GEFEN_STATS:
+        ggml_vk_opt_step_gefen_stats(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_OPT_STEP_GEFEN:
+        ggml_vk_opt_step_gefen(ctx, compute_ctx, node);
 
         break;
     default:
@@ -16569,6 +16674,49 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     && ggml_is_contiguous(op->src[3]);
         case GGML_OP_OPT_STEP_SGD:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
+        // retro delta: Gefen. The two phases are admitted together so a device
+        // never runs one without the other, which would split the update onto
+        // a copy of the state.
+        case GGML_OP_OPT_STEP_GEFEN_STATS:
+        case GGML_OP_OPT_STEP_GEFEN: {
+            const bool is_stats = op->op == GGML_OP_OPT_STEP_GEFEN_STATS;
+            const int  base     = is_stats ? 0 : 1;
+
+            const ggml_tensor * grad     = op->src[base + 0];
+            const ggml_tensor * moment   = op->src[base + 1];
+            const ggml_tensor * scales   = op->src[base + 2];
+            const ggml_tensor * v        = op->src[base + 3];
+            const ggml_tensor * codebook = op->src[is_stats ? 4 : 6];
+
+            // The weight is written in place and indexed linearly.
+            if (!is_stats && (op->src[0]->type != GGML_TYPE_F32 || !ggml_is_contiguous(op->src[0]))) {
+                return false;
+            }
+            if (grad->type != GGML_TYPE_F32 || !ggml_is_contiguous(grad)) {
+                return false;
+            }
+            if (v->type != GGML_TYPE_F32 || !ggml_is_contiguous(v)) {
+                return false;
+            }
+            if (!ggml_is_contiguous(moment)) {
+                return false;
+            }
+            switch (ggml_get_op_params_i32(op, 0)) {
+                case GGML_OPT_GEFEN_VARIANT_SHARED_V:
+                    return moment->type == GGML_TYPE_F32 && !scales && !codebook;
+                case GGML_OPT_GEFEN_VARIANT_QUANTIZED_M:
+                    // Byte indices are addressed as packed 32-bit words: GLSL
+                    // has no 8-bit store, and one invocation must own a whole
+                    // word. The block size being a multiple of four keeps block
+                    // boundaries out of the middle of words.
+                    return ggml_get_op_params_i32(op, 1) % 4 == 0
+                            && moment->type == GGML_TYPE_I8
+                            && scales   && scales->type   == GGML_TYPE_F32 && ggml_is_contiguous(scales)
+                            && codebook && codebook->type == GGML_TYPE_F32 && ggml_is_contiguous(codebook);
+                default:
+                    return false;
+            }
+        }
         case GGML_OP_OUT_PROD:
             // The out_prod shaders index every operand through its full strides,
             // so non-contiguous / permuted gradient tensors are fine for the F32
