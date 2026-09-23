@@ -762,6 +762,16 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+
+    // retro delta: sched_reserve() replaces `sched` with a freshly created scheduler
+    // (e.g. after a LoRA adapter change flags sched_need_reserve). An initialized
+    // optimizer captured the previous scheduler at llama_opt_init and would otherwise
+    // keep using the now-freed object, so rebind it to the live scheduler here. This
+    // is what makes GRPO survive past the first update, where fixed-reference scoring
+    // toggles the adapter between rollouts.
+    if (opt_ctx) {
+        ggml_opt_set_backend_sched(opt_ctx, sched.get());
+    }
 }
 
 void llama_context::synchronize() {
