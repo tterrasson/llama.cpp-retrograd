@@ -1785,6 +1785,13 @@ extern "C" {
 
         enum ggml_opt_optimizer_type optimizer_type;
 
+        // retro delta: per-parameter optimizer assignment. NULL puts every
+        // marked parameter on optimizer_type above, which is the
+        // single-optimizer run; a callback is what lets one run keep two
+        // optimizers' state tables side by side.
+        ggml_opt_get_param_optimizer param_optimizer;
+        void * param_optimizer_ud;
+
         // retro delta: fuse the output projection with the cross-entropy
         // in the packed optimizer step so the full [n_vocab, n_tokens] logits are
         // never materialized. n_ce_tiles is the vocabulary tile count C (>= 1).
