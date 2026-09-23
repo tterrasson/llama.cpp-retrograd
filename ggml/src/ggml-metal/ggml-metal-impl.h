@@ -1384,4 +1384,24 @@ typedef struct {
     int64_t ne;
 } ggml_metal_kargs_silu_back;
 
+// retro delta: RMS-norm backward (LoRA training on Metal)
+typedef struct {
+     int32_t ne00;
+     float   eps;
+    uint64_t nb01; uint64_t nb02; uint64_t nb03; // src0 = dz (grad)
+    uint64_t nb11; uint64_t nb12; uint64_t nb13; // src1 = x  (forward input)
+    uint64_t nb1;  uint64_t nb2;  uint64_t nb3;  // dst
+} ggml_metal_kargs_rms_norm_back;
+
+// retro delta: out-prod / weight-gradient GEMM (LoRA training on Metal)
+// strides are in ELEMENTS (host divides byte strides by sizeof(float)); s00=s0=1.
+typedef struct {
+    int64_t ne0; int64_t ne1; int64_t ne2; int64_t ne3; // dst dims
+    int64_t ne01;                                        // contraction dim
+    int64_t dps2; int64_t dps3;                          // GQA broadcast factors
+    int64_t s01; int64_t s02; int64_t s03;               // src0
+    int64_t s10; int64_t s11; int64_t s12; int64_t s13;  // src1
+    int64_t s1;  int64_t s2;  int64_t s3;                // dst
+} ggml_metal_kargs_out_prod;
+
 #endif // GGML_METAL_IMPL
