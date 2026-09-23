@@ -959,7 +959,7 @@ int main(void) {
                         t = ggml_opt_step_adamw(ctx, a, b, c, d, p);
                     } break;
                     case GGML_OPT_OPTIMIZER_TYPE_SGD: {
-                        ggml_tensor * p = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2);
+                        ggml_tensor * p = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
                         t = ggml_opt_step_sgd(ctx, a, b, p);
                     } break;
                     default: {

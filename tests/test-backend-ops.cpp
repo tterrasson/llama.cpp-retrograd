@@ -8252,7 +8252,8 @@ struct test_opt_step_sgd : public test_case {
         ggml_tensor * grad = ggml_new_tensor_4d(ctx, type, ne[0], ne[1], ne[2], ne[3]);
         ggml_set_name(grad, "grad");
 
-        ggml_tensor * sgd_params = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2);
+        // retro delta: alpha, wd, the rounding seed and the clipping scale.
+        ggml_tensor * sgd_params = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
         ggml_set_name(sgd_params, "sgd_params");
 
         ggml_tensor * out = ggml_opt_step_sgd(ctx, a, grad, sgd_params);

@@ -11,8 +11,20 @@
 #include "ggml.h"
 #include "ggml-impl.h"
 
-// GGML_OP_OPT_STEP_ADAMW, F16 parameters with stochastic rounding. Called from
-// ggml_compute_forward_opt_step_adamw's type switch in ops.cpp.
+// AdamW with stochastic rounding, F16 and BF16 parameters.
 void ggml_compute_forward_opt_step_adamw_f16(
+        const ggml_compute_params * params,
+        ggml_tensor * dst);
+
+void ggml_compute_forward_opt_step_adamw_bf16(
+        const ggml_compute_params * params,
+        ggml_tensor * dst);
+
+// SGD with stochastic rounding, F16 and BF16 parameters.
+void ggml_compute_forward_opt_step_sgd_f16(
+        const ggml_compute_params * params,
+        ggml_tensor * dst);
+
+void ggml_compute_forward_opt_step_sgd_bf16(
         const ggml_compute_params * params,
         ggml_tensor * dst);

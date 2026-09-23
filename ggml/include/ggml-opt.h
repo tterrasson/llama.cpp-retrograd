@@ -140,6 +140,12 @@ extern "C" {
             enum ggml_opt_gefen_variant variant;
             int64_t                     block_size; // <= 0 selects 1024
         } gefen;
+        // An F32 master copy per half-precision parameter, updated by the F32
+        // step and cast back into the parameter's own store. Structural rather
+        // than a hyperparameter: it decides whether a slot exists and whether
+        // the step is one node or two, which is what this struct carries.
+        // Ignored by an F32 parameter, which is already its own master.
+        bool master_weights;
     };
 
     // The layout every optimizer's frozen v1 declares.
@@ -166,6 +172,11 @@ extern "C" {
         GGML_OPT_SLOT_INIT_ZERO             = 0, // every element zero
         GGML_OPT_SLOT_INIT_CODE             = 1, // every byte the same code
         GGML_OPT_SLOT_INIT_UNIFORM_CODEBOOK = 2, // c[k] = -1 + 2k/(n-1), F32
+        // The parameter's own values, widened. The one initializer whose bytes
+        // do not come from the definition: the allocator widens the parameter
+        // instead, and ggml_opt_slot_initial_bytes answers false for it so the
+        // "one definition, one reader" contract of that function still holds.
+        GGML_OPT_SLOT_INIT_PARAMETER        = 3,
     };
 
     struct ggml_opt_slot_def {
@@ -193,6 +204,19 @@ extern "C" {
             const struct ggml_opt_optimizer_layout * layout,
             int64_t                                * n_slots);
 
+    // retro delta: the F32 master copy of one half-precision parameter, when
+    // the layout asks for one.
+    //
+    // The one slot the tables above cannot declare. A slot table belongs to an
+    // optimizer, and this slot's existence depends on the *parameter's* dtype,
+    // so it is answered per parameter here rather than folded into a table
+    // that has no parameter to look at. Returns false, leaving `out` untouched,
+    // for an F32 parameter and for a layout that did not ask.
+    GGML_API bool ggml_opt_master_slot(
+            const struct ggml_opt_optimizer_layout * layout,
+            enum ggml_type                           param_type,
+            struct ggml_opt_slot_def               * out);
+
     // How many hyperparameters one optimizer's update step reads, excluding
     // the shared gradient-clipping scale appended to them.
     GGML_API int64_t ggml_opt_optimizer_n_params(enum ggml_opt_optimizer_type optimizer);
@@ -207,7 +231,9 @@ extern "C" {
     // alone. This is what the allocator writes into a live slot, exposed so the
     // initializer can be checked without allocating a graph: one definition,
     // one reader. Returns false for a buffer that is not exactly the slot's
-    // size, which is the only way a caller can get a partial answer.
+    // size, which is the only way a caller can get a partial answer, and false
+    // for GGML_OPT_SLOT_INIT_PARAMETER, whose bytes are the parameter's and
+    // not the definition's.
     GGML_API bool ggml_opt_slot_initial_bytes(
             const struct ggml_opt_slot_def * def, int64_t n_elements, void * out, size_t n_bytes);
 

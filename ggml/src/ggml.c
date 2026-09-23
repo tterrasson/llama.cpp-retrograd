@@ -6594,7 +6594,9 @@ struct ggml_tensor * ggml_opt_step_adamw(
     GGML_ASSERT(ggml_are_same_shape(a, grad));
     GGML_ASSERT(ggml_are_same_shape(a, m));
     GGML_ASSERT(ggml_are_same_shape(a, v));
-    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16);
+    // retro delta: a half-precision parameter is updated in place, with the
+    // store rounded stochastically; the gradient and both moments stay F32.
+    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_BF16);
     GGML_ASSERT(grad->type == GGML_TYPE_F32);
     GGML_ASSERT(m->type == GGML_TYPE_F32);
     GGML_ASSERT(v->type == GGML_TYPE_F32);
@@ -6627,7 +6629,10 @@ struct ggml_tensor * ggml_opt_step_sgd(
     GGML_ASSERT(a->flags & GGML_TENSOR_FLAG_PARAM);
     GGML_ASSERT(ggml_are_same_shape(a, grad));
     GGML_ASSERT(params->type == GGML_TYPE_F32);
-    GGML_ASSERT(ggml_nelements(params) == 2);
+    // retro delta: alpha, wd, the rounding seed, and the gradient-clipping
+    // scale, applied inside the kernel as AdamW's is rather than as a
+    // full-size scaled copy of every gradient.
+    GGML_ASSERT(ggml_nelements(params) == 4);
 
     struct ggml_tensor * result = ggml_view_tensor(ctx, a);
 
@@ -8354,7 +8359,10 @@ void ggml_build_backward_expand(
             if (!node->src[j] || ignore_src[j] || !grads_needed[ggml_hash_find(&cgraph->visited_hash_set, node->src[j])]) {
                 continue;
             }
-            GGML_ASSERT(node->src[j]->type == GGML_TYPE_F32 || node->src[j]->type == GGML_TYPE_F16);
+            // retro delta: BF16 joins the float types a differentiable source
+            // may be stored as; the accumulator below is F32 either way.
+            GGML_ASSERT(node->src[j]->type == GGML_TYPE_F32 || node->src[j]->type == GGML_TYPE_F16 ||
+                        node->src[j]->type == GGML_TYPE_BF16);
             node_needs_grad = true;
             break;
         }
