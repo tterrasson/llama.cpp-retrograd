@@ -2012,3 +2012,179 @@ kernel void kernel_get_rows_back_f32(
         atomic_fetch_add_explicit(d + i00, s[i00], memory_order_relaxed);
     }
 }
+
+// retro delta: fixed-block Gefen, both phases. One threadgroup owns one whole
+// quantization block, which is what the CPU reference's per-worker block
+// ownership buys: no element of a block loses its old scale before every
+// element of that block has been read against it.
+
+// The uniform codebook's nearest entry for a value in [-1, 1], ties to the
+// lower index. Mirrors ggml_gefen_nearest_code; the two must agree exactly or a
+// checkpoint written on one backend decodes differently on the other.
+static uchar retro_gefen_nearest_code(float value, int levels) {
+    const float top = (float) (levels - 1);
+    const float position = (value + 1.0f)*0.5f*top;
+    if (!(position > 0.0f)) {
+        // Catches NaN as well, which has no nearest entry to speak of.
+        return 0;
+    }
+    if (position >= top) {
+        return (uchar) (levels - 1);
+    }
+    // ceil(x - 1/2) is nearest-with-ties-to-the-lower-index; the usual
+    // floor(x + 1/2) would send an exact midpoint upwards.
+    return (uchar) ceil(position - 0.5f);
+}
+
+// Phase A. Pure: reads the clipped gradient and the old state, answers
+// [scale, second moment] per block. Under shared_v there is no scale to
+// compute and the first row stays zero.
+template<bool quantized>
+kernel void kernel_opt_step_gefen_stats_impl(
+        constant ggml_metal_kargs_opt_step_gefen & args,
+        device const float * g,
+        device const char  * moment,
+        device const float * scales,
+        device const float * v,
+        device const float * codebook,
+        device const float * pars,
+        device       float * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3 ntg[[threads_per_threadgroup]]) {
+    threadgroup float sh[32];
+
+    const int64_t b = tgpig.x;
+
+    const float beta1  = pars[1];
+    const float beta2  = pars[2];
+    const float gscale = pars[7];
+
+    const int64_t i0 = b*args.bs;
+    const int64_t i1 = MIN(i0 + args.bs, args.np);
+
+    const int   levels    = args.levels;
+    const float scale_old = quantized ? scales[b] : 0.0f;
+
+    device const uchar * i_old = (device const uchar *) moment;
+
+    float sum_sq  = 0.0f;
+    float max_abs = 0.0f;
+    for (int64_t i = i0 + tpitg.x; i < i1; i += ntg.x) {
+        const float gi = g[i]*gscale;
+        sum_sq += gi*gi;
+        if (quantized) {
+            // The same recomputed first moment the update will use, so the
+            // scale a block is quantized against is the scale of the values
+            // actually being quantized.
+            const int   code    = (int) i_old[i];
+            const float decoded = scale_old*codebook[code < levels ? code : levels - 1];
+            const float mi      = beta1*decoded + (1.0f - beta1)*gi;
+            max_abs = MAX(max_abs, fabs(mi));
+        }
+    }
+
+    const float sum_total = retro_tg_sum(sum_sq, sh, sgitg, tiisg, ntg.x);
+    const float max_total = quantized ? retro_tg_max(max_abs, sh, sgitg, tiisg, ntg.x) : 0.0f;
+
+    if (tpitg.x == 0) {
+        // The mean is over the block's actual elements, so a partial trailing
+        // block is not diluted by the padding it does not have.
+        const float mean_sq = sum_total/(float) (i1 - i0);
+        dst[2*b + 0] = max_total;
+        dst[2*b + 1] = beta2*v[b] + (1.0f - beta2)*mean_sq;
+    }
+}
+
+typedef decltype(kernel_opt_step_gefen_stats_impl<false>) kernel_opt_step_gefen_stats_t;
+
+template [[host_name("kernel_opt_step_gefen_stats_shared_v")]]
+kernel kernel_opt_step_gefen_stats_t kernel_opt_step_gefen_stats_impl<false>;
+template [[host_name("kernel_opt_step_gefen_stats_quantized_m")]]
+kernel kernel_opt_step_gefen_stats_t kernel_opt_step_gefen_stats_impl<true>;
+
+// Phase B. Mutates the weights, the first moment, the scales and the second
+// moments; `stats` is phase A's answer.
+template<bool quantized>
+kernel void kernel_opt_step_gefen_impl(
+        constant ggml_metal_kargs_opt_step_gefen & args,
+        device       float * w,
+        device const float * g,
+        device       char  * moment,
+        device       float * scales,
+        device       float * v,
+        device const float * stats,
+        device const float * codebook,
+        device const float * pars,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3 ntg[[threads_per_threadgroup]]) {
+    const int64_t b = tgpig.x;
+
+    const float alpha  = pars[0];
+    const float beta1  = pars[1];
+    const float eps    = pars[3];
+    const float wd     = pars[4];
+    const float beta1h = pars[5];
+    const float beta2h = pars[6];
+    const float gscale = pars[7];
+    const float keep   = 1.0f - alpha*wd;
+
+    const int64_t i0 = b*args.bs;
+    const int64_t i1 = MIN(i0 + args.bs, args.np);
+
+    const float scale_new = stats[2*b + 0];
+    const float v_new     = stats[2*b + 1];
+    const float denom     = sqrt(v_new*beta2h) + eps;
+    // Read once, before any element of this block overwrites it.
+    const float scale_old = quantized ? scales[b] : 0.0f;
+
+    const int levels = args.levels;
+
+    device uchar * i_state = (device uchar *) moment;
+    device float * m_state = (device float *) moment;
+
+    for (int64_t i = i0 + tpitg.x; i < i1; i += ntg.x) {
+        const float gi = g[i]*gscale;
+        float mi;
+        if (quantized) {
+            const int   code    = (int) i_state[i];
+            const float decoded = scale_old*codebook[code < levels ? code : levels - 1];
+            mi = beta1*decoded + (1.0f - beta1)*gi;
+        } else {
+            mi = beta1*m_state[i] + (1.0f - beta1)*gi;
+        }
+        // Decoupled, and against the old weight: decaying an already updated
+        // weight adds a cross term AdamW does not have.
+        w[i] = w[i]*keep - alpha*(mi*beta1h)/denom;
+        if (quantized) {
+            // A zero block has no direction to quantize; its scale carries the
+            // zero and the index only has to be canonical.
+            i_state[i] = scale_new > 0.0f
+                    ? retro_gefen_nearest_code(mi/scale_new, levels)
+                    : (uchar) args.zero_code;
+        } else {
+            m_state[i] = mi;
+        }
+    }
+
+    // Every thread of this threadgroup has read the old scale by now, so the
+    // block's new one can be published.
+    threadgroup_barrier(mem_flags::mem_device);
+
+    if (tpitg.x == 0) {
+        if (quantized) {
+            scales[b] = scale_new;
+        }
+        v[b] = v_new;
+    }
+}
+
+typedef decltype(kernel_opt_step_gefen_impl<false>) kernel_opt_step_gefen_t;
+
+template [[host_name("kernel_opt_step_gefen_shared_v")]]
+kernel kernel_opt_step_gefen_t kernel_opt_step_gefen_impl<false>;
+template [[host_name("kernel_opt_step_gefen_quantized_m")]]
+kernel kernel_opt_step_gefen_t kernel_opt_step_gefen_impl<true>;

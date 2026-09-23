@@ -1,0 +1,90 @@
+#version 450
+
+#include "gefen_head.glsl"
+
+layout(local_size_x = GEFEN_WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) buffer X {float x[];};
+layout (binding = 1) readonly buffer G {float grad[];};
+#ifdef QUANTIZED
+layout (binding = 2) buffer M {uint indices[];};
+#else
+layout (binding = 2) buffer M {float moment[];};
+#endif
+layout (binding = 3) buffer S {float scales[];};
+layout (binding = 4) buffer V {float v[];};
+layout (binding = 5) readonly buffer T {float stats[];};
+layout (binding = 6) readonly buffer C {float codebook[];};
+layout (binding = 7) readonly buffer P {float pars[];};
+
+// Phase B. Mutates weights, first moment, scales and second moments; `stats`
+// is phase A's answer.
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint b   = gl_WorkGroupID.x;
+
+    const float alpha  = pars[0];
+    const float beta1  = pars[1];
+    const float eps    = pars[3];
+    const float wd     = pars[4];
+    const float beta1h = pars[5];
+    const float beta2h = pars[6];
+    const float gscale = pars[7];
+    const float keep   = 1.0f - alpha*wd;
+
+    const uint i0 = b*p.bs;
+    const uint i1 = min(i0 + p.bs, p.np);
+
+    const float scale_new = stats[2*b + 0];
+    const float v_new     = stats[2*b + 1];
+    const float denom     = sqrt(v_new*beta2h) + eps;
+
+#ifdef QUANTIZED
+    // Read before any element of this block overwrites it.
+    const float scale_old = scales[b];
+
+    // One invocation per packed word, so no word is read-modify-written twice.
+    const uint w0 = i0 >> 2;
+    const uint w1 = (i1 + 3u) >> 2;
+    for (uint wi = w0 + tid; wi < w1; wi += GEFEN_WORKGROUP_SIZE) {
+        const uint word = indices[wi];
+        uint updated_word = word;
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+            const uint i = 4u*wi + k;
+            if (i >= i1) {
+                continue;
+            }
+            const float gi      = grad[i]*gscale;
+            const uint  code    = (word >> (8u*k)) & 0xFFu;
+            const float decoded = scale_old*codebook[code < p.levels ? code : p.levels - 1u];
+            const float mi      = beta1*decoded + (1.0f - beta1)*gi;
+            // Decoupled, against the old weight: decaying the updated weight
+            // adds a cross term AdamW does not have.
+            x[i] = x[i]*keep - alpha*(mi*beta1h)/denom;
+            // Zero block: the scale carries the zero, the index is canonical.
+            const uint new_code = scale_new > 0.0f
+                    ? gefen_nearest_code(mi/scale_new, p.levels)
+                    : p.zero_code;
+            updated_word = (updated_word & ~(0xFFu << (8u*k))) | (new_code << (8u*k));
+        }
+        indices[wi] = updated_word;
+    }
+#else
+    for (uint i = i0 + tid; i < i1; i += GEFEN_WORKGROUP_SIZE) {
+        const float gi = grad[i]*gscale;
+        const float mi = beta1*moment[i] + (1.0f - beta1)*gi;
+        x[i] = x[i]*keep - alpha*(mi*beta1h)/denom;
+        moment[i] = mi;
+    }
+#endif
+
+    // All invocations have read the old scale, so the new one can be published.
+    barrier();
+
+    if (tid == 0u) {
+#ifdef QUANTIZED
+        scales[b] = scale_new;
+#endif
+        v[b] = v_new;
+    }
+}
