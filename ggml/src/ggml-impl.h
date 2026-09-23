@@ -693,6 +693,50 @@ static inline ggml_bf16_t ggml_compute_fp32_to_bf16(float s) {
 #define GGML_FP32_TO_BF16(x) ggml_compute_fp32_to_bf16(x)
 #define GGML_BF16_TO_FP32(x) ggml_compute_bf16_to_fp32(x)
 
+// retro delta: stochastic rounding, for training a parameter stored in BF16.
+//
+// The same argument as the F16 helpers above, sharpened by a shorter
+// significand: 8 bits against F16's 11, so a discarded update is eight times
+// larger. `ggml_sr_uniform` is shared with the F16 path.
+//
+// A backend kernel that writes a BF16 parameter reimplements this identically
+// and is bound to the CPU by an exact equality test through
+// RETRO_PROBE_OP_OPT_STEP_ADAMW_BF16.
+
+// The BF16 value adjacent to `bits`, towards +inf when `up`, else towards
+// -inf. A plain magnitude increment, correct across the subnormal/normal
+// boundary, saturating at infinity.
+static inline uint16_t ggml_bf16_neighbour(uint16_t bits, int up) {
+    const uint16_t sign = bits & UINT16_C(0x8000);
+    const uint16_t mag  = bits & UINT16_C(0x7FFF);
+    if (mag == 0) {
+        return up ? UINT16_C(0x0001) : UINT16_C(0x8001);
+    }
+    const int grow = up ? (sign == 0) : (sign != 0);
+    return (uint16_t) (sign | (uint16_t) (grow ? mag + 1 : mag - 1));
+}
+
+// `x` snapped to one of its two neighbouring BF16 values, unbiased in
+// expectation. `u` must be uniform in [0, 1). The result is exactly
+// representable in BF16, so the caller's ordinary conversion stores it
+// verbatim.
+static inline float ggml_stochastic_round_bf16(float x, float u) {
+    const ggml_bf16_t nearest   = GGML_FP32_TO_BF16(x);
+    const float       nearest_f = GGML_BF16_TO_FP32(nearest);
+    const float       residual  = x - nearest_f;
+    if (residual == 0.0f) {
+        return nearest_f;
+    }
+    ggml_bf16_t other;
+    other.bits = ggml_bf16_neighbour(nearest.bits, residual > 0.0f);
+    const float other_f = GGML_BF16_TO_FP32(other);
+    const float span    = other_f - nearest_f;
+    // Saturating at infinity leaves an infinite span, hence probability zero:
+    // stochastic rounding never manufactures an overflow.
+    const float p = span != 0.0f && isfinite(span) ? residual / span : 0.0f;
+    return u < p ? other_f : nearest_f;
+}
+
 static inline int32_t ggml_node_get_use_count(const struct ggml_cgraph * cgraph, int node_idx) {
     const struct ggml_tensor * node = cgraph->nodes[node_idx];
 

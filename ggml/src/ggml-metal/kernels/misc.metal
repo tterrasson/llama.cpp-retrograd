@@ -302,7 +302,8 @@ kernel void kernel_opt_step_sgd_f32(
         return;
     }
 
-    x[gid] = x[gid] * (1.0f - pars[0] * pars[1]) - pars[0] * g[gid];
+    // retro delta: pars[3] is the gradient-clipping scale.
+    x[gid] = x[gid] * (1.0f - pars[0] * pars[1]) - pars[0] * pars[3] * g[gid];
 }
 
 template<typename T>
