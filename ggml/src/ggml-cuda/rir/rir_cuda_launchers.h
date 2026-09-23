@@ -13,33 +13,53 @@
     X(l2_norm_back) \
     X(rms_norm_back) \
     X(rms_norm_back_shared_reduce) \
+    X(rms_norm_back_flat_rows) \
     X(unary_abs) \
+    X(unary_abs_flat_linear) \
     X(unary_sgn) \
+    X(unary_sgn_flat_linear) \
     X(unary_neg) \
+    X(unary_neg_flat_linear) \
     X(unary_step) \
+    X(unary_step_flat_linear) \
     X(unary_tanh) \
+    X(unary_tanh_flat_linear) \
     X(unary_elu) \
+    X(unary_elu_flat_linear) \
     X(unary_relu) \
+    X(unary_relu_flat_linear) \
     X(unary_sigmoid) \
+    X(unary_sigmoid_flat_linear) \
     X(unary_gelu_quick) \
+    X(unary_gelu_quick_flat_linear) \
     X(unary_silu) \
+    X(unary_silu_flat_linear) \
     X(unary_hardswish) \
+    X(unary_hardswish_flat_linear) \
     X(unary_hardsigmoid) \
+    X(unary_hardsigmoid_flat_linear) \
     X(unary_exp) \
+    X(unary_exp_flat_linear) \
     X(unary_expm1) \
+    X(unary_expm1_flat_linear) \
     X(add) \
     X(add_vec4) \
+    X(add_flat_linear) \
     X(mul) \
     X(mul_vec4) \
+    X(mul_flat_linear) \
     X(scale) \
+    X(scale_flat_linear) \
     X(add_repeat) \
     X(add_repeat_vec4) \
     X(mul_repeat) \
     X(mul_repeat_vec4) \
     X(add_f16) \
     X(add_f16_vec4) \
+    X(add_f16_flat_linear) \
     X(mul_f16) \
     X(mul_f16_vec4) \
+    X(mul_f16_flat_linear) \
     X(add_repeat_f16) \
     X(add_repeat_f16_vec4) \
     X(mul_repeat_f16) \
