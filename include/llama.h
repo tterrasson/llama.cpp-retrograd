@@ -1739,6 +1739,11 @@ extern "C" {
         // buffer, evicting one token chunk at a time. Numerically inert. Requires
         // n_ce_seq_chunk > 0 to bound anything; ignored (with a warning) otherwise.
         bool    ce_offload_logsoftmax;
+
+        // retro delta: recompute transformer activations during the
+        // backward pass, retaining every Nth layer output as a checkpoint.
+        bool    gradient_checkpointing;
+        uint32_t checkpoint_every_n_layers;
     };
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
@@ -1823,6 +1828,14 @@ extern "C" {
     LLAMA_API void llama_opt_get_timing(
             const struct llama_context * lctx,
             struct llama_opt_timing * out_timing);
+
+    // retro delta: what the retained activation checkpoints cost and how long they
+    // are held, from the last backward graph the optimizer built. See
+    // ggml_opt_checkpoint_profile. False (and a zeroed profile) when gradient
+    // checkpointing is off or no backward graph exists yet.
+    LLAMA_API bool llama_opt_get_checkpoint_profile(
+            const struct llama_context * lctx,
+            struct ggml_opt_checkpoint_profile * out_profile);
 
     // retro delta: training-graph preflight. Requires llama_opt_init.
     enum llama_opt_preflight_check {
