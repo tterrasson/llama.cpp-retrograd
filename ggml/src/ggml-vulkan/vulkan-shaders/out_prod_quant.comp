@@ -1,0 +1,71 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+#include "types.glsl"
+#include "generic_binary_head.glsl"
+#include "dequant_funcs.glsl"
+
+// out_prod with a quantized src0 (weight-gradient / activation-gradient case
+// dx = out_prod(W, dy) where W is a quantized model weight). One thread per dst
+// element: dst[i0,i1,i2,i3] = Sum_k dequant(src0)[i0,k,a_i2,a_i3] * src1[i1,k,i2,i3].
+// src0 element i0 within a row lives in block i0/QUANT_K; the two-element
+// dequantize()/get_dm() contract from dequant_funcs.glsl is the same one
+// get_rows_quant relies on, so element (iqs,sel) is picked to match its layout.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+#ifdef NEEDS_INIT_IQ_SHMEM
+    init_iq_shmem(gl_WorkGroupSize);
+#endif
+
+    const uint idx = get_idx();
+    if (idx >= p.ne) {
+        return;
+    }
+
+    uint tmp = idx;
+    const uint i0 = tmp % p.ne20; tmp /= p.ne20;
+    const uint i1 = tmp % p.ne21; tmp /= p.ne21;
+    const uint i2 = tmp % p.ne22; tmp /= p.ne22;
+    const uint i3 = tmp;
+
+    // src0 rows broadcast over the batch dims (dps2/dps3 style)
+    const uint a_i2 = i2 / (p.ne22 / p.ne02);
+    const uint a_i3 = i3 / (p.ne23 / p.ne03);
+
+    const uint b_i0 = i1 % p.ne10;
+    const uint b_i2 = i2;
+    const uint b_i3 = i3;
+
+    // which packed element of the block (and which half of the dequantize() pair)
+    const uint rem        = i0 % QUANT_K;
+    const uint blk_in_row = i0 / QUANT_K;
+#if QUANT_R == 1
+    const uint sel = rem & 1u;
+    const uint iqs = rem - sel;
+#else
+    const uint half_k = QUANT_K / 2u;
+    const uint sel = rem >= half_k ? 1u : 0u;
+    const uint iqs = rem - sel * half_k;
+#endif
+
+    // nb0x for a quantized src0 are in block units (byte stride / block size).
+    const uint a_row_base = a_i3 * p.nb03 + a_i2 * p.nb02 + blk_in_row;
+    const uint boff_base  = get_boffset() + b_i3 * p.nb13 + b_i2 * p.nb12 + b_i0 * p.nb10;
+
+    float sum = 0.0f;
+    const uint K = p.ne01;
+    for (uint k = 0; k < K; ++k) {
+        const uint ib = a_row_base + k * p.nb01;
+        vec2 v = dequantize(ib, iqs, 0);
+        const vec2 dm = get_dm(ib, 0);
+        v = v * dm.x + dm.y;
+        const float a_val = sel == 0u ? v.x : v.y;
+        sum += a_val * float(data_b[boff_base + k * p.nb11]);
+    }
+
+    const uint doff = get_doffset() + i3 * p.nb23 + i2 * p.nb22 + i1 * p.nb21 + i0 * p.nb20;
+    data_d[doff] = D_TYPE(sum);
+}
