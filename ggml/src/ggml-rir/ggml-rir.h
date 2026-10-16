@@ -40,7 +40,7 @@ typedef enum ggml_rir_mode {
 } ggml_rir_mode;
 
 // The configured mode. Pipeline creation reads this one, at device init.
-ggml_rir_mode ggml_rir_get_mode(void);
+GGML_API ggml_rir_mode ggml_rir_get_mode(void);
 
 // Set the policy programmatically, so it can be a versioned runtime option
 // rather than only an environment variable. Takes
@@ -52,24 +52,24 @@ ggml_rir_mode ggml_rir_get_mode(void);
 // one way `executed_impl` could start lying. Setting the value it already has is
 // always accepted, so a second trainer asking for the same policy is not an
 // error while a second trainer asking for a different one is.
-int ggml_rir_set_mode(ggml_rir_mode mode);
+GGML_API int ggml_rir_set_mode(ggml_rir_mode mode);
 
 // Whether the mode has been read, i.e. whether ggml_rir_set_mode can still
 // succeed with a new value.
-bool ggml_rir_mode_is_latched(void);
+GGML_API bool ggml_rir_mode_is_latched(void);
 
 // The mode a dispatch site must honour: the configured mode, lowered to OFF
 // while the probe forces the native path. Only the dispatch sites use it, so
 // forcing native can never un-create a pipeline that was already built.
-ggml_rir_mode ggml_rir_get_dispatch_mode(void);
+GGML_API ggml_rir_mode ggml_rir_get_dispatch_mode(void);
 
 // Probe-only knob: force every subsequent dispatch onto the native kernel.
 // It can only *lower* the effective mode, never raise it — raising it would
 // claim a pipeline that was never created at device init. That asymmetry is
 // what keeps `retro_probe_op_run_ex(..., NATIVE, ...)` honest without
 // reintroducing a mid-run policy change.
-void ggml_rir_set_force_native(bool force);
-bool ggml_rir_get_force_native(void);
+GGML_API void ggml_rir_set_force_native(bool force);
+GGML_API bool ggml_rir_get_force_native(void);
 
 // Stable rejection taxonomy. Order is ABI.
 typedef enum ggml_rir_reject {
@@ -111,14 +111,14 @@ typedef struct ggml_rir_counters {
 } ggml_rir_counters;
 
 // Returns a snapshot; accumulation functions below are thread-safe.
-ggml_rir_counters ggml_rir_counters_snapshot(void);
-void ggml_rir_count_seen(void);
-void ggml_rir_count_eligible(void);
+GGML_API ggml_rir_counters ggml_rir_counters_snapshot(void);
+GGML_API void ggml_rir_count_seen(void);
+GGML_API void ggml_rir_count_eligible(void);
 // `variant_id` must be the static registry string of the variant that was
 // encoded, so a probe can report *which* variant ran and not merely "some RIR".
-void ggml_rir_count_dispatched(const char * variant_id);
-void ggml_rir_count_native(void);
-void ggml_rir_count_reject(ggml_rir_reject why);
+GGML_API void ggml_rir_count_dispatched(const char * variant_id);
+GGML_API void ggml_rir_count_native(void);
+GGML_API void ggml_rir_count_reject(ggml_rir_reject why);
 
 // Per-site breakdown. The aggregate above answers "how
 // much of everything fell back"; with more than one integrated op that is no
@@ -133,8 +133,8 @@ void ggml_rir_count_reject(ggml_rir_reject why);
 //
 // `ggml_op` and `backend` must be static storage (the "GGML_OP_*" spelling from
 // the registry and a rir_backend), because rows keep the pointer.
-void ggml_rir_site_begin(const char * ggml_op, uint8_t backend);
-void ggml_rir_site_end(void);
+GGML_API void ggml_rir_site_begin(const char * ggml_op, uint8_t backend);
+GGML_API void ggml_rir_site_end(void);
 
 #define GGML_RIR_MAX_SITES 32
 // Variants dispatched *at one site*. One per priority level and one per `src0`
@@ -175,9 +175,9 @@ typedef struct ggml_rir_site_counters {
 
 // Rows are append-only and never reordered, so an index stays valid for the
 // process lifetime. `ggml_rir_site_count` is monotonic.
-uint32_t ggml_rir_site_count(void);
+GGML_API uint32_t ggml_rir_site_count(void);
 // Zeroed row (ggml_op == NULL) when `index` is out of range.
-ggml_rir_site_counters ggml_rir_site_snapshot(uint32_t index);
+GGML_API ggml_rir_site_counters ggml_rir_site_snapshot(uint32_t index);
 
 // Which implementation actually ran, for the op-at-a-time probe path. The
 // counters answer "how often"; this answers "what ran, and why not the other
@@ -197,19 +197,19 @@ typedef struct ggml_rir_decision {
 
 // Process-wide, last writer wins. Meaningful for a single-op graph; a full
 // training graph must be read through the counters instead.
-void ggml_rir_decision_reset(void);
-ggml_rir_decision ggml_rir_decision_last(void);
+GGML_API void ggml_rir_decision_reset(void);
+GGML_API ggml_rir_decision ggml_rir_decision_last(void);
 
 // Stable lowercase spelling of a rir_backend ("cuda"/"vulkan"/"metal"/"cpu",
 // "unknown" otherwise). One spelling for every report, so a test can match on
 // it: the FFI report, the capability report and the stats line must not each
 // invent their own.
-const char * ggml_rir_backend_name(uint8_t backend);
+GGML_API const char * ggml_rir_backend_name(uint8_t backend);
 
 // Stable lowercase spelling of a ggml_rir_reject ("matched", "stride", ...),
 // "unknown" out of range. Same reason: the reject taxonomy is what a coverage
 // run is read through, so its names must be one list, not four.
-const char * ggml_rir_reject_name(int32_t reject);
+GGML_API const char * ggml_rir_reject_name(int32_t reject);
 
 // Registry lookup: the **fallback** variant of `kernel` for `backend`, or NULL.
 // Called at context init to resolve pipelines, never in the hot path.
@@ -217,7 +217,7 @@ const char * ggml_rir_reject_name(int32_t reject);
 // A (kernel, backend) pair may publish several variants arbitrated per shape;
 // this returns the one with no shape rule, i.e. the one the pair is named
 // after. Ask `ggml_rir_find_variant_named` for a specialization.
-const rir_variant_desc * ggml_rir_find_variant(const char * kernel, rir_backend backend);
+GGML_API const rir_variant_desc * ggml_rir_find_variant(const char * kernel, rir_backend backend);
 
 // Registry lookup by full artifact identity: `variant` is the name the schedule
 // table gave this lowering ("blocked"), or NULL for the pair's fallback.
@@ -225,7 +225,7 @@ const rir_variant_desc * ggml_rir_find_variant(const char * kernel, rir_backend 
 // This is the lookup a backend needs once a kernel has more than one lowering:
 // a Vulkan pipeline is built from a per-variant SPIR-V blob, so the object and
 // the registry row must be matched on the variant and not on the kernel.
-const rir_variant_desc * ggml_rir_find_variant_named(const char * kernel, const char * variant,
+GGML_API const rir_variant_desc * ggml_rir_find_variant_named(const char * kernel, const char * variant,
                                                      rir_backend backend);
 
 // Registry lookup by the thing a dispatcher actually holds: a ggml op. Returns
@@ -241,7 +241,7 @@ const rir_variant_desc * ggml_rir_find_variant_named(const char * kernel, const 
 // instead of descriptive: a backend must not name a kernel string of its own.
 // `ggml_op` is an `enum ggml_op`, taken as int32_t so
 // the header stays usable from C and Objective-C.
-const rir_variant_desc * ggml_rir_find_variant_for_op(int32_t ggml_op, rir_backend backend);
+GGML_API const rir_variant_desc * ggml_rir_find_variant_for_op(int32_t ggml_op, rir_backend backend);
 
 // The same question asked about a *node*, which is the only form that can
 // answer it once a pair publishes more than one variant: among the rows
@@ -252,13 +252,13 @@ const rir_variant_desc * ggml_rir_find_variant_for_op(int32_t ggml_op, rir_backe
 // Every dispatch site and the require-preflight go through this one, because a
 // contract evaluated against one variant and encoded with another is exactly
 // the drift the registry exists to prevent.
-const rir_variant_desc * ggml_rir_find_variant_for_node(int32_t ggml_op, rir_backend backend,
+GGML_API const rir_variant_desc * ggml_rir_find_variant_for_node(int32_t ggml_op, rir_backend backend,
                                                         const struct ggml_tensor * node);
 
 // Whether every shape rule `v` publishes holds for `node`. Exposed because a
 // backend that keeps one object per variant (a Vulkan pipeline) needs to say
 // which variant a node would use before it can check that object exists.
-bool ggml_rir_variant_fits_shape(const rir_variant_desc * v, const struct ggml_tensor * node);
+GGML_API bool ggml_rir_variant_fits_shape(const rir_variant_desc * v, const struct ggml_tensor * node);
 
 // Whether the *axis* half of a variant's contract holds for `node`: every
 // binding sharing an axis agrees on its extent, and every **folded** axis
@@ -269,7 +269,7 @@ bool ggml_rir_variant_fits_shape(const rir_variant_desc * v, const struct ggml_t
 // claims a divisor. Evaluated before selection for that reason — a repeated node
 // that reached `mul` would be refused with `shape` and would never try the
 // kernel written for it.
-bool ggml_rir_variant_fits_axes(const rir_variant_desc * v, const struct ggml_tensor * node);
+GGML_API bool ggml_rir_variant_fits_axes(const rir_variant_desc * v, const struct ggml_tensor * node);
 
 // Whether the *layout* a variant needs holds for `node`. Today that is the
 // vector width: a variant reading four elements at a time only accepts a
@@ -277,7 +277,7 @@ bool ggml_rir_variant_fits_axes(const rir_variant_desc * v, const struct ggml_te
 // sense as a shape rule — evaluated before a variant is selected, so a
 // permuted view falls to the pair's scalar fallback instead of falling out of
 // RIR entirely.
-bool ggml_rir_variant_fits_layout(const rir_variant_desc * v, const struct ggml_tensor * node);
+GGML_API bool ggml_rir_variant_fits_layout(const rir_variant_desc * v, const struct ggml_tensor * node);
 
 // Whether the *dtypes* a variant declares hold for `node`, binding by binding.
 //
@@ -288,7 +288,7 @@ bool ggml_rir_variant_fits_layout(const rir_variant_desc * v, const struct ggml_
 // before selection, so a type no row claims falls to the pair's fallback and
 // leaves through the portable contract with `dtype` — never onto a row that
 // would reinterpret its bytes.
-bool ggml_rir_variant_fits_dtype(const rir_variant_desc * v, const struct ggml_tensor * node);
+GGML_API bool ggml_rir_variant_fits_dtype(const rir_variant_desc * v, const struct ggml_tensor * node);
 
 // Whether the **member of an op family** a variant declares is the node's own.
 //
@@ -302,7 +302,7 @@ bool ggml_rir_variant_fits_dtype(const rir_variant_desc * v, const struct ggml_t
 // shape-blind fallback and be encoded by a kernel computing a *different
 // function* — the one failure mode every other check in this file would have
 // called green.
-bool ggml_rir_variant_fits_op_variant(const rir_variant_desc * v, const struct ggml_tensor * node);
+GGML_API bool ggml_rir_variant_fits_op_variant(const rir_variant_desc * v, const struct ggml_tensor * node);
 
 // The registry's policy for `(op, backend)`: NATIVE_ONLY when the pair is
 // pinned or simply absent. Resolved once, like the selection above.
@@ -312,7 +312,7 @@ bool ggml_rir_variant_fits_op_variant(const rir_variant_desc * v, const struct g
 // differential matrix can run a registered-but-not-promoted variant against the
 // native kernel — the measurement a promotion decision needs. It can only raise
 // observe to prefer; a NATIVE_ONLY pair has no pipeline and stays unreachable.
-rir_policy ggml_rir_op_policy(int32_t ggml_op, rir_backend backend);
+GGML_API rir_policy ggml_rir_op_policy(int32_t ggml_op, rir_backend backend);
 
 // The parts of this op's ggml domain the RIR kernel does **not** claim, as a
 // bitmask of `ggml_rir_reject` values — `rir_op_policy.assumed_domain`.
@@ -331,14 +331,14 @@ rir_policy ggml_rir_op_policy(int32_t ggml_op, rir_backend backend);
 // Keyed by the registry's `"GGML_OP_*"` spelling rather than by the enum,
 // because that is what a *site row* carries: the two consumers that need this
 // are both reporting on a site they have already attributed.
-uint32_t ggml_rir_op_assumed_domain(const char * ggml_op_spelling, rir_backend backend);
+GGML_API uint32_t ggml_rir_op_assumed_domain(const char * ggml_op_spelling, rir_backend backend);
 
 // Whether `(op, backend)` is *targeted*: a variant exists **and** its policy is
 // PREFER_GENERATED, i.e. this pair is one whose native kernel RIR intends to
 // replace. Only targeted nodes are what `require` requires — requiring a pair
 // that is registered for observation only would fail graphs over a variant no
 // mode is ever allowed to encode.
-bool ggml_rir_op_is_targeted(int32_t ggml_op, rir_backend backend);
+GGML_API bool ggml_rir_op_is_targeted(int32_t ggml_op, rir_backend backend);
 
 // Whether the **native kernel of this pair is absent** from this build:
 // `rir_op_policy.native_retired`. The registry only
@@ -353,7 +353,7 @@ bool ggml_rir_op_is_targeted(int32_t ggml_op, rir_backend backend);
 // for a differential it cannot measure).
 // Keyed by spelling, and either spelling: the registry and a site row carry
 // "GGML_OP_ADD", a dispatch site holds `ggml_op_name`'s "ADD".
-bool ggml_rir_op_native_retired(const char * ggml_op_spelling, rir_backend backend);
+GGML_API bool ggml_rir_op_native_retired(const char * ggml_op_spelling, rir_backend backend);
 
 // The answer a backend's `supports_op` owes for a node RIR may serve: the pair
 // is promoted, the mode allows encoding, and the **portable** contract matches
@@ -373,7 +373,7 @@ bool ggml_rir_op_native_retired(const char * ggml_op_spelling, rir_backend backe
 // the RIR contract accepts the packed-QKV view the native Vulkan `l2_norm_back`
 // failed on. A backend whose native is retired
 // returns this and nothing else.
-bool ggml_rir_supports_op(uint8_t backend, const struct ggml_tensor * node);
+GGML_API bool ggml_rir_supports_op(uint8_t backend, const struct ggml_tensor * node);
 
 // The selection rule itself, over an explicit table: among the rows matching
 // `(ggml_op, backend)` whose policy is not NATIVE_ONLY **and whose shape rules
@@ -387,7 +387,7 @@ bool ggml_rir_supports_op(uint8_t backend, const struct ggml_tensor * node);
 //
 // Taking the tables as arguments is what makes the rule testable: the shipped
 // registry cannot exhibit a tie, a veto and a shape miss in the same run.
-const rir_variant_desc * ggml_rir_select_variant(
+GGML_API const rir_variant_desc * ggml_rir_select_variant(
         const rir_variant_desc * rows, uint32_t n_rows,
         const rir_op_policy * policies, uint32_t n_policies,
         int32_t ggml_op, uint8_t backend, const struct ggml_tensor * node);
@@ -396,11 +396,11 @@ const rir_variant_desc * ggml_rir_select_variant(
 // when every case held, otherwise a bitmask of the cases that failed — see
 // ggml-rir.cpp for what each bit means. Exposed so a lane with no GPU can still
 // assert that the registry's `priority` and `rir_op_policies` are load-bearing.
-uint32_t ggml_rir_selftest_selection(void);
+GGML_API uint32_t ggml_rir_selftest_selection(void);
 
 // The tensor a binding of `v` reads or writes on `node`: `src[source]`, or
 // `node` itself for the dst binding. NULL when the node has no such src.
-const struct ggml_tensor * ggml_rir_binding_tensor(const rir_variant_desc * v, uint32_t i,
+GGML_API const struct ggml_tensor * ggml_rir_binding_tensor(const rir_variant_desc * v, uint32_t i,
                                                    const struct ggml_tensor * node);
 
 // The portable half of the contract, decided from the registry row and the
@@ -411,7 +411,7 @@ const struct ggml_tensor * ggml_rir_binding_tensor(const rir_variant_desc * v, u
 // No backend restates any of this. A constraint that needs a pipeline, a device
 // limit or a descriptor offset to answer is the device half, and only that half
 // belongs in `ggml_rir_device_check_fn`.
-int32_t ggml_rir_evaluate_portable(const rir_variant_desc * v, const struct ggml_tensor * node);
+GGML_API int32_t ggml_rir_evaluate_portable(const rir_variant_desc * v, const struct ggml_tensor * node);
 
 // The device half of the contract, supplied by the backend: everything that
 // needs a pipeline, a device limit or a descriptor offset to answer. Returns
@@ -424,7 +424,7 @@ typedef int32_t (*ggml_rir_device_check_fn)(void * device_ctx, const struct ggml
 // Evaluates the portable part first, then delegates to `device_check`.
 // Counts nothing: the caller decides whether this evaluation is a dispatch
 // decision or a preflight probe.
-int32_t ggml_rir_evaluate(uint8_t backend, const struct ggml_tensor * node,
+GGML_API int32_t ggml_rir_evaluate(uint8_t backend, const struct ggml_tensor * node,
                           ggml_rir_device_check_fn device_check, void * device_ctx);
 
 // --- descriptor-driven dispatch ---------------------------------------------
@@ -447,13 +447,13 @@ int32_t ggml_rir_evaluate(uint8_t backend, const struct ggml_tensor * node,
 // extent per axis, then each binding's `nb[d]`. Returns false, writing nothing
 // meaningful, when the buffer size does not match or a binding is missing;
 // callers must have passed `ggml_rir_evaluate` first.
-bool ggml_rir_fill_params(const rir_variant_desc * v, const struct ggml_tensor * node,
+GGML_API bool ggml_rir_fill_params(const rir_variant_desc * v, const struct ggml_tensor * node,
                           void * out, size_t n_out);
 
 // Workgroup counts for `node`, per the variant's dispatch geometry:
 // `grid[d] = ceil(extent(axis[d]) / per_workgroup[d])`, and 1 for an unused
 // dimension. Values are the *counts*, not the total thread extent.
-void ggml_rir_grid(const rir_variant_desc * v, const struct ggml_tensor * node, uint32_t grid[3]);
+GGML_API void ggml_rir_grid(const rir_variant_desc * v, const struct ggml_tensor * node, uint32_t grid[3]);
 
 // The whole selection chain for one node, at a dispatch site. It opens the
 // per-site attribution, counts the node as seen, evaluates the contract through
@@ -468,20 +468,20 @@ void ggml_rir_grid(const rir_variant_desc * v, const struct ggml_tensor * node, 
 // Everything a dispatch site would otherwise spell out — the mode test, the
 // site name, the counters, the require abort — lives here, so integrating a second op is a
 // call and not a copy of forty lines.
-const rir_variant_desc * ggml_rir_dispatch_begin(uint8_t backend, const struct ggml_tensor * node,
+GGML_API const rir_variant_desc * ggml_rir_dispatch_begin(uint8_t backend, const struct ggml_tensor * node,
                                                  ggml_rir_device_check_fn device_check,
                                                  void * device_ctx);
 
 // Counts the dispatch of the variant `ggml_rir_dispatch_begin` returned and
 // closes the site. Call it exactly once, after the encoding.
-void ggml_rir_dispatch_end(const rir_variant_desc * variant);
+GGML_API void ggml_rir_dispatch_end(const rir_variant_desc * variant);
 
 // Graph preflight for `require`, called by a backend at the top of its
 // graph_compute, before any encoding. Returns true when the mode is not
 // `require`, or when every targeted node of `cgraph` is eligible. Returns false
 // after recording the first violation, and the backend must then fail the graph
 // rather than run a native kernel.
-bool ggml_rir_preflight_graph(uint8_t backend, struct ggml_cgraph * cgraph,
+GGML_API bool ggml_rir_preflight_graph(uint8_t backend, struct ggml_cgraph * cgraph,
                               ggml_rir_device_check_fn device_check, void * device_ctx);
 
 // --- graph census -----------------------------------------------------------
@@ -504,7 +504,7 @@ bool ggml_rir_preflight_graph(uint8_t backend, struct ggml_cgraph * cgraph,
 // isolation. Two measurements, each honest about what it observed.
 //
 // Off unless RETRO_RIR_CENSUS=1: it walks every node of every graph.
-bool ggml_rir_census_enabled(void);
+GGML_API bool ggml_rir_census_enabled(void);
 
 #define GGML_RIR_MAX_CENSUS_ROWS   96
 // Distinct destination shapes kept per row. A ranking needs the shapes to feed
@@ -533,12 +533,12 @@ typedef struct ggml_rir_census_row {
 // Walks `cgraph` and accumulates into the process-wide table. A no-op when the
 // census is disabled. Accumulates across calls: "cumulative" is over the whole
 // run, so one training step is one call per graph the scheduler computes.
-void ggml_rir_census_graph(uint8_t backend, const struct ggml_cgraph * cgraph);
+GGML_API void ggml_rir_census_graph(uint8_t backend, const struct ggml_cgraph * cgraph);
 
 // Rows are append-only, like the site rows: an index stays valid for the
 // process lifetime and the count is monotonic.
-uint32_t            ggml_rir_census_count(void);
-ggml_rir_census_row ggml_rir_census_snapshot(uint32_t index);
+GGML_API uint32_t            ggml_rir_census_count(void);
+GGML_API ggml_rir_census_row ggml_rir_census_snapshot(uint32_t index);
 
 // --- subgraph patterns ------------------------------------------------------
 //
@@ -584,13 +584,13 @@ typedef struct ggml_rir_census_pattern {
 } ggml_rir_census_pattern;
 
 // Append-only and monotonic, same contract as the op rows.
-uint32_t                ggml_rir_census_pattern_count(void);
-ggml_rir_census_pattern ggml_rir_census_pattern_snapshot(uint32_t index);
+GGML_API uint32_t                ggml_rir_census_pattern_count(void);
+GGML_API ggml_rir_census_pattern ggml_rir_census_pattern_snapshot(uint32_t index);
 
 // Windows dropped because the table was full. Its own counter rather than a
 // silent truncation: a reader ranking patterns has to know the rows above do
 // not add up to the graph.
-uint64_t                ggml_rir_census_pattern_overflow(void);
+GGML_API uint64_t                ggml_rir_census_pattern_overflow(void);
 
 // The last violation recorded by a preflight (or by a dispatch site that found
 // one under `require`). Process-wide, last writer wins — the same contract the
@@ -602,11 +602,11 @@ typedef struct ggml_rir_violation {
     const char * node_name;  // static buffer, valid until the next violation
 } ggml_rir_violation;
 
-void               ggml_rir_violation_reset(void);
-ggml_rir_violation ggml_rir_violation_last(void);
+GGML_API void               ggml_rir_violation_reset(void);
+GGML_API ggml_rir_violation ggml_rir_violation_last(void);
 // One-line rendering of the last violation into `buf` ("" when none). The same
 // sentence for the backend log and the FFI error, so a test can match one text.
-void               ggml_rir_violation_format(char * buf, size_t n_buf);
+GGML_API void               ggml_rir_violation_format(char * buf, size_t n_buf);
 
 // Largest byte offset a fully strided kernel will compute for `t`, i.e.
 // `Σ_d (ne[d]-1)*nb[d] + type_size` over the four ggml dimensions. The caller
@@ -617,7 +617,7 @@ void               ggml_rir_violation_format(char * buf, size_t n_buf);
 // argument per dimension: a view whose planes sit further apart than the rows
 // they contain (Qwen3.5's packed QKV) addresses
 // well past what a row-folded bound would predict.
-uint64_t ggml_rir_max_byte_offset(const struct ggml_tensor * t);
+GGML_API uint64_t ggml_rir_max_byte_offset(const struct ggml_tensor * t);
 
 #ifdef __cplusplus
 }
