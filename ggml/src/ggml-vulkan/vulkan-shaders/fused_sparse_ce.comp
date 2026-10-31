@@ -83,6 +83,10 @@ layout(binding = 1) readonly buffer A16 {A_TYPE_PACKED16 data_a_packed16[];};
 #if defined(A_TYPE_PACKED32)
 layout(binding = 1) readonly buffer A32 {A_TYPE_PACKED32 data_a_packed32[];};
 #endif
+// The F32 head's aligned vec4 load reads it as vec2 pairs (dequant_funcs.glsl).
+#if defined(A_TYPE_PACKED64)
+layout(binding = 1) readonly buffer A64 {A_TYPE_PACKED64 data_a_packed64[];};
+#endif
 layout(binding = 2) readonly buffer Tgt {int   data_tgt[];};
 layout(binding = 3) readonly buffer Wgt {float data_wgt[];};
 layout(binding = 4) readonly buffer Cnt {uint  data_count[];};
