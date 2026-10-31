@@ -6581,6 +6581,12 @@ int32_t ggml_metal_rir_device_check(void * device_ctx, const ggml_tensor * node)
     if ((uint32_t) ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) < needed) {
         return GGML_RIR_REJECT_MISSING_FEATURE;
     }
+    // The fragment product is an Apple7 capability, the same gate the native
+    // simdgroup matrix kernels are behind.
+    if (v->requires_matrix &&
+        !ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_simdgroup_mm) {
+        return GGML_RIR_REJECT_MISSING_FEATURE;
+    }
     return GGML_RIR_MATCHED;
 }
 
