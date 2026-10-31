@@ -12823,6 +12823,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_bin_bcast(ggml_mul, GGML_TYPE_F16, {1024,  16, 1, 1}, {1, 1, 1, 1}));
     test_cases.emplace_back(new test_bin_bcast(ggml_mul, GGML_TYPE_F16, { 128,  16, 16, 1}, {1, 1, 1, 1}));
 
+    // retro delta: MUL_MAT in the **decode** regime, on the projections of a
+    // Qwen3-0.6B layer (n_embd 1024, 16 query and 8 KV heads of 128, n_ff
+    // 3072): Q, K/V, O, gate/up and down, as {m = output rows, k = contraction}.
+    // The step sizes are those decode is profiled at, and the formats those the
+    // profiled GGUFs store their matrices in (q8_0, and q4_K + q6_K for
+    // Q4_K_M) - which are the formats RIR generates a GEMV for. `bs = nr =
+    // {1,1}`: one weight matrix, which is what a decode step multiplies.
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        for (auto mk : std::vector<std::array<int64_t, 2>>{{2048, 1024}, {1024, 1024}, {1024, 2048}, {3072, 1024}, {1024, 3072}}) {
+            for (int64_t n_tokens : {1, 4, 8, 16, 32}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, mk[0], n_tokens, mk[1], {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {

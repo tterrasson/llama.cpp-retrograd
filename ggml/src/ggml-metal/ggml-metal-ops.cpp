@@ -2868,6 +2868,21 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         return ggml_metal_op_fwht(ctx, idx);
     }
 
+    // retro delta: RIR selection chain. After the Hadamard path, which is a
+    // different function of the same op, and before every native GEMV/GEMM.
+    // One generated variant per profiled weight format; the node's own src0
+    // type picks between them, and every other dtype or a batched node fails
+    // the portable contract and falls through to the native kernels below.
+    // A generated variant computes one node: preserve a native fusion starting
+    // here, and offer only the decode regime this GEMV is measured in.
+    int n_fuse = 1;
+    if (op->src[1]->ne[1] <= RIR_DECODE_MAX_TOKENS &&
+        (!ctx->use_fusion() || ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n_fuse) == nullptr)) {
+        if (const int n = ggml_metal_op_rir_try(ctx, idx)) {
+            return n;
+        }
+    }
+
     if (props_dev->has_simdgroup_mm && ggml_metal_op_mul_mat_use_mma(op)) {
         return ggml_metal_op_mul_mat_mma(ctx, idx);
     }

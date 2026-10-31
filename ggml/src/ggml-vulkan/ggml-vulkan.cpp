@@ -7546,6 +7546,11 @@ void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, con
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, r_buf, p_buf, c_buf, d_buf }, pc, { n_embd, n_tokens, 1 });
 }
 
+// retro delta: the RIR selection chain is defined with the other RIR helpers,
+// well below the op encoders. `mul_mat`, the elementwise band and `out_prod`
+// sit above them, hence this declaration rather than a second copy of the chain.
+static bool ggml_vk_rir_try(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * node);
+
 void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
@@ -7581,6 +7586,14 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
         }
     } else if (ggml_vk_can_use_fwht(ctx, src1, dst)) {
         ggml_vk_fwht(ctx, subctx, src1, dst);
+    // retro delta: RIR selection chain, offered a node only in the decode
+    // regime the registry publishes and only when the graph fused nothing into
+    // it - a generated variant computes one node. After the split and Hadamard
+    // paths, before every native kernel; a dtype or a batched node outside the
+    // portable contract falls through to them.
+    } else if (src1->ne[1] <= RIR_DECODE_MAX_TOKENS && ctx->num_additional_fused_ops == 0 &&
+               ggml_vk_rir_try(ctx, subctx, dst)) {
+        // encoded by the registry's variant
     } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && dst->ne[1] == 1 &&
         // detect 0213 permutation, and batch size of 1
         src0->nb[0] <= src0->nb[2] &&
@@ -10493,11 +10506,6 @@ void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_c
             ggml_vk_subbuffer(ctx, buf[11], offset[11]),
         }, pc, elements);
 }
-
-// retro delta: the RIR selection chain is defined with the other RIR helpers,
-// well below the op encoders. The elementwise band and `out_prod` sit above
-// them, hence this declaration rather than a second copy of the chain.
-static bool ggml_vk_rir_try(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * node);
 
 void ggml_vk_add(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     // retro delta: RIR selection chain. Guarded by
