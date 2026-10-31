@@ -1,6 +1,7 @@
 #include "llama-graph.h"
 
 #include "llama-impl.h"
+#include "llama-adapter-rows.h" // retro delta: per-row LoRA selection
 #include "llama-model.h"
 #include "llama-moe-cache.h"
 #include "llama-batch.h"
@@ -1582,6 +1583,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     hdmd             (params.hdmd),
     samplers         (params.samplers),
     target_logprob_idx(params.target_logprob_idx),
+    lora_rows        (params.lora_rows),   // retro delta
+    lora_routes      (params.lora_routes), // retro delta
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
@@ -1682,7 +1685,19 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         ggml_tensor * ab_cur = ggml_mul_mat(ctx0, lora_b, a_cur);
 
         ab_cur = ggml_scale(ctx0, ab_cur, scale);
+        // retro delta: per-row LoRA selection, the context's set only applies to route-0 rows
+        if (lora_rows) {
+            ggml_tensor * mask = build_lora_rows_mask(ggml_nrows(ab_cur));
+            ab_cur = ggml_mul(ctx0, ab_cur, ggml_reshape_4d(ctx0, mask, 1, ab_cur->ne[1], ab_cur->ne[2], ab_cur->ne[3]));
+        }
         res = ggml_add(ctx0, res, ab_cur);
+    }
+
+    // retro delta: per-row LoRA selection, each row's routed adapter
+    if (lora_rows) {
+        if (ggml_tensor * delta = build_lora_rows_delta(w, cur, res)) {
+            res = ggml_add(ctx0, res, delta);
+        }
     }
 
     return res;
@@ -1778,6 +1793,11 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         ggml_tensor * ab_cur = ggml_mul_mat_id(ctx0, lora_b, a_cur, ids);
 
         ab_cur = ggml_scale(ctx0, ab_cur, scale);
+        // retro delta: per-row LoRA selection, the context's set only applies to route-0 rows
+        if (lora_rows) {
+            ggml_tensor * mask = build_lora_rows_mask(ab_cur->ne[2]);
+            ab_cur = ggml_mul(ctx0, ab_cur, ggml_reshape_3d(ctx0, mask, 1, 1, ab_cur->ne[2]));
+        }
         res = ggml_add(ctx0, res, ab_cur);
     }
 
@@ -1977,7 +1997,8 @@ ggml_tensor * llm_graph_context::build_ffn(
                 return true;
             }
         }
-        return false;
+        // retro delta: a routed adapter is a LoRA as well
+        return lora_rows != nullptr && lora_rows->get(w) != nullptr;
     };
 
     auto is_scaled_low_precision = [](ggml_tensor * w) {
@@ -2745,6 +2766,11 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
                         ctx0, lw->b, // non-transposed lora_b
                         ggml_get_rows(ctx0, lw->a, ids)
                         ), scale);
+
+            // retro delta: per-row LoRA selection, the context's set only applies to route-0 rows
+            if (lora_rows) {
+                inpL_delta = ggml_mul(ctx0, inpL_delta, build_lora_rows_mask(inpL_delta->ne[1]));
+            }
 
             cur = ggml_add(ctx0, cur, inpL_delta);
         }
