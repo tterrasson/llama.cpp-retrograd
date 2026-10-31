@@ -823,6 +823,8 @@ public:
 using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il)>;
 
 class llm_graph_result;
+class llm_graph_input_lora_rows; // retro delta: llama-adapter-rows.cpp
+struct llama_adapter_lora_rows;  // retro delta: llama-adapter-rows.h
 
 struct llm_graph_params {
     llm_arch arch = LLM_ARCH_UNKNOWN;
@@ -874,6 +876,11 @@ struct llm_graph_params {
     llm_graph_cb cb;
 
     llm_graph_result * res;
+
+    // retro delta: per-row LoRA selection (llama-adapter-rows.h). The routed set
+    // changes the topology, the routes only the inputs.
+    const llama_adapter_lora_rows * lora_rows   = nullptr;
+    const std::vector<int32_t>    * lora_routes = nullptr;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -951,6 +958,7 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
+            lora_rows == other.lora_rows && // retro delta
             cross == other.cross;
     }
 };
@@ -1124,6 +1132,11 @@ struct llm_graph_context {
 
     const std::vector<int32_t> * target_logprob_idx; // retro delta
 
+    // retro delta: per-row LoRA selection, the builders live in llama-adapter-rows.cpp
+    const llama_adapter_lora_rows * lora_rows;
+    const std::vector<int32_t>    * lora_routes;
+    mutable llm_graph_input_lora_rows * inp_lora_rows = nullptr;
+
     const llm_graph_cb & cb_func;
 
     llm_graph_result * res;
@@ -1164,6 +1177,19 @@ struct llm_graph_context {
               ggml_tensor * w,
               ggml_tensor * cur,
               ggml_tensor * w_s = nullptr) const;
+
+    // retro delta: per-row LoRA selection. The route inputs of `n_rows` rows,
+    // which are the ubatch tokens or its outputs: I32 slot ids and an F32 mask
+    // that is 1 where the context's LoRA set applies. Both [1, n_rows].
+    ggml_tensor * build_lora_rows_ids (int64_t n_rows) const;
+    ggml_tensor * build_lora_rows_mask(int64_t n_rows) const;
+
+    // retro delta: the routed delta of `w` for `cur`, shaped like `like`, or
+    // nullptr when no routed adapter targets `w`
+    ggml_tensor * build_lora_rows_delta(
+              ggml_tensor * w,
+              ggml_tensor * cur,
+              ggml_tensor * like) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
     // if slots is set, the experts are read from the MoE cache at these slots (see build_moe_cache_slots)

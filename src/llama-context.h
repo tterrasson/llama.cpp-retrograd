@@ -5,6 +5,7 @@
 #include "llama-cparams.h"
 #include "llama-graph.h"
 #include "llama-adapter.h"
+#include "llama-adapter-rows.h" // retro delta: per-row LoRA selection
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-moe-cache.h"
@@ -131,6 +132,13 @@ struct llama_context {
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
+
+    // retro delta: per-row LoRA selection, defined in llama-adapter-rows.cpp
+    bool set_adapters_lora_rows(llama_adapter_lora * const * adapters, size_t n_adapters, const float * scales, std::string & err);
+    void clear_adapters_lora_rows();
+    bool set_seq_lora_route(llama_seq_id seq_id, int32_t route);
+    void clear_seq_lora_routes();
+    const llama_adapter_lora_rows * get_adapters_lora_rows() const { return lora_rows.get(); }
 
     bool set_adapter_cvec(
             const float * data,
@@ -364,6 +372,10 @@ private:
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
+
+    // retro delta: the routed LoRA set and the route of each sequence (llama-adapter-rows.h)
+    std::unique_ptr<llama_adapter_lora_rows> lora_rows;
+    std::vector<int32_t> lora_routes;
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 

@@ -2768,6 +2768,10 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
             res += lora->get_n_nodes();
         }
     }
+    // retro delta: the routed LoRA delta and the per-row masks of the context's LoRA set
+    if (lora_rows) {
+        res += lora_rows->get_n_nodes() + 4u*model.n_tensors();
+    }
 
     // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling
     for (const auto & [seq_id, sampler] : sampling.samplers) {
@@ -2968,6 +2972,9 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        // retro delta: per-row LoRA selection
+        /*.lora_rows   =*/ lora_rows.get(),
+        /*.lora_routes =*/ lora_rows ? &lora_routes : nullptr,
     };
 }
 
