@@ -295,6 +295,14 @@ struct llama_context {
             ggml_opt_epoch_callback  callback);
 
 private:
+    // retro delta: the training path clears the memory between steps; an
+    // encoder has none.
+    void opt_clear_memory() {
+        if (memory) {
+            memory->clear(true);
+        }
+    }
+
     //
     // output
     //

@@ -4468,7 +4468,7 @@ int32_t llama_context::opt_preflight(llama_opt_preflight_cb callback, void * use
     const uint32_t n_ctx    = llama_model_n_ctx_train(&model);
     const uint32_t n_batch  = std::min(this->n_batch(),  n_ctx);
 
-    memory->clear(true);
+    opt_clear_memory(); // retro delta: an encoder has no memory
 
     llama_batch batch = llama_batch_init(n_batch, 0, 1);
     batch.n_tokens = n_batch;
@@ -4491,10 +4491,23 @@ int32_t llama_context::opt_preflight(llama_opt_preflight_cb callback, void * use
             }
         }
 
-        auto mctx = memory->init_batch(*balloc, cparams.n_ubatch, true);
-        if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
-            LLAMA_LOG_ERROR("%s: could not initialize batch\n", __func__);
-            break;
+        // retro delta: an encoder has no memory; its micro-batch is split
+        // from the batch directly, as encode() does.
+        llama_memory_context_ptr mctx;
+        llama_ubatch ubatch_no_memory;
+        if (memory) {
+            mctx = memory->init_batch(*balloc, cparams.n_ubatch, true);
+            if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
+                LLAMA_LOG_ERROR("%s: could not initialize batch\n", __func__);
+                break;
+            }
+        } else {
+            balloc->split_reset();
+            ubatch_no_memory = balloc->split_simple(cparams.n_ubatch);
+            if (ubatch_no_memory.n_tokens == 0) {
+                LLAMA_LOG_ERROR("%s: could not split the batch\n", __func__);
+                break;
+            }
         }
 
         const uint32_t n_tokens_all = balloc->get_n_tokens();
@@ -4505,9 +4518,9 @@ int32_t llama_context::opt_preflight(llama_opt_preflight_cb callback, void * use
 
         // the first ubatch is representative: every training ubatch has the
         // same shape, so it produces the same graph structure
-        const auto & ubatch = mctx->get_ubatch();
+        const llama_ubatch & ubatch = mctx ? mctx->get_ubatch() : ubatch_no_memory;
         n_outputs = ubatch.n_tokens;
-        if (!mctx->apply()) {
+        if (mctx && !mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to update the memory context\n", __func__);
             break;
         }
@@ -4661,7 +4674,7 @@ int32_t llama_context::opt_preflight(llama_opt_preflight_cb callback, void * use
         }
     }
     gf_res_prev_active = nullptr;
-    memory->clear(true);
+    opt_clear_memory(); // retro delta: an encoder has no memory
     llama_batch_free(batch);
 
     return n_missing;
@@ -4692,7 +4705,7 @@ void llama_context::opt_abandon_step() {
         }
     }
     gf_res_prev_active = nullptr;
-    memory->clear(true);
+    opt_clear_memory(); // retro delta: an encoder has no memory
 }
 
 void llama_context::opt_epoch_iter(
@@ -4739,7 +4752,7 @@ void llama_context::opt_epoch_iter(
     // it here; a null callback is a no-op.
     ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
-    memory->clear(true);
+    opt_clear_memory(); // retro delta: an encoder has no memory
 
     for (uint32_t pos_ctx = 0; pos_ctx < pos_end; pos_ctx += n_batch) {
         const uint32_t n_tokens_window = std::min(n_batch, pos_end - pos_ctx);
@@ -5063,7 +5076,7 @@ bool llama_context::opt_step_packed_sequences(
         }
     }
 
-    memory->clear(true);
+    opt_clear_memory(); // retro delta: an encoder has no memory
 
     llama_opt_unwind_guard abandon_on_error { *this };
     bool ok = false;
@@ -5264,7 +5277,7 @@ bool llama_context::opt_step_packed_sequences(
                         ggml_opt_set_graph_cache(opt_ctx, false);
                         opt_packed_compute_ctx.reset();
                         res->reset();
-                        memory->clear(true);
+                        opt_clear_memory(); // retro delta: an encoder has no memory
                         return false;
                     }
                     const size_t offset = (i*labels_t->ne[0] + id)*sizeof(float);
@@ -5307,7 +5320,7 @@ bool llama_context::opt_step_packed_sequences(
         opt_abandon_step();
         return false;
     }
-    memory->clear(true);
+    opt_clear_memory(); // retro delta: an encoder has no memory
     return true;
 }
 
