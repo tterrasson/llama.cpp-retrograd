@@ -660,6 +660,9 @@ extern "C" {
         GGML_UNARY_OP_CEIL,
         GGML_UNARY_OP_ROUND,
         GGML_UNARY_OP_TRUNC,
+        // retro delta: the error function, which the backward of GELU_ERF and
+        // GEGLU_ERF needs and cannot be composed from the other ops.
+        GGML_UNARY_OP_ERF,
 
         GGML_UNARY_OP_COUNT,
     };
@@ -1227,6 +1230,15 @@ extern "C" {
             struct ggml_tensor  * a);
 
     GGML_API struct ggml_tensor * ggml_gelu_erf_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
+    // retro delta: erf(x), the error function
+    GGML_API struct ggml_tensor * ggml_erf(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
+    GGML_API struct ggml_tensor * ggml_erf_inplace(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 

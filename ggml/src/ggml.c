@@ -1288,9 +1288,10 @@ static const char * GGML_UNARY_OP_NAME[GGML_UNARY_OP_COUNT] = {
     "CEIL",
     "ROUND",
     "TRUNC",
+    "ERF", // retro delta
 };
 
-static_assert(GGML_UNARY_OP_COUNT == 22, "GGML_UNARY_OP_COUNT != 22");
+static_assert(GGML_UNARY_OP_COUNT == 23, "GGML_UNARY_OP_COUNT != 23");
 
 static const char * GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
     "REGLU",
@@ -2859,6 +2860,20 @@ struct ggml_tensor * ggml_gelu_erf_inplace(
         struct ggml_context * ctx,
         struct ggml_tensor  * a) {
     return ggml_unary_inplace(ctx, a, GGML_UNARY_OP_GELU_ERF);
+}
+
+// retro delta: ggml_erf
+
+struct ggml_tensor * ggml_erf(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a) {
+    return ggml_unary(ctx, a, GGML_UNARY_OP_ERF);
+}
+
+struct ggml_tensor * ggml_erf_inplace(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a) {
+    return ggml_unary_inplace(ctx, a, GGML_UNARY_OP_ERF);
 }
 
 // ggml_gelu_quick
@@ -7391,6 +7406,84 @@ static void ggml_sub_or_set(
     ggml_build_forward_expand(cgraph, cgraph->grads[isrc]);
 }
 
+// retro delta: gradient helpers for the LayerNorm and GELU (erf) family, the
+// ops of BERT-style encoders. Each is composed from forward ops every backend
+// already has, plus GGML_UNARY_OP_ERF, so the backward runs wherever the
+// forward does and is checked by finite differences in test-backend-ops.
+
+// d/dx gelu_erf(x) = Phi(x) + x*phi(x), the standard normal CDF and density.
+static struct ggml_tensor * ggml_gelu_erf_derivative(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x) {
+    const float sqrt_1_2     = 0.70710678118654752440f;
+    const float inv_sqrt_2pi = 0.39894228040143267794f;
+    struct ggml_tensor * cdf = ggml_scale_bias(ctx, ggml_erf(ctx, ggml_scale(ctx, x, sqrt_1_2)), 0.5f, 0.5f);
+    struct ggml_tensor * pdf = ggml_scale(ctx, ggml_exp(ctx, ggml_scale(ctx, ggml_sqr(ctx, x), -0.5f)), inv_sqrt_2pi);
+    return ggml_add(ctx, cdf, ggml_mul(ctx, x, pdf));
+}
+
+// y = (x - mean(x)) / sigma, sigma = sqrt(mean((x - mean(x))^2) + eps), per row:
+//   dx = (dy - mean(dy) - y*mean(dy*y)) / sigma
+// sigma is recomputed from x rather than recovered from y, which would divide
+// by x - mean(x) and lose every element near the mean.
+static struct ggml_tensor * ggml_norm_backward(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * grad,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * y,
+        float                 eps) {
+    struct ggml_tensor * xc    = ggml_sub(ctx, x, ggml_mean(ctx, x));
+    struct ggml_tensor * sigma = ggml_sqrt(ctx, ggml_scale_bias(ctx, ggml_mean(ctx, ggml_sqr(ctx, xc)), 1.0f, eps));
+    struct ggml_tensor * gc    = ggml_sub(ctx, grad, ggml_mean(ctx, grad));
+    struct ggml_tensor * gy    = ggml_mul(ctx, y, ggml_mean(ctx, ggml_mul(ctx, grad, y)));
+    return ggml_div(ctx, ggml_sub(ctx, gc, gy), sigma);
+}
+
+// out = gelu_erf(x) * g. The fused form reads x and g as the two halves of
+// src0 (x first unless swapped), and its gradient is the two halves
+// concatenated back in the same order.
+static void ggml_geglu_erf_backward(
+        struct ggml_context * ctx,
+        struct ggml_cgraph  * cgraph,
+        struct ggml_tensor  * tensor,
+        struct ggml_tensor  * grad,
+        size_t                isrc0,
+        size_t                isrc1,
+        bool                  src0_needs_grads,
+        bool                  src1_needs_grads) {
+    struct ggml_tensor * src0 = tensor->src[0];
+    struct ggml_tensor * src1 = tensor->src[1];
+
+    if (src1) {
+        if (src0_needs_grads) {
+            ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, ggml_mul(ctx, grad, src1), ggml_gelu_erf_derivative(ctx, src0)));
+        }
+        if (src1_needs_grads) {
+            ggml_add_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, ggml_gelu_erf(ctx, src0), grad));
+        }
+        return;
+    }
+    if (!src0_needs_grads) {
+        return;
+    }
+
+    const int64_t nc      = tensor->ne[0];
+    const bool    swapped = ggml_get_op_params_i32(tensor, 1) != 0;
+    struct ggml_tensor * x = ggml_cont(ctx, ggml_view_4d(ctx, src0, nc, src0->ne[1], src0->ne[2], src0->ne[3],
+            src0->nb[1], src0->nb[2], src0->nb[3], (swapped ? nc : 0)*src0->nb[0]));
+    struct ggml_tensor * g = ggml_cont(ctx, ggml_view_4d(ctx, src0, nc, src0->ne[1], src0->ne[2], src0->ne[3],
+            src0->nb[1], src0->nb[2], src0->nb[3], (swapped ? 0 : nc)*src0->nb[0]));
+
+    struct ggml_tensor * dx = ggml_mul(ctx, ggml_mul(ctx, grad, g), ggml_gelu_erf_derivative(ctx, x));
+    struct ggml_tensor * dg = ggml_mul(ctx, ggml_gelu_erf(ctx, x), grad);
+    struct ggml_tensor * da = swapped ? ggml_concat(ctx, dg, dx, 0) : ggml_concat(ctx, dx, dg, 0);
+    // an odd row leaves its last element out of both halves: no gradient
+    if (src0->ne[0] > 2*nc) {
+        da = ggml_pad(ctx, da, (int) (src0->ne[0] - 2*nc), 0, 0, 0);
+    }
+    ggml_add_or_set(ctx, cgraph, isrc0, da);
+}
+
 // retro delta: the offset and strides of a view are those of the memory under
 // its source. When the source is itself a strided view (a head split out of a
 // fused QKV projection, then viewed again by the attention), its gradient is
@@ -7635,6 +7728,14 @@ static void ggml_compute_backward(
                 float eps;
                 memcpy(&eps, tensor->op_params, sizeof(float));
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_rms_norm_back(ctx, grad, src0, eps));
+            }
+        } break;
+        // retro delta: LayerNorm, composed (see ggml_norm_backward)
+        case GGML_OP_NORM: {
+            if (src0_needs_grads) {
+                float eps;
+                memcpy(&eps, tensor->op_params, sizeof(float));
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_norm_backward(ctx, grad, src0, tensor, eps));
             }
         } break;
         // retro delta: analytic backward for GGML_OP_L2_NORM (Qwen3.5 gated
@@ -8078,6 +8179,20 @@ static void ggml_compute_backward(
                                 ggml_mul(ctx, grad, ggml_mul(ctx, tensor, one_minus)));
                     }
                 } break;
+                // retro delta: the exact (erf) GELU, see ggml_gelu_erf_derivative
+                case GGML_UNARY_OP_GELU_ERF: {
+                    if (src0_needs_grads) {
+                        ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad, ggml_gelu_erf_derivative(ctx, src0)));
+                    }
+                } break;
+                // retro delta: d/dx erf(x) = 2/sqrt(pi) * exp(-x^2)
+                case GGML_UNARY_OP_ERF: {
+                    if (src0_needs_grads) {
+                        const float two_over_sqrt_pi = 1.12837916709551257390f;
+                        struct ggml_tensor * d = ggml_scale(ctx, ggml_exp(ctx, ggml_scale(ctx, ggml_sqr(ctx, src0), -1.0f)), two_over_sqrt_pi);
+                        ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad, d));
+                    }
+                } break;
                 default: {
                     fprintf(stderr, "%s: unsupported unary op for backward pass: %s\n",
                         __func__, ggml_unary_op_name(ggml_get_unary_op(tensor)));
@@ -8336,6 +8451,10 @@ static void ggml_compute_backward(
                     if (src1_needs_grads) {
                         ggml_add_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, ggml_gelu(ctx, src0), grad));
                     }
+                } break;
+                // retro delta: split and fused, see ggml_geglu_erf_backward
+                case GGML_GLU_OP_GEGLU_ERF: {
+                    ggml_geglu_erf_backward(ctx, cgraph, tensor, grad, isrc0, isrc1, src0_needs_grads, src1_needs_grads);
                 } break;
                 default: {
                     GGML_ABORT("unsupported glu op for backward pass: %s", ggml_glu_op_name(ggml_get_glu_op(tensor)));
@@ -8849,6 +8968,7 @@ static bool ggml_backward_op_implemented(const struct ggml_tensor * node) {
         case GGML_OP_REPEAT:
         case GGML_OP_REPEAT_BACK:
         case GGML_OP_RMS_NORM:
+        case GGML_OP_NORM: // retro delta
         case GGML_OP_L2_NORM:
         case GGML_OP_MUL_MAT:
         case GGML_OP_SCALE:
@@ -8893,6 +9013,8 @@ static bool ggml_backward_op_implemented(const struct ggml_tensor * node) {
                 case GGML_UNARY_OP_EXPM1:
                 case GGML_UNARY_OP_SOFTPLUS:
                 case GGML_UNARY_OP_SIGMOID:
+                case GGML_UNARY_OP_GELU_ERF: // retro delta
+                case GGML_UNARY_OP_ERF:      // retro delta
                     return true;
                 default:
                     return false;
@@ -8903,6 +9025,8 @@ static bool ggml_backward_op_implemented(const struct ggml_tensor * node) {
                 case GGML_GLU_OP_GEGLU:
                     // backward pass only implemented for the split variants
                     return node->src[1] != NULL;
+                case GGML_GLU_OP_GEGLU_ERF: // retro delta: split and fused
+                    return true;
                 default:
                     return false;
             }

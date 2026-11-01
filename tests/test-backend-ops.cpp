@@ -2118,7 +2118,8 @@ struct test_unary : public test_case {
         const bool grad_supported = op == GGML_UNARY_OP_ABS || op == GGML_UNARY_OP_SGN || op == GGML_UNARY_OP_NEG ||
             op == GGML_UNARY_OP_STEP || op == GGML_UNARY_OP_TANH || op == GGML_UNARY_OP_RELU ||
             op == GGML_UNARY_OP_GELU || op == GGML_UNARY_OP_SILU ||
-            op == GGML_UNARY_OP_EXPM1 || op == GGML_UNARY_OP_SOFTPLUS;
+            op == GGML_UNARY_OP_EXPM1 || op == GGML_UNARY_OP_SOFTPLUS ||
+            op == GGML_UNARY_OP_GELU_ERF || op == GGML_UNARY_OP_ERF; // retro delta
 
         ggml_tensor * a;
         if (v & 1) {
@@ -2153,7 +2154,7 @@ struct test_unary : public test_case {
         float min = -150.f;
         float max =  150.f;
 
-        if (op == GGML_UNARY_OP_TANH || op == GGML_UNARY_OP_GELU) {
+        if (op == GGML_UNARY_OP_TANH || op == GGML_UNARY_OP_GELU || smooth_near_zero()) {
             min = -3.f;
             max =  3.f;
         }
@@ -2171,19 +2172,25 @@ struct test_unary : public test_case {
         }
     }
 
+    // retro delta: the ops whose derivative varies over [-3, 3], so the
+    // finite differences need a small step and a narrow range
+    bool smooth_near_zero() const {
+        return op == GGML_UNARY_OP_GELU_ERF || op == GGML_UNARY_OP_ERF;
+    }
+
     float grad_eps() override {
-        if (op == GGML_UNARY_OP_TANH || op == GGML_UNARY_OP_GELU) {
+        if (op == GGML_UNARY_OP_TANH || op == GGML_UNARY_OP_GELU || smooth_near_zero()) {
             return 0.1f;
         }
         return 15.0f;
     }
 
     bool grad_precise() override {
-        return op == GGML_UNARY_OP_TANH || op == GGML_UNARY_OP_GELU;
+        return op == GGML_UNARY_OP_TANH || op == GGML_UNARY_OP_GELU || smooth_near_zero();
     }
 
     int64_t grad_nmax() override {
-        return op == GGML_UNARY_OP_TANH || op == GGML_UNARY_OP_GELU ? 2048 : 10000;
+        return op == GGML_UNARY_OP_TANH || op == GGML_UNARY_OP_GELU || smooth_near_zero() ? 2048 : 10000;
     }
 
     double max_maa_err() override {
@@ -2194,6 +2201,11 @@ struct test_unary : public test_case {
         // tensors, so finite differences include its quantization error.
         if (op == GGML_UNARY_OP_GELU) {
             return 1e-2;
+        }
+        // retro delta: the F32 sum the finite differences read loses about
+        // 1e-3 of the asymmetry on [-3, 3]; a wrong derivative costs 1e-1.
+        if (smooth_near_zero()) {
+            return 5e-3;
         }
         return 1e-4;
     }
@@ -2241,17 +2253,29 @@ struct test_glu : public test_case {
             bool swapped = false)
         : op(op), type(type), ne_a(ne_a), v(v), swapped(swapped) {}
 
+    // retro delta: the fused GEGLU_ERF has a backward, which differentiates
+    // both halves of `a`
+    bool grad_supported() const {
+        return op == GGML_GLU_OP_GEGLU_ERF;
+    }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a;
         if (v & 1) {
             auto ne = ne_a; ne[0] *= 3;
             a = ggml_new_tensor(ctx, type, 4, ne.data());
+            if (grad_supported()) {
+                ggml_set_param(a);
+            }
             ggml_set_name(a, "a");
 
             a = ggml_view_4d(ctx, a, ne_a[0], ne_a[1], ne_a[2], ne_a[3], a->nb[1], a->nb[2], a->nb[3], 0);
             ggml_set_name(a, "view_of_a");
         } else {
             a = ggml_new_tensor(ctx, type, 4, ne_a.data());
+            if (grad_supported()) {
+                ggml_set_param(a);
+            }
             ggml_set_name(a, "a");
         }
 
@@ -2263,9 +2287,25 @@ struct test_glu : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (mode == MODE_GRAD && grad_supported()) {
+                // retro delta: where gelu_erf is not linear, and away from the
+                // zeros of the gradient (g = 0, x = -0.75), which the relative
+                // asymmetry of the check turns into noise
+                init_tensor_uniform(t, 0.25f, 3.f);
+                continue;
+            }
             // test extended range of values to check for NaNs in GELU
             init_tensor_uniform(t, -150.f, 150.f);
         }
+    }
+
+    bool grad_precise() override {
+        return grad_supported();
+    }
+
+    // retro delta: see test_unary, the same F32 noise
+    double max_maa_err() override {
+        return grad_supported() ? 5e-3 : 1e-4;
     }
 };
 
@@ -2330,9 +2370,25 @@ struct test_glu_split : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (mode == MODE_GRAD && op == GGML_GLU_OP_GEGLU_ERF) {
+                // retro delta: where gelu_erf is not linear, and away from the
+                // zeros of the gradient (g = 0, x = -0.75), which the relative
+                // asymmetry of the check turns into noise
+                init_tensor_uniform(t, 0.25f, 3.f);
+                continue;
+            }
             // test extended range of values to check for NaNs in GELU
             init_tensor_uniform(t, -150.f, 150.f);
         }
+    }
+
+    bool grad_precise() override {
+        return op == GGML_GLU_OP_GEGLU_ERF; // retro delta
+    }
+
+    // retro delta: see test_unary, the same F32 noise
+    double max_maa_err() override {
+        return op == GGML_GLU_OP_GEGLU_ERF ? 5e-3 : 1e-4;
     }
 };
 
@@ -3904,6 +3960,54 @@ struct test_norm : public test_case {
         ggml_set_name(out, "out");
 
         return out;
+    }
+};
+
+// retro delta: GGML_OP_NORM under a weight. The rows of norm(a) sum to zero,
+// so the gradient of sum(norm(a)) is zero whatever the backward does; the
+// weight b makes the test see it.
+struct test_norm_weighted : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float eps;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "NORM";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, eps) + ",weighted";
+    }
+
+    test_norm_weighted(std::array<int64_t, 4> ne = {64, 5, 4, 3}, float eps = 1e-5f)
+        : ne(ne), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul(ctx, ggml_norm(ctx, a, eps), b);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    bool grad_precise() override {
+        return true;
+    }
+
+    // a step large enough that the F32 sum of the loss does not drown it, the
+    // four-point difference keeps the truncation error below the threshold
+    float grad_eps() override {
+        return 1e-1f;
+    }
+
+    double max_maa_err() override {
+        return 2e-3;
     }
 };
 
@@ -11091,6 +11195,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, v, eps));
             }
             test_cases.emplace_back(new test_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, false, eps, true));
+            test_cases.emplace_back(new test_norm_weighted({ n, 5, 4, 3 }, eps)); // retro delta
             test_cases.emplace_back(new test_norm_scale(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false, 1.5f));
             test_cases.emplace_back(new test_norm_scale(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true, 1.5f));
             test_cases.emplace_back(new test_rms_norm_back(GGML_TYPE_F32, { n, 5, 4, 3 }, eps));
