@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-opt-grouped.h" // retro delta
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -4399,7 +4400,16 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     opt_checkpoint_every_n_layers = lopt_params.checkpoint_every_n_layers > 0
             ? lopt_params.checkpoint_every_n_layers : 1;
     opt_checkpoint_type = lopt_params.checkpoint_type;
-    const enum ggml_opt_loss_type loss_type = opt_fused_ce
+    // retro delta: a model without an output head has no logits to train; its
+    // answer is read from the embeddings output and the loss is the grouped
+    // softmax cross-entropy of llama_opt_step_grouped, an external loss.
+    opt_grouped_loss = lopt_params.grouped_loss || model->output == nullptr;
+    if (opt_grouped_loss && opt_fused_ce) {
+        LLAMA_LOG_WARN("%s: the fused cross-entropy reads an output head, this model is trained "
+                "with a grouped loss over its embeddings output; ignoring it\n", __func__);
+        opt_fused_ce = false;
+    }
+    const enum ggml_opt_loss_type loss_type = opt_fused_ce || opt_grouped_loss
             ? GGML_OPT_LOSS_TYPE_EXTERNAL
             : GGML_OPT_LOSS_TYPE_CROSS_ENTROPY;
 
@@ -4433,6 +4443,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     llama_set_param(model->cls_out,         param_filter, param_filter_ud);
     llama_set_param(model->cls_out_b,       param_filter, param_filter_ud);
     llama_set_param(model->cls_norm,        param_filter, param_filter_ud);
+    llama_set_param(model->cls_norm_b,      param_filter, param_filter_ud); // retro delta: the scorer LayerNorm bias of a decision head
 
     for (struct llama_layer & layer : model->layers) {
         for (size_t i = 0; i < sizeof(layer)/sizeof(struct ggml_tensor *); ++i) {
@@ -4563,8 +4574,15 @@ int32_t llama_context::opt_preflight(llama_opt_preflight_cb callback, void * use
             }
         }
 
+        // retro delta: scan from the output the loss actually reads: the
+        // embeddings for a grouped loss, the logits otherwise.
+        ggml_tensor * loss_input = opt_grouped_loss ? res->get_embd() : res->get_logits();
+        if (!loss_input) {
+            LLAMA_LOG_ERROR("%s: the graph has no %s output to train\n", __func__, opt_grouped_loss ? "embeddings" : "logits");
+            break;
+        }
         std::vector<ggml_tensor *> missing(ggml_graph_n_nodes(gf));
-        n_missing = ggml_graph_missing_backward_ops(gf, res->get_logits(), missing.data(), (int) missing.size());
+        n_missing = ggml_graph_missing_backward_ops(gf, loss_input, missing.data(), (int) missing.size());
         for (int i = 0; i < n_missing && i < (int) missing.size(); ++i) {
             callback(LLAMA_OPT_PREFLIGHT_MISSING_GRAD, nullptr, missing[i], userdata);
         }
@@ -4575,10 +4593,12 @@ int32_t llama_context::opt_preflight(llama_opt_preflight_cb callback, void * use
         }
 
         struct ggml_context * ctx_compute_opt;
-        const size_t size_gf = ggml_graph_size(gf);
+        // retro delta: the grouped loss is a second graph rooted at its scalar,
+        // a few nodes larger than the model's.
+        const size_t size_gf = ggml_graph_size(gf) + (opt_grouped_loss ? LLAMA_OPT_GROUPED_EXTRA_NODES : 0);
         {
             const size_t size_meta = llama_opt_metadata_size(
-                    size_gf, opt_fused_ce, opt_gradient_checkpointing,
+                    size_gf, opt_fused_ce || opt_grouped_loss, opt_gradient_checkpointing,
                     llama_opt_update_size(gf, opt_optimizer_type, &opt_optimizer_layout));
             struct ggml_init_params params = {
                 /*.mem_size   =*/ size_meta,
@@ -4617,6 +4637,14 @@ int32_t llama_context::opt_preflight(llama_opt_preflight_cb callback, void * use
             struct ggml_cgraph * gf_fused = ggml_new_graph_custom(ctx_compute_opt, size_gf, /*grads =*/ true);
             ggml_build_forward_expand(gf_fused, fused_loss);
             ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf_fused, res->get_inp_tokens(), fused_loss);
+        } else if (opt_grouped_loss) {
+            // retro delta: the graph a grouped step builds, on one group of
+            // the first two outputs; its inputs are never set, nothing runs.
+            const llama_opt_grouped_loss grouped = llama_opt_build_grouped_loss(
+                    ctx_compute_opt, loss_input, std::min<uint32_t>(2, n_outputs), 1, 1.0f);
+            struct ggml_cgraph * gf_grouped = ggml_new_graph_custom(ctx_compute_opt, size_gf, /*grads =*/ true);
+            ggml_build_forward_expand(gf_grouped, grouped.loss);
+            ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf_grouped, res->get_inp_tokens(), grouped.loss);
         } else {
             ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
         }
@@ -4696,6 +4724,7 @@ void llama_context::opt_abandon_step() {
     ggml_opt_set_graph_cache(opt_ctx, false);
     ggml_opt_cancel(opt_ctx);
     ggml_opt_abort_accumulation(opt_ctx);
+    opt_grouped_accumulated = 0;
     opt_packed_compute_ctx.reset();
     opt_packed_graph_storage->reset();
     // Row graphs borrow the per-micro-batch compute context released here.
@@ -4752,6 +4781,12 @@ void llama_context::opt_epoch_iter(
     // it here; a null callback is a no-op.
     ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
+    // retro delta: the epoch trains next-token logits through the memory; a
+    // model without one (an encoder) reads its answer from the embeddings and
+    // trains through llama_opt_step_grouped.
+    if (!memory || opt_grouped_loss) {
+        throw std::runtime_error("this model has no next-token objective, train it with llama_opt_step_grouped");
+    }
     opt_clear_memory(); // retro delta: an encoder has no memory
 
     for (uint32_t pos_ctx = 0; pos_ctx < pos_end; pos_ctx += n_batch) {
@@ -5020,6 +5055,10 @@ bool llama_context::opt_step_packed_sequences(
     const bool mixed_layout = llm_arch_supports_unequal_seqs(model.arch);
     if (!mixed_layout && n_sequences != 1 && !packed_seq_supported(__func__)) {
         return false;
+    }
+    // retro delta: as opt_epoch_iter, the packed step trains logits through the memory
+    if (!memory || opt_grouped_loss) {
+        throw std::runtime_error("this model has no next-token objective, train it with llama_opt_step_grouped");
     }
 
     // retro delta: the same reading of the labels the epoch
@@ -5321,6 +5360,208 @@ bool llama_context::opt_step_packed_sequences(
         return false;
     }
     opt_clear_memory(); // retro delta: an encoder has no memory
+    return true;
+}
+
+// retro delta: one step of the grouped softmax cross-entropy over the
+// embeddings output (llama_opt_step_grouped). The batch is one micro-batch:
+// a non-causal sequence cannot be split, and the groups read across all of it.
+bool llama_context::opt_step_grouped(
+        const llama_batch          & batch_inp,
+        const llama_grouped_target & target,
+        ggml_opt_result_t            result) {
+    GGML_ASSERT(opt_ctx);
+    if (!opt_grouped_loss) {
+        LLAMA_LOG_ERROR("%s: the optimizer was initialized for a logits loss, not a grouped one\n", __func__);
+        opt_abandon_step();
+        return false;
+    }
+    if (batch_inp.n_tokens <= 0 || !batch_inp.logits || !batch_inp.pos ||
+            target.n_groups == 0 || target.n_opt_max == 0 ||
+            !target.rows || (!target.columns && !target.pointer_rows) || !target.targets ||
+            !(target.inv_temperature > 0.0f) || !std::isfinite(target.inv_temperature) ||
+            target.accumulation_steps == 0 || target.accumulation_steps > INT32_MAX) {
+        LLAMA_LOG_ERROR("%s: invalid batch or target\n", __func__);
+        opt_abandon_step();
+        return false;
+    }
+    const uint32_t n_tokens = (uint32_t) batch_inp.n_tokens;
+    if (n_tokens > cparams.n_ubatch) {
+        LLAMA_LOG_ERROR("%s: %u tokens do not fit one micro-batch of %u\n", __func__, n_tokens, cparams.n_ubatch);
+        opt_abandon_step();
+        return false;
+    }
+
+    // the outputs come in batch order
+    std::vector<int32_t> output_row(n_tokens, -1);
+    int32_t n_marked = 0;
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        if (batch_inp.logits[i]) {
+            output_row[i] = n_marked++;
+        }
+    }
+    std::vector<int32_t> index;
+    std::vector<float>   mask;
+    std::vector<int32_t> pointer;
+    std::string          error;
+    if (!llama_opt_grouped_inputs(target, output_row, llama_model_n_embd_out(&model), index, mask, pointer, error)) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, error.c_str());
+        opt_abandon_step();
+        return false;
+    }
+
+    // a cached packed graph would be reused against this one
+    if (opt_packed_compute_ctx) {
+        ggml_opt_set_graph_cache(opt_ctx, false);
+        opt_packed_compute_ctx.reset();
+        opt_packed_graph_storage->reset();
+    }
+    // A physical step may continue an accumulation window, but cannot
+    // change its period. set_period only succeeds at an update boundary.
+    if ((opt_grouped_accumulated == 0 &&
+                !ggml_opt_set_period(opt_ctx, (int32_t) target.accumulation_steps)) ||
+            (opt_grouped_accumulated != 0 && opt_grouped_period != target.accumulation_steps)) {
+        LLAMA_LOG_ERROR("%s: cannot change the accumulation period mid-update\n", __func__);
+        opt_abandon_step();
+        return false;
+    }
+    opt_grouped_period = target.accumulation_steps;
+    ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+    opt_clear_memory();
+
+    llama_opt_unwind_guard abandon_on_error { *this };
+    bool ok = false;
+    do {
+        {
+            llama_batch_compat compat(this, batch_inp);
+            if (!balloc->init(*compat.batch_ext, model.vocab, /*output_all =*/ false)) {
+                throw std::runtime_error("batch allocator initialization failed");
+            }
+        }
+        const uint32_t n_outputs_all = balloc->get_n_outputs();
+        if (n_outputs_all != (uint32_t) n_marked) {
+            LLAMA_LOG_ERROR("%s: %u outputs for %d marked tokens\n", __func__, n_outputs_all, n_marked);
+            break;
+        }
+        n_queued_tokens += balloc->get_n_tokens();
+        embd_seq.clear();
+        if (output_reserve(n_outputs_all) < n_outputs_all) {
+            throw std::runtime_error("output reserve failed");
+        }
+
+        llama_memory_context_ptr mctx;
+        llama_ubatch ubatch_no_memory;
+        if (memory) {
+            mctx = memory->init_batch(*balloc, cparams.n_ubatch, false);
+            if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
+                throw std::runtime_error("memory batch initialization failed");
+            }
+        } else {
+            balloc->split_reset();
+            ubatch_no_memory = balloc->split_simple(n_tokens);
+        }
+        const llama_ubatch & ubatch = mctx ? mctx->get_ubatch() : ubatch_no_memory;
+        if (ubatch.n_tokens != n_tokens) {
+            LLAMA_LOG_ERROR("%s: the batch split into %u of %u tokens\n", __func__, ubatch.n_tokens, n_tokens);
+            break;
+        }
+        if (mctx && !mctx->apply()) {
+            throw std::runtime_error("memory apply failed");
+        }
+        n_outputs = n_outputs_all;
+
+        auto * res = get_gf_res_prev();
+        const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
+        // the optimizer graph is allocated outside sched, so the next decode must rebuild
+        gf_res_prev_active = nullptr;
+
+        const auto graph_build_started = std::chrono::steady_clock::now();
+        res->reset();
+        std::vector<ggml_tensor *> gradient_checkpoints;
+        auto * gf = llama_opt_build_forward_graph(model, gparams, opt_gradient_checkpointing,
+                opt_checkpoint_every_n_layers, gradient_checkpoints);
+        if (!gf) {
+            throw std::runtime_error("failed to build the grouped training graph");
+        }
+        ggml_tensor * t_embd = res->get_embd();
+        if (!t_embd || t_embd->ne[1] != (int64_t) n_outputs_all) {
+            LLAMA_LOG_ERROR("%s: the graph has no embeddings output for the %u outputs\n", __func__, n_outputs_all);
+            break;
+        }
+        opt_timing.graph_build_seconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - graph_build_started).count();
+
+        const auto allocation_started = std::chrono::steady_clock::now();
+        const size_t size_gf = ggml_graph_size(gf) + LLAMA_OPT_GROUPED_EXTRA_NODES;
+        const size_t size_meta = llama_opt_metadata_size(size_gf, /*second graph =*/ true,
+                opt_gradient_checkpointing, llama_opt_update_size(gf, opt_optimizer_type, &opt_optimizer_layout));
+        if (opt_compute_meta.size() < size_meta) {
+            opt_compute_meta.resize(size_meta);
+        }
+        struct ggml_init_params params = {
+            /*.mem_size   =*/ opt_compute_meta.size(),
+            /*.mem_buffer =*/ opt_compute_meta.data(),
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx_compute_owner(ggml_init(params));
+        struct ggml_context * ctx_compute_opt = ctx_compute_owner.get();
+
+        const llama_opt_grouped_loss grouped = llama_opt_build_grouped_loss(
+                ctx_compute_opt, t_embd, target.n_opt_max, target.n_groups, target.inv_temperature,
+                target.pointer_rows != nullptr);
+        struct ggml_cgraph * gf_grouped = ggml_new_graph_custom(ctx_compute_opt, size_gf, /*grads =*/ true);
+        // retro delta: the writes of a context with memory (KV and recurrent
+        // states) are not on the loss path, but res->set_inputs() fills their
+        // index inputs, which must be allocated: keep them in the graph. A
+        // write into memory is a SET_ROWS or CPY whose destination already
+        // has a buffer; the unselected input branches of the graph write
+        // into compute tensors and stay out.
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            if ((node->op == GGML_OP_SET_ROWS || node->op == GGML_OP_CPY) &&
+                    node->view_src && node->view_src->buffer) {
+                ggml_build_forward_expand(gf_grouped, node);
+            }
+        }
+        ggml_build_forward_expand(gf_grouped, grouped.loss);
+        ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf_grouped, res->get_inp_tokens(), grouped.loss);
+        ggml_opt_set_gradient_checkpoints(opt_ctx, gradient_checkpoints.data(), (int) gradient_checkpoints.size());
+        ggml_opt_set_gradient_checkpoint_type(opt_ctx, opt_checkpoint_type);
+        ggml_opt_alloc(opt_ctx, /*backward =*/ true);
+        opt_timing.allocation_seconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - allocation_started).count();
+        opt_memory_sample();
+
+        res->set_inputs(&ubatch);
+        ggml_backend_tensor_set(grouped.index, index.data(), 0, ggml_nbytes(grouped.index));
+        ggml_backend_tensor_set(grouped.mask, mask.data(), 0, ggml_nbytes(grouped.mask));
+        if (grouped.pointer) {
+            ggml_backend_tensor_set(grouped.pointer, pointer.data(), 0, ggml_nbytes(grouped.pointer));
+        }
+        ggml_backend_tensor_set(grouped.targets, target.targets, 0, ggml_nbytes(grouped.targets));
+
+        const auto execution_started = std::chrono::steady_clock::now();
+        ggml_opt_eval(opt_ctx, result);
+        opt_timing.execution_seconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - execution_started).count();
+        opt_memory_sample();
+        ok = true;
+    } while (false);
+
+    // the graph borrowed the compute context released above
+    for (auto & res : gf_res_prev) {
+        if (res) {
+            res->reset();
+        }
+    }
+    gf_res_prev_active = nullptr;
+
+    if (!ok) {
+        opt_abandon_step();
+        return false;
+    }
+    opt_grouped_accumulated = (opt_grouped_accumulated + 1) % opt_grouped_period;
+    opt_clear_memory();
     return true;
 }
 
@@ -6279,6 +6520,18 @@ bool llama_opt_step_packed_sequences(
     return ctx->opt_step_packed_sequences(dataset, result, tokens, labels, label_weights,
             topk, positions, seq_offsets, seq_ids, n_tokens, n_seq_ids, n_sequences,
             accumulation_steps, callback);
+}
+
+// retro delta: see llama.h
+bool llama_opt_step_grouped(
+        struct llama_context              * ctx,
+        struct llama_batch                  batch,
+        const struct llama_grouped_target * target,
+        ggml_opt_result_t                   result) {
+    if (!ctx || !target) {
+        return false;
+    }
+    return ctx->opt_step_grouped(batch, *target, result);
 }
 
 void llama_opt_get_timing(

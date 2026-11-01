@@ -1838,6 +1838,11 @@ extern "C" {
         // Passed through to ggml_opt_init verbatim, because the allocator and
         // the update graph are the two readers and both live below here.
         struct ggml_opt_optimizer_layout optimizer_layout;
+
+        // retro delta: the loss reads the embeddings output, not logits: a
+        // softmax cross-entropy over groups of scores, one group per question
+        // (llama_opt_step_grouped). Implied when the model has no output head.
+        bool grouped_loss;
     };
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
@@ -1913,6 +1918,42 @@ extern "C" {
             uint32_t                  n_sequences,
             uint32_t                  accumulation_steps,
             ggml_opt_epoch_callback   callback);
+
+    // retro delta: the targets of one grouped step. A group is a softmax over
+    // scores read from the embeddings output: option j of group g is column
+    // columns[g] of the output of batch token rows[g*n_opt_max + j]. Groups
+    // with fewer options pad with row -1; a padded option is masked out of the
+    // softmax and must have a zero target. targets[g*n_opt_max + j] is the
+    // target probability of the option (one-hot or soft), each group summing
+    // to 1. The scores are multiplied by inv_temperature before the softmax.
+    typedef struct llama_grouped_target {
+        uint32_t        n_groups;
+        uint32_t        n_opt_max;
+        const int32_t * rows;     // [n_groups*n_opt_max], batch token index or -1
+        const int32_t * columns;  // [n_groups]
+        const float   * targets;  // [n_groups*n_opt_max]
+        float           inv_temperature;
+        uint32_t        accumulation_steps; // physical steps per optimizer update, >= 1
+        // [n_groups] or NULL. When set, the score of option j of group g is a
+        // pointer product instead of a column: q.k / sqrt(n_embd_out/2), q the
+        // first half of the output of batch token pointer_rows[g], k the second
+        // half of the output of token rows[g*n_opt_max + j]; columns is then
+        // ignored and may be NULL. n_embd_out must be even.
+        const int32_t * pointer_rows;
+    } llama_grouped_target;
+
+    // retro delta: one training step of a model whose answer is read from its
+    // embeddings output (a decision head, a reranker). The batch may hold
+    // several sequences, one per question; every token read by a target must
+    // have batch.logits set, and no other may. The whole batch is one
+    // micro-batch: it must fit in n_ubatch. Requires llama_opt_init with
+    // grouped_loss (or a model without an output head). Returns false, with
+    // the step abandoned, on an invalid batch or target.
+    LLAMA_API bool llama_opt_step_grouped(
+            struct llama_context              * lctx,
+            struct llama_batch                  batch,
+            const struct llama_grouped_target * target,
+            ggml_opt_result_t                   result);
 
     // retro delta: monotonic wall-clock counters for optimizer graph work.
     // The three fields split graph construction, backend planning/allocation,

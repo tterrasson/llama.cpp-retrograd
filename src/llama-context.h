@@ -294,6 +294,12 @@ struct llama_context {
             uint32_t                 accumulation_steps,
             ggml_opt_epoch_callback  callback);
 
+    // retro delta: see llama_opt_step_grouped
+    bool opt_step_grouped(
+            const llama_batch          & batch,
+            const llama_grouped_target & target,
+            ggml_opt_result_t            result);
+
 private:
     // retro delta: the training path clears the memory between steps; an
     // encoder has none.
@@ -528,6 +534,10 @@ private:
     llama_opt_timing opt_timing = {};
     llama_opt_memory opt_memory = {}; // retro delta
 
+    // retro delta: the loss reads the embeddings output (llama_opt_step_grouped).
+    bool    opt_grouped_loss = false;
+    uint32_t opt_grouped_accumulated = 0;
+    uint32_t opt_grouped_period = 1;
     // retro delta: fused sparse cross-entropy for the packed step.
     bool    opt_fused_ce = false;
     int32_t opt_ce_tiles = 1;
