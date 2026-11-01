@@ -12344,6 +12344,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {128, 16, 2, 3}, 2));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {64, 16, 2, 3}, 3));
 
+    // retro delta: ACC's out-of-place copy must preserve the part outside b,
+    // including the tail of rows wider than one Metal threadgroup. Fused QKV
+    // gradients in decision models have 1152 or more elements per row.
+    for (int64_t width : {1152, 2305, 4096}) {
+        test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {width, 7, 2, 2}, {64, 6, 2, 2}, -1));
+    }
+
     test_cases.emplace_back(new test_pad());
     test_cases.emplace_back(new test_pad(GGML_TYPE_F32, {33, 17, 2, 1}, 4, 3, true)); // circular
     test_cases.emplace_back(new test_pad_ext());
