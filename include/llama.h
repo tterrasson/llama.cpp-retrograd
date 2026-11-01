@@ -1827,6 +1827,11 @@ extern "C" {
         // Passed through to ggml_opt_init verbatim, because the allocator and
         // the update graph are the two readers and both live below here.
         struct ggml_opt_optimizer_layout optimizer_layout;
+
+        // retro delta: the loss is built by the caller from the forward
+        // outputs (llama_opt_step_custom) instead of a cross-entropy over the
+        // logits. Implied when the model has no output head.
+        bool custom_loss;
     };
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
@@ -1902,6 +1907,41 @@ extern "C" {
             uint32_t                  n_sequences,
             uint32_t                  accumulation_steps,
             ggml_opt_epoch_callback   callback);
+
+    // retro delta: a loss supplied by the caller. build() receives the
+    // forward outputs of the step's graph - the embeddings output and the
+    // logits, either NULL when the graph has none - and returns a scalar F32
+    // loss built from them in ctx, or NULL to refuse the step. Every tensor it
+    // creates in ctx is allocated with the optimizer graph; set_inputs() is
+    // called once that is done, to fill the builder's own inputs with
+    // ggml_backend_tensor_set. n_extra_nodes bounds the graph nodes build()
+    // adds on top of the model graph.
+    typedef struct llama_opt_loss_builder {
+        struct ggml_tensor * (*build)(
+                void                * user_data,
+                struct ggml_context * ctx,
+                struct ggml_tensor  * embd,
+                struct ggml_tensor  * logits);
+        void (*set_inputs)(void * user_data);
+        void   * user_data;
+        uint32_t n_extra_nodes;
+    } llama_opt_loss_builder;
+
+    // retro delta: one training step of a caller-supplied loss: the batch goes
+    // through the forward graph as one micro-batch (it must fit in n_ubatch),
+    // loss->build() turns the outputs of the tokens with batch.logits set into
+    // a scalar, and the optimizer differentiates it. The outputs come in batch
+    // order. accumulation_steps (>= 1) is the number of physical steps per
+    // optimizer update, and cannot change inside an update. Requires
+    // llama_opt_init with custom_loss (or a model without an output head).
+    // Returns false, with the step abandoned, on an invalid batch or a refused
+    // loss.
+    LLAMA_API bool llama_opt_step_custom(
+            struct llama_context                * lctx,
+            struct llama_batch                    batch,
+            const struct llama_opt_loss_builder * loss,
+            uint32_t                              accumulation_steps,
+            ggml_opt_result_t                     result);
 
     // retro delta: monotonic wall-clock counters for optimizer graph work.
     // The three fields split graph construction, backend planning/allocation,
@@ -1981,6 +2021,17 @@ extern "C" {
             struct llama_context   * lctx,
             llama_opt_preflight_cb   callback,
             void                   * userdata);
+
+    // retro delta: llama_opt_preflight for a context trained through
+    // llama_opt_step_custom: the gradient rules are checked from the loss
+    // loss->build() makes out of the representative ubatch, whose every token
+    // is an output. set_inputs() is not called, nothing runs. The plain
+    // preflight refuses such a context.
+    LLAMA_API int32_t llama_opt_preflight_custom(
+            struct llama_context                * lctx,
+            const struct llama_opt_loss_builder * loss,
+            llama_opt_preflight_cb                callback,
+            void                                * userdata);
 
 #ifdef __cplusplus
 }

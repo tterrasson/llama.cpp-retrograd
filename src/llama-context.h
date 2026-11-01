@@ -275,8 +275,9 @@ struct llama_context {
             // position, nullable = the scalar labels above.
             const llama_opt_topk_labels * topk = nullptr);
 
-    // retro delta: see llama_opt_preflight
-    int32_t opt_preflight(llama_opt_preflight_cb callback, void * userdata);
+    // retro delta: see llama_opt_preflight and llama_opt_preflight_custom
+    int32_t opt_preflight(llama_opt_preflight_cb callback, void * userdata,
+            const llama_opt_loss_builder * loss = nullptr);
 
     void opt_epoch_iter(
             ggml_opt_dataset_t               dataset,
@@ -308,6 +309,13 @@ struct llama_context {
             uint32_t                 n_sequences,
             uint32_t                 accumulation_steps,
             ggml_opt_epoch_callback  callback);
+
+    // retro delta: see llama_opt_step_custom
+    bool opt_step_custom(
+            const llama_batch            & batch,
+            const llama_opt_loss_builder & loss,
+            uint32_t                       accumulation_steps,
+            ggml_opt_result_t              result);
 
 private:
     // retro delta: the training path clears the memory between steps; an
@@ -567,6 +575,10 @@ private:
     llama_opt_timing opt_timing = {};
     llama_opt_memory opt_memory = {}; // retro delta
 
+    // retro delta: the loss is built by the caller (llama_opt_step_custom).
+    bool    opt_custom_loss = false;
+    uint32_t opt_custom_accumulated = 0;
+    uint32_t opt_custom_period = 1;
     // retro delta: fused sparse cross-entropy for the packed step.
     bool    opt_fused_ce = false;
     int32_t opt_ce_tiles = 1;
