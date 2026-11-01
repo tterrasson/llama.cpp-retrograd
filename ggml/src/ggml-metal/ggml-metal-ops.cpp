@@ -800,42 +800,11 @@ int ggml_metal_op_acc(ggml_metal_op_t ctx, int idx) {
     const bool inplace = (bool) ((const int32_t *) op->op_params)[4];
 
     if (!inplace) {
-        // run a separate kernel to cpy src->dst
-        // not sure how to avoid this
-        // TODO: make a simpler cpy_bytes kernel
-
-        //const id<MTLComputePipelineState> pipeline = ctx->pipelines[GGML_METAL_PIPELINE_TYPE_CPY_F32_F32].obj;
-        auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type);
-
-        ggml_metal_kargs_cpy args = {
-            /*.nk0  =*/ ne00,
-            /*.ne00 =*/ ne00,
-            /*.ne01 =*/ ne01,
-            /*.ne02 =*/ ne02,
-            /*.ne03 =*/ ne03,
-            /*.nb00 =*/ nb00,
-            /*.nb01 =*/ nb01,
-            /*.nb02 =*/ nb02,
-            /*.nb03 =*/ nb03,
-            /*.ne0  =*/ ne0,
-            /*.ne1  =*/ ne1,
-            /*.ne2  =*/ ne2,
-            /*.ne3  =*/ ne3,
-            /*.nb0  =*/ nb0,
-            /*.nb1  =*/ nb1,
-            /*.nb2  =*/ nb2,
-            /*.nb3  =*/ nb3,
-        };
-
-        ggml_metal_encoder_set_pipeline(enc, pipeline);
-        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
-        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
-        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
-
-        const int nth = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), ne00);
-
-        ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
-
+        // retro delta: CPY assigns one element per thread, splitting wide rows across
+        // multiple threadgroups. Reuse its dispatch: one group per row leaves
+        // the tail uninitialized when ne00 exceeds the threadgroup limit
+        // (e.g. the 1152-wide fused QKV gradient of a decision model).
+        ggml_metal_op_cpy(ctx, idx);
         ggml_metal_op_concurrency_reset(ctx);
     }
 
