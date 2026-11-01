@@ -26,6 +26,52 @@
 #include <cstdlib>
 #include <vector>
 
+// ---- erf ----
+
+// retro delta: GGML_UNARY_OP_ERF, the error function, which the backward of
+// GELU_ERF and GEGLU_ERF reads. Row-parallel like the upstream unary kernels,
+// computed in F32 whatever the storage.
+template <typename src_t, typename dst_t>
+static void ggml_compute_forward_erf_rows(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(ggml_is_contiguous_rows(src0) && ggml_is_contiguous_rows(dst) && ggml_are_same_shape(src0, dst));
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    constexpr auto to_f32   = type_conversion_table<src_t>::to_f32;
+    constexpr auto from_f32 = type_conversion_table<dst_t>::from_f32;
+
+    const auto [ir0, ir1] = get_thread_range(params, src0);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i03 = ir/(ne02*ne01);
+        const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
+        const int64_t i01 = (ir - i03*ne02*ne01 - i02*ne01);
+
+        dst_t       * y = (dst_t       *) ((char       *) dst->data  + i03*nb3  + i02*nb2  + i01*nb1 );
+        const src_t * x = (const src_t *) ((const char *) src0->data + i03*nb03 + i02*nb02 + i01*nb01);
+
+        for (int64_t i = 0; i < ne0; ++i) {
+            y[i] = from_f32(erff(to_f32(x[i])));
+        }
+    }
+}
+
+void ggml_compute_forward_erf(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        ggml_compute_forward_erf_rows<float, float>(params, dst);
+    } else if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
+        ggml_compute_forward_erf_rows<ggml_fp16_t, ggml_fp16_t>(params, dst);
+    } else if (src0->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_BF16) {
+        ggml_compute_forward_erf_rows<ggml_bf16_t, ggml_bf16_t>(params, dst);
+    } else {
+        GGML_ABORT("erf: unsupported types: dst %s, src0 %s", ggml_type_name(dst->type), ggml_type_name(src0->type));
+    }
+}
+
 // ---- l2_norm_back ----
 
 // retro delta: analytic backward for GGML_OP_L2_NORM.

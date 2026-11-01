@@ -20,6 +20,11 @@ void ggml_compute_forward_opt_step_adamw_bf16(
         const ggml_compute_params * params,
         ggml_tensor * dst);
 
+// erf(x), GGML_UNARY_OP_ERF.
+void ggml_compute_forward_erf(
+        const ggml_compute_params * params,
+        ggml_tensor * dst);
+
 // SGD with stochastic rounding, F16 and BF16 parameters.
 void ggml_compute_forward_opt_step_sgd_f16(
         const ggml_compute_params * params,
