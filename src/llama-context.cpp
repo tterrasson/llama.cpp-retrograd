@@ -6018,6 +6018,17 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
     return ctx->get_memory();
 }
 
+// retro delta: see llama.h
+void llama_moe_cache_stats(const struct llama_context * ctx, struct llama_moe_cache_stats * out) {
+    if (!out) {
+        return;
+    }
+    *out = {};
+    if (ctx && ctx->get_moe_cache()) {
+        ctx->get_moe_cache()->stats(*out);
+    }
+}
+
 float * llama_get_embeddings_nextn(llama_context * ctx) {
     ctx->synchronize();
 

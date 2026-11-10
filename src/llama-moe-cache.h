@@ -4,6 +4,8 @@
 
 #include <map>
 #include <memory>
+
+struct llama_moe_cache_stats; // retro delta: telemetry output declared in llama.h
 #include <vector>
 
 struct llama_model;
@@ -33,6 +35,9 @@ public:
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+
+    // retro delta: read-only counters and per-group slot layout, for llama_moe_cache_stats
+    void stats(struct llama_moe_cache_stats & out) const;
 
 private:
     struct impl;

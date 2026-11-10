@@ -362,6 +362,28 @@ extern "C" {
         struct llama_sampler * sampler;
     };
 
+    // retro delta: read-only telemetry of the MoE expert device cache configured
+    // with llama_context_params::moe_cache_size; zeroed when the context has none.
+#define LLAMA_MOE_CACHE_STATS_MAX_GROUPS 16
+    struct llama_moe_cache_path_stats {
+        uint64_t hits;
+        uint64_t misses;
+        uint64_t bytes;
+    };
+    struct llama_moe_cache_group_stats {
+        int32_t  n_slots;      // expert slots allocated for the group's banks
+        int32_t  n_layers;     // cached layers sharing the group
+        int32_t  n_expert;     // experts per layer bank
+        uint64_t device_bytes; // device buffer bytes held by the group's banks
+    };
+    struct llama_moe_cache_stats {
+        struct llama_moe_cache_path_stats small; // slot-map path, small ubatches
+        struct llama_moe_cache_path_stats large; // slot-map path, large ubatches
+        struct llama_moe_cache_path_stats copy;  // copy_experts path, large batches
+        int32_t n_groups;
+        struct llama_moe_cache_group_stats groups[LLAMA_MOE_CACHE_STATS_MAX_GROUPS];
+    };
+
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
     //       https://github.com/ggml-org/llama.cpp/pull/7544
     struct llama_context_params {
@@ -583,6 +605,11 @@ extern "C" {
     LLAMA_API size_t llama_max_devices(void);
     LLAMA_API size_t llama_max_parallel_sequences(void);
     LLAMA_API size_t llama_max_tensor_buft_overrides(void);
+
+    // retro delta: fills `out` with the MoE expert cache's counters and per-group
+    // slot layout (up to LLAMA_MOE_CACHE_STATS_MAX_GROUPS groups); a context
+    // without a cache reports zeros. Call from the thread that owns the context.
+    LLAMA_API void llama_moe_cache_stats(const struct llama_context * ctx, struct llama_moe_cache_stats * out);
 
     LLAMA_API bool llama_supports_mmap       (void);
     LLAMA_API bool llama_supports_mlock      (void);

@@ -77,6 +77,9 @@ struct llama_context {
 
     llama_memory_t get_memory() const;
 
+    // retro delta: the MoE expert device cache, for llama_moe_cache_stats; null when the context has none.
+    const llama_moe_cache * get_moe_cache() const { return moe_cache.get(); }
+
     // return true if the memory was updated
     bool memory_update(bool optimize);
 
