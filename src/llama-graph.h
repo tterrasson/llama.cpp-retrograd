@@ -1022,6 +1022,9 @@ public:
 
     std::vector<ggml_tensor *> t_layer_inp;
 
+    // retro delta: the IDs consumed by each layer's expert banks, indexed by layer.
+    std::vector<ggml_tensor *> moe_route_ids;
+
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_sampled_probs;
     std::vector<ggml_tensor *> t_sampled_logits;

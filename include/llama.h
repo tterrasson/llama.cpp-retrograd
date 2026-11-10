@@ -611,6 +611,14 @@ extern "C" {
     // without a cache reports zeros. Call from the thread that owns the context.
     LLAMA_API void llama_moe_cache_stats(const struct llama_context * ctx, struct llama_moe_cache_stats * out);
 
+    // retro delta: optional routing telemetry for validated models. Counts are
+    // indexed by expert within a layer; all banks in that layer share the same IDs.
+    // sample_every == 0 disables collection; otherwise count one in N ubatches.
+    LLAMA_API bool llama_moe_route_enable(struct llama_context * ctx, uint32_t sample_every);
+    LLAMA_API size_t llama_moe_route_counts(const struct llama_context * ctx, uint32_t layer, uint32_t * out, size_t n_max);
+    LLAMA_API void llama_moe_route_paths(const struct llama_context * ctx, uint64_t out[3]); // slots, copy, readback
+    LLAMA_API void llama_moe_route_reset(struct llama_context * ctx);
+
     LLAMA_API bool llama_supports_mmap       (void);
     LLAMA_API bool llama_supports_mlock      (void);
     LLAMA_API bool llama_supports_gpu_offload(void);

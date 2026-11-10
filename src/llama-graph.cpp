@@ -4,6 +4,7 @@
 #include "llama-adapter-rows.h" // retro delta: per-row LoRA selection
 #include "llama-model.h"
 #include "llama-moe-cache.h"
+#include "llama-moe-route.h" // retro delta: retain routing IDs for readback
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
@@ -1397,6 +1398,7 @@ int64_t llm_graph_result::get_max_nodes() const {
 }
 
 void llm_graph_result::reset() {
+    moe_route_ids.clear(); // retro delta: drop routing tensors from the previous graph
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
@@ -2414,6 +2416,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // the experts of host-resident layers may be read from the MoE cache
     ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
+
+    // retro delta: these are the IDs passed to mul_mat_id after any remapping.
+    // The slot lookup reads the same IDs before replacing them with slot indices.
+    if (cparams.moe_route && slots == nullptr) {
+        llama_moe_route_retain(res->moe_route_ids, il, selected_experts);
+    }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 

@@ -1679,7 +1679,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // retro delta: observe a successful ubatch before the graph storage is reused.
+    if (moe_route) { moe_route->begin(); }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (moe_route && status == GGML_STATUS_SUCCESS) {
+        moe_route->finish(sched.get(), res->moe_route_ids);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -3026,8 +3031,8 @@ ggml_status llama_context::graph_compute(
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
 
-    // the slot maps of the MoE cache
-    if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
+    // retro delta: share the slot planner's host read with routing telemetry.
+    if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph, lctx->moe_route.get())) {
         return true;
     }
 
@@ -3066,6 +3071,9 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
         st.ids = ids;
     }
+
+    // retro delta: count the raw selection, including repeats, once per layer.
+    if (lctx->moe_route) { lctx->moe_route->observe_copy(src, ids, st.ids_data.data()); }
 
     // group consecutive experts and copy them together
     for (int64_t first = 0; first < n_expert; ) {

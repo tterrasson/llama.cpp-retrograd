@@ -8,6 +8,7 @@
 #define LLAMA_MAX_SEQ 256
 
 struct llama_cparams {
+    bool moe_route = false; // retro delta: retain routing IDs for ubatch readback
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
     uint32_t n_batch;
