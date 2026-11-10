@@ -340,6 +340,7 @@ struct llama_moe_cache::impl {
         std::vector<ggml_tensor *> banks; // device storage of all slots, one per expert tensor
         size_t host_bytes = 0;
         int32_t n_slots = 0;
+        size_t device_bytes = 0; // retro delta: per-group bank storage for telemetry
         moe_cache_lru lru;
     };
 
@@ -581,7 +582,9 @@ struct llama_moe_cache::impl {
                     buf_host_size += GGML_PAD(ggml_nbytes(l.cpu_map), alignment_host);
                 }
             }
-            devices[g.id].buf_size += alloc_size(g, g.n_slots);
+            // retro delta: keep each group's share of the device buffer for telemetry.
+            g.device_bytes = alloc_size(g, g.n_slots);
+            devices[g.id].buf_size += g.device_bytes;
         }
 
         // with no_alloc, dummy buffers are attached so the memory use can still be measured, see llama_context::memory_breakdown
@@ -861,6 +864,36 @@ struct llama_moe_cache::impl {
         return true;
     }
 
+    // retro delta: snapshot for llama_moe_cache_stats - the counters are the
+    // live ones (monotonic since context creation), the groups only the ones
+    // that actually got slots.
+    void snapshot(struct llama_moe_cache_stats & out) const {
+        auto fill = [](const struct stats & st, struct llama_moe_cache_path_stats & dst) {
+            dst.hits   = st.hits;
+            dst.misses = st.misses;
+            dst.cpu    = st.cpu;
+            dst.bytes  = st.bytes;
+        };
+        fill(stats_small, out.small);
+        fill(stats_large, out.large);
+        fill(stats_copy,  out.copy);
+        out.n_groups = 0;
+        for (const group & g : groups) {
+            if (out.n_groups == LLAMA_MOE_CACHE_STATS_MAX_GROUPS) {
+                break;
+            }
+            if (g.n_slots == 0) {
+                continue;
+            }
+            llama_moe_cache_group_stats & dst = out.groups[out.n_groups++];
+            dst.n_slots      = g.n_slots;
+            // Layer indices and expert counts already fit int32_t in the cache.
+            dst.n_layers     = static_cast<int32_t>(g.layers.size());
+            dst.n_expert     = static_cast<int32_t>(g.ref[0]->ne[2]);
+            dst.device_bytes = g.device_bytes;
+        }
+    }
+
     void log_stats() const {
         auto log = [](const char * name, const stats & st) {
             const size_t n = st.hits + st.misses;
@@ -981,4 +1014,9 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown()
         res[ggml_backend_buffer_get_type(pimpl->buf_host.get())] += pimpl->buf_host_size;
     }
     return res;
+}
+
+// retro delta: see llama.h
+void llama_moe_cache::stats(struct llama_moe_cache_stats & out) const {
+    pimpl->snapshot(out);
 }
