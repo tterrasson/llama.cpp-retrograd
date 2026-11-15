@@ -7,6 +7,7 @@
 
 class llama_moe_route_observer;
 struct llama_moe_cache_stats; // retro delta: telemetry output declared in llama.h
+struct llama_moe_cache_pin_stats; // retro delta: revocable pins, declared in llama.h
 #include <vector>
 
 struct llama_model;
@@ -67,6 +68,13 @@ public:
 
     // retro delta: read-only counters and per-group slot layout, for llama_moe_cache_stats
     void stats(struct llama_moe_cache_stats & out) const;
+
+    // retro delta: revocable pins, set between steps, see llama.h
+    int32_t layer_group(int32_t il) const;
+    int32_t pin    (int32_t il, const int32_t * experts, size_t n);
+    int32_t unpin  (int32_t il, const int32_t * experts, size_t n);
+    int32_t prewarm(int32_t il, const int32_t * experts, size_t n);
+    void pin_stats(struct llama_moe_cache_pin_stats & out) const;
 
 private:
     struct impl;

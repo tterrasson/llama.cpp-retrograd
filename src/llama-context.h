@@ -80,6 +80,8 @@ struct llama_context {
 
     // retro delta: the MoE expert device cache, for llama_moe_cache_stats; null when the context has none.
     const llama_moe_cache * get_moe_cache() const { return moe_cache.get(); }
+    // retro delta: pins change the cache between decodes
+    llama_moe_cache * get_moe_cache_mut() { return moe_cache.get(); }
 
     // retro delta: optional, context-local routing observer (see llama.h).
     bool moe_route_set_observer(llama_moe_route_cb cb, void * user_data);

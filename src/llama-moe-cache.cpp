@@ -24,9 +24,11 @@ namespace {
 // CRF (combined recency and frequency) = uses of an expert, decayed with a half-life of N tokens, retained across evictions
 // class = floor(log2(CRF)), at most n_class - 1; each slot is in the LRU list of the class, as of its last use
 // victim: an empty slot, or the least recently used slot of each list not in the current plan() with the max age/2^class
+// retro delta: one more list holds revocable pins, its slots are victims only when no other list has one
 struct moe_cache_lru {
     static constexpr int   n_class  = 8; // floor(log2(1/(1 - 2^(-1/crf_half_life)))) = 7, class of CRF_max for half-life of 128
     static constexpr float crf_half_life = 128.0f; // tokens
+    static constexpr int   pinned   = n_class; // retro delta: index of the list of the pins
 
     int32_t n_expert = 0;
     int32_t n_slots  = 0;
@@ -40,10 +42,12 @@ struct moe_cache_lru {
     // one LRU list per class, the head is the least recently used end
     std::vector<int32_t> prev;    // [n_slots] -1 at the ends
     std::vector<int32_t> next;    // [n_slots]
-    int32_t head[n_class];
-    int32_t tail[n_class];
+    int32_t head[n_class + 1]; // retro delta: + the list of the pins
+    int32_t tail[n_class + 1];
     std::vector<int8_t>  list_of; // [n_slots] class list of the slot
     int32_t n_filled = 0;         // slots that hold an expert
+    int32_t n_pinned  = 0;        // retro delta: slots in the list of the pins
+    size_t  n_revoked = 0;        // retro delta: pins evicted by plan()
 
     std::vector<float>   crf;      // [n_layer*n_expert]
     std::vector<int64_t> last_use; // [n_layer*n_expert] layer clock at the last use, -1 if not used
@@ -68,7 +72,7 @@ struct moe_cache_lru {
             prev[s] = s - 1;
             next[s] = s + 1 < n_slots ? s + 1 : -1;
         }
-        for (int c = 0; c < n_class; ++c) {
+        for (int c = 0; c <= pinned; ++c) {
             head[c] = -1;
             tail[c] = -1;
         }
@@ -107,6 +111,7 @@ struct moe_cache_lru {
         }
         tail[c] = s;
         list_of[s] = c;
+        n_pinned += int(c == pinned) - int(from == pinned); // retro delta
     }
 
     // key = index of an expert of a layer in crf and last_use
@@ -117,6 +122,11 @@ struct moe_cache_lru {
     // for a key after use(): its CRF is >= 1, so log2 is >= 0 and the cast is the floor
     int class_of(int32_t key) const {
         return std::min(n_class - 1, (int) std::log2(crf[key]));
+    }
+
+    // retro delta: the class of a key that pin or prewarm made resident before any use
+    int class_or_zero(int32_t key) const {
+        return crf[key] >= 1.0f ? class_of(key) : 0;
     }
 
     // the CRF of a key, decayed by the time since its last use
@@ -151,7 +161,8 @@ struct moe_cache_lru {
         return -1;
     }
 
-    int32_t victim(int32_t il) const {
+    // retro delta: the victim outside the pins, -1 if none
+    int32_t victim_unpinned(int32_t il) const {
         int32_t res = -1;
         double res_score = -1.0;
         for (int c = 0; c < n_class; ++c) {
@@ -169,6 +180,16 @@ struct moe_cache_lru {
                 res       = s;
                 res_score = score;
             }
+        }
+        return res;
+    }
+
+    // retro delta: pins are the last resort, so plan() needs no more slots than it did without them,
+    // and the least recently used pin outside the plan() is revoked
+    int32_t victim(int32_t il) const {
+        int32_t res = victim_unpinned(il);
+        if (res < 0) {
+            res = candidate(pinned, il);
         }
         if (res < 0) {
             GGML_ABORT("no MoE cache victim");
@@ -216,7 +237,8 @@ struct moe_cache_lru {
             const int32_t key = make_key(il, e);
             use(il, key);
             if (slots[e] < n_slots) {
-                move(slots[e], class_of(key));
+                // retro delta: a hit on a pin only refreshes its recency among the pins
+                move(slots[e], list_of[slots[e]] == pinned ? pinned : class_of(key));
                 n_hit++;
             } else {
                 misses.push_back(e);
@@ -272,6 +294,7 @@ struct moe_cache_lru {
         std::sort(misses.begin(), misses.end());
         for (int32_t e : misses) {
             const int32_t s = victim(il);
+            n_revoked += list_of[s] == pinned; // retro delta
             if (key_of[s] >= 0) {
                 slot_map[key_layer(key_of[s])][key_expert(key_of[s])] = empty;
             } else {
@@ -284,6 +307,58 @@ struct moe_cache_lru {
             fills.push_back({ e, s });
         }
         clock[il] += n_tokens;
+        return true;
+    }
+
+    // retro delta: between steps, mark experts of layer il so that admit()
+    // does not evict one of them for another; returns false on an invalid id
+    bool begin(const int32_t * experts, size_t n) {
+        if (++seen_gen == 0) {
+            std::fill(seen.begin(), seen.end(), 0);
+            seen_gen = 1;
+        }
+        for (size_t i = 0; i < n; ++i) {
+            if (experts[i] < 0 || experts[i] >= n_expert) {
+                return false;
+            }
+            seen[experts[i]] = seen_gen;
+        }
+        return true;
+    }
+
+    // retro delta: the slot of expert e of layer il, taking the victim outside
+    // the pins and outside the marked experts if it is not cached; -1 if there
+    // is none. `filled` tells the caller to upload the expert. The CRF is left
+    // alone: only routing counts as a use.
+    int32_t admit(int32_t il, int32_t e, bool & filled) {
+        int32_t * slots = slot_map[il];
+        filled = false;
+        if (slots[e] < n_slots) {
+            return slots[e];
+        }
+        const int32_t s = victim_unpinned(il);
+        if (s < 0) {
+            return -1;
+        }
+        if (key_of[s] >= 0) {
+            slot_map[key_layer(key_of[s])][key_expert(key_of[s])] = empty;
+        } else {
+            n_filled++;
+        }
+        const int32_t key = make_key(il, e);
+        key_of[s] = key;
+        slots[e]  = s;
+        move(s, class_or_zero(key));
+        filled = true;
+        return s;
+    }
+
+    // retro delta: a pinned slot goes back to the list of its class
+    bool unpin(int32_t s) {
+        if (list_of[s] != pinned) {
+            return false;
+        }
+        move(s, class_or_zero(key_of[s]));
         return true;
     }
 };
@@ -375,6 +450,7 @@ struct llama_moe_cache::impl {
     stats stats_small; // up to 8 tokens per ubatch
     stats stats_large;
     stats stats_copy;  // experts copied from the cache for large batches
+    stats stats_pin;   // retro delta: experts made resident by pin and prewarm
 
     std::vector<device> devices;
     std::vector<group> groups;
@@ -898,6 +974,116 @@ struct llama_moe_cache::impl {
         }
     }
 
+    // retro delta: index of the group of layer il among the groups with slots,
+    // as listed by llama_moe_cache_stats; -1 if the layer is not cached
+    int32_t layer_group(int32_t il) const {
+        if (il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
+            return -1;
+        }
+        int32_t res = 0;
+        for (int32_t ig = 0; ig < layers[il].ig; ++ig) {
+            res += groups[ig].n_slots > 0;
+        }
+        return res;
+    }
+
+    // retro delta: pins that leave every request the slot path admits a victim
+    // outside them: get_slot_map admits at most min(max_batch*k, n_expert)
+    // distinct experts per layer
+    int32_t pin_limit(const group & g) const {
+        const int64_t n_expert = g.ref[0]->ne[2];
+        const int64_t largest  = std::min<int64_t>(max_batch*n_expert_used, n_expert);
+        return (int32_t) std::max<int64_t>(0, g.n_slots - largest);
+    }
+
+    // retro delta: between steps, make the experts of layer il resident, and
+    // pin them if `pin`. Stops at the first expert that finds no slot outside
+    // the pins and outside the experts of the call. Returns how many experts
+    // of the call are resident, -1 on an invalid layer or expert.
+    int32_t residents(int32_t il, const int32_t * experts, size_t n, bool pin) {
+        if (il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0 || (n > 0 && experts == nullptr)) {
+            return -1;
+        }
+        const layer & l = layers[il];
+        group & g = groups[l.ig];
+        if (g.lru.slot_map[il] == nullptr) {
+            return 0; // no_alloc: nothing to upload
+        }
+        if (!g.lru.begin(experts, n)) {
+            return -1;
+        }
+        ggml_backend_t backend = devices[g.id].backend;
+        // the last step may still read the banks or upload a slot map
+        ggml_backend_synchronize(backend);
+
+        int32_t res = 0;
+        for (size_t i = 0; i < n; ++i) {
+            bool filled = false;
+            const int32_t s = g.lru.admit(il, experts[i], filled);
+            if (s < 0) {
+                break;
+            }
+            if (filled) {
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const ggml_tensor * w = l.experts[ip];
+                    const size_t expert_size = w->nb[2];
+                    ggml_backend_tensor_set(g.banks[ip], (const uint8_t *) w->data + experts[i]*expert_size, s*expert_size, expert_size);
+                    stats_pin.bytes += expert_size;
+                }
+                stats_pin.misses++;
+            } else {
+                stats_pin.hits++;
+            }
+            if (pin) {
+                g.lru.move(s, moe_cache_lru::pinned);
+            }
+            res++;
+        }
+        return res;
+    }
+
+    // retro delta: returns how many of the experts were pinned, -1 on an
+    // invalid layer or expert
+    int32_t unpin(int32_t il, const int32_t * experts, size_t n) {
+        if (il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0 || (n > 0 && experts == nullptr)) {
+            return -1;
+        }
+        moe_cache_lru & lru = groups[layers[il].ig].lru;
+        const int32_t * slots = lru.slot_map[il];
+        if (slots == nullptr) {
+            return 0;
+        }
+        int32_t res = 0;
+        for (size_t i = 0; i < n; ++i) {
+            if (experts[i] < 0 || experts[i] >= lru.n_expert) {
+                return -1;
+            }
+            res += slots[experts[i]] < lru.n_slots && lru.unpin(slots[experts[i]]);
+        }
+        return res;
+    }
+
+    // retro delta: see llama_moe_cache_pin_stats
+    void pin_snapshot(struct llama_moe_cache_pin_stats & out) const {
+        out.uploads.hits   = stats_pin.hits;
+        out.uploads.misses = stats_pin.misses;
+        out.uploads.bytes  = stats_pin.bytes;
+        out.revoked  = 0;
+        out.n_groups = 0;
+        for (const group & g : groups) {
+            if (g.n_slots == 0) {
+                continue;
+            }
+            out.revoked += g.lru.n_revoked;
+            if (out.n_groups == LLAMA_MOE_CACHE_STATS_MAX_GROUPS) {
+                continue;
+            }
+            llama_moe_cache_pin_group & dst = out.groups[out.n_groups++];
+            dst.n_pinned  = g.lru.n_pinned;
+            dst.pin_limit = pin_limit(g);
+        }
+    }
+
     void log_stats() const {
         auto log = [](const char * name, const stats & st) {
             const size_t n = st.hits + st.misses;
@@ -1023,4 +1209,25 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown()
 // retro delta: see llama.h
 void llama_moe_cache::stats(struct llama_moe_cache_stats & out) const {
     pimpl->snapshot(out);
+}
+
+// retro delta: revocable pins, see llama.h
+int32_t llama_moe_cache::layer_group(int32_t il) const {
+    return pimpl->layer_group(il);
+}
+
+int32_t llama_moe_cache::pin(int32_t il, const int32_t * experts, size_t n) {
+    return pimpl->residents(il, experts, n, true);
+}
+
+int32_t llama_moe_cache::unpin(int32_t il, const int32_t * experts, size_t n) {
+    return pimpl->unpin(il, experts, n);
+}
+
+int32_t llama_moe_cache::prewarm(int32_t il, const int32_t * experts, size_t n) {
+    return pimpl->residents(il, experts, n, false);
+}
+
+void llama_moe_cache::pin_stats(struct llama_moe_cache_pin_stats & out) const {
+    pimpl->pin_snapshot(out);
 }

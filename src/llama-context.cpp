@@ -6463,6 +6463,33 @@ void llama_moe_cache_stats(const struct llama_context * ctx, struct llama_moe_ca
     }
 }
 
+// retro delta: revocable pins, see llama.h
+int32_t llama_moe_cache_layer_group(const struct llama_context * ctx, int32_t il) {
+    return ctx && ctx->get_moe_cache() ? ctx->get_moe_cache()->layer_group(il) : -1;
+}
+
+int32_t llama_moe_cache_pin(struct llama_context * ctx, int32_t il, const int32_t * experts, size_t n) {
+    return ctx && ctx->get_moe_cache() ? ctx->get_moe_cache_mut()->pin(il, experts, n) : -1;
+}
+
+int32_t llama_moe_cache_unpin(struct llama_context * ctx, int32_t il, const int32_t * experts, size_t n) {
+    return ctx && ctx->get_moe_cache() ? ctx->get_moe_cache_mut()->unpin(il, experts, n) : -1;
+}
+
+int32_t llama_moe_cache_prewarm(struct llama_context * ctx, int32_t il, const int32_t * experts, size_t n) {
+    return ctx && ctx->get_moe_cache() ? ctx->get_moe_cache_mut()->prewarm(il, experts, n) : -1;
+}
+
+void llama_moe_cache_pin_stats(const struct llama_context * ctx, struct llama_moe_cache_pin_stats * out) {
+    if (!out) {
+        return;
+    }
+    *out = {};
+    if (ctx && ctx->get_moe_cache()) {
+        ctx->get_moe_cache()->pin_stats(*out);
+    }
+}
+
 float * llama_get_embeddings_nextn(llama_context * ctx) {
     ctx->synchronize();
 

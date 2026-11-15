@@ -394,6 +394,19 @@ extern "C" {
         struct llama_moe_cache_group_stats groups[LLAMA_MOE_CACHE_STATS_MAX_GROUPS];
     };
 
+    // retro delta: revocable pins of the MoE expert device cache. Groups are in
+    // the order of llama_moe_cache_stats::groups.
+    struct llama_moe_cache_pin_group {
+        int32_t n_pinned;  // slots currently pinned
+        int32_t pin_limit; // pins that keep a victim outside them for every request the slot path admits
+    };
+    struct llama_moe_cache_pin_stats {
+        struct llama_moe_cache_path_stats uploads; // pin and prewarm: hits = already resident, misses = uploaded
+        uint64_t revoked;                          // pins evicted because a request found no other victim
+        int32_t n_groups;
+        struct llama_moe_cache_pin_group groups[LLAMA_MOE_CACHE_STATS_MAX_GROUPS];
+    };
+
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
     //       https://github.com/ggml-org/llama.cpp/pull/7544
     struct llama_context_params {
@@ -598,6 +611,21 @@ extern "C" {
     // slot layout (up to LLAMA_MOE_CACHE_STATS_MAX_GROUPS groups); a context
     // without a cache reports zeros. Call from the thread that owns the context.
     LLAMA_API void llama_moe_cache_stats(const struct llama_context * ctx, struct llama_moe_cache_stats * out);
+
+    // retro delta: revocable pins of the MoE expert device cache, called between
+    // decodes from the thread that owns the context. A pin is a preference: a
+    // request that finds no unpinned victim evicts the coldest pin outside it
+    // (counted in `revoked`), so pins never make the slot path abort and never
+    // change what is computed. Pins beyond `pin_limit` are accepted and revoked
+    // under load. pin and prewarm make experts resident (prewarm without
+    // pinning) and stop at the first one that finds no slot outside the pins
+    // and the experts of the call; they return how many are resident, unpin how
+    // many were pinned, all three -1 on a layer without cache or an invalid id.
+    LLAMA_API int32_t llama_moe_cache_layer_group(const struct llama_context * ctx, int32_t il); // -1 if not cached
+    LLAMA_API int32_t llama_moe_cache_pin    (struct llama_context * ctx, int32_t il, const int32_t * experts, size_t n);
+    LLAMA_API int32_t llama_moe_cache_unpin  (struct llama_context * ctx, int32_t il, const int32_t * experts, size_t n);
+    LLAMA_API int32_t llama_moe_cache_prewarm(struct llama_context * ctx, int32_t il, const int32_t * experts, size_t n);
+    LLAMA_API void    llama_moe_cache_pin_stats(const struct llama_context * ctx, struct llama_moe_cache_pin_stats * out);
 
     // retro delta: observer of the expert ids each MoE layer consumes. For every
     // ubatch the context calls it with LLAMA_MOE_ROUTE_BEGIN (layer -1, no ids),
