@@ -9,6 +9,7 @@
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-moe-cache.h"
+#include "llama-moe-route-observer.h" // retro delta: optional expert routing observer
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -79,6 +80,9 @@ struct llama_context {
 
     // retro delta: the MoE expert device cache, for llama_moe_cache_stats; null when the context has none.
     const llama_moe_cache * get_moe_cache() const { return moe_cache.get(); }
+
+    // retro delta: optional, context-local routing observer (see llama.h).
+    bool moe_route_set_observer(llama_moe_route_cb cb, void * user_data);
 
     // return true if the memory was updated
     bool memory_update(bool optimize);
@@ -545,6 +549,7 @@ private:
     };
 
     copy_experts_info copy_experts;
+    std::unique_ptr<llama_moe_route_observer> moe_route; // retro delta: routing is opt-in
 
     // graph reallocations during inference where the backend assignments did not change, split by whether the
     // graph size is the same as the previously scheduled one (unexpected) or different

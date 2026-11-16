@@ -599,6 +599,36 @@ extern "C" {
     // without a cache reports zeros. Call from the thread that owns the context.
     LLAMA_API void llama_moe_cache_stats(const struct llama_context * ctx, struct llama_moe_cache_stats * out);
 
+    // retro delta: observer of the expert ids each MoE layer consumes. For every
+    // ubatch the context calls it with LLAMA_MOE_ROUTE_BEGIN (layer -1, no ids),
+    // whose return value says whether the ubatch is observed; if it is, the
+    // observer gets at most one call per layer, from the first path that saw that
+    // layer's ids, then LLAMA_MOE_ROUTE_END (layer -1, no ids) only when the
+    // ubatch computed successfully: a BEGIN without END means the ids received
+    // since are to be dropped. ids holds n_tokens rows of n_expert_used ids,
+    // row_stride ids apart, and is only valid during the call; all the routed
+    // expert banks of a layer share it. SLOTS and COPY calls come from inside the
+    // graph computation, before the experts are copied: the callback must not
+    // block, allocate or call back into the context. Only BEGIN's return value is
+    // read.
+    enum llama_moe_route_event {
+        LLAMA_MOE_ROUTE_BEGIN    = 0,
+        LLAMA_MOE_ROUTE_SLOTS    = 1, // read by the expert cache's slot planner, the misses computed on the CPU included
+        LLAMA_MOE_ROUTE_COPY     = 2, // read by the scheduler's copy of the used experts
+        LLAMA_MOE_ROUTE_READBACK = 3, // read back after the graph, for the layers neither path saw
+        LLAMA_MOE_ROUTE_END      = 4,
+    };
+
+    typedef bool (*llama_moe_route_cb)(
+            void * user_data, enum llama_moe_route_event event, int32_t layer,
+            const int32_t * ids, int64_t n_expert_used, int64_t n_tokens, int64_t row_stride);
+
+    // cb == NULL removes the observer; without one, the graph is unchanged and
+    // nothing is read back. Returns false, and changes nothing, for a model
+    // without routed experts. Call between decodes, from the thread that owns
+    // the context; user_data must outlive the observer.
+    LLAMA_API bool llama_moe_route_set_observer(struct llama_context * ctx, llama_moe_route_cb cb, void * user_data);
+
     LLAMA_API bool llama_supports_mmap       (void);
     LLAMA_API bool llama_supports_mlock      (void);
     LLAMA_API bool llama_supports_gpu_offload(void);

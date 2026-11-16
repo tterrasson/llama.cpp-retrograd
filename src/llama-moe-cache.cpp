@@ -1,4 +1,5 @@
 #include "llama-moe-cache.h"
+#include "llama-moe-route-observer.h"
 
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -767,7 +768,7 @@ struct llama_moe_cache::impl {
         return n;
     }
 
-    bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
+    bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, llama_moe_route_observer * route) {
         const auto it = layer_of.find(src);
         if (it == layer_of.end()) {
             return false;
@@ -807,6 +808,9 @@ struct llama_moe_cache::impl {
         ids.resize(ggml_nelements(sel));
         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
         ggml_backend_synchronize(backend);
+
+        // retro delta: sel holds every selected expert, the misses computed on the CPU included
+        if (route) { route->observe_slots(il, sel, ids.data()); }
 
         if (trace != nullptr) {
             write_trace(il, n_used);
@@ -995,8 +999,8 @@ ggml_tensor * llama_moe_cache::build_experts(const llm_graph_context & g, const 
     return experts;
 }
 
-bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
-    return pimpl->copy(backend, src, dst, graph);
+bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, llama_moe_route_observer * route) {
+    return pimpl->copy(backend, src, dst, graph, route);
 }
 
 int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
